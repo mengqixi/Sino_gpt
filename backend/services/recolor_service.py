@@ -127,7 +127,7 @@ def analyze_recolor_masks(image_path: str) -> dict:
     }
 
 
-def apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
+def render_recolor_image(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> Image.Image:
     image = _load_rgb(image_path)
     target = _hex_to_rgb(target_color)
     subject = np.array(_data_url_to_mask(subject_mask, image.size)) > 24
@@ -146,8 +146,16 @@ def apply_recolor(image_path: str, target_color: str, subject_mask: str, protect
     result = rgb.copy()
     alpha = 0.86
     result[recolor_area] = rgb[recolor_area] * (1 - alpha) + recolored[recolor_area] * alpha
-    result_image = Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), mode="RGB")
+    return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), mode="RGB")
 
+
+def preview_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> dict:
+    result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
+    return {"preview_image": _image_to_data_url(result_image)}
+
+
+def apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
+    result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     output = RESULT_DIR / f"recolor_{uuid.uuid4().hex[:12]}.png"
     result_image.save(output)

@@ -3,7 +3,7 @@ from pydantic import BaseModel
 
 from ..services.file_service import save_existing_image_as_upload
 from ..services.image_job_service import create_local_recolor_job, get_generated_image, get_job, get_upload
-from ..services.recolor_service import analyze_recolor_masks, apply_recolor, result_payload
+from ..services.recolor_service import analyze_recolor_masks, apply_recolor, preview_recolor, result_payload
 
 router = APIRouter(prefix="/api/recolor", tags=["recolor"])
 
@@ -50,6 +50,17 @@ def apply(payload: ApplyPayload):
             "generated_image": generated,
             "uploaded_image": reusable_upload,
         }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/preview")
+def preview(payload: ApplyPayload):
+    upload = get_upload(payload.uploaded_image_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="上传图片不存在")
+    try:
+        return preview_recolor(upload["file_path"], payload.target_color, payload.subject_mask, payload.protect_mask)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

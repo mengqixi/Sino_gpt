@@ -1,4 +1,4 @@
-import { Download, Eraser, Paintbrush, Pipette, RotateCcw, Shield, UploadCloud, ZoomIn, ZoomOut } from "lucide-react";
+import { Download, Eraser, Eye, Image as ImageIcon, Pipette, RotateCcw, Save, Shield, UploadCloud } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -19,19 +19,38 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
   const [targetColor, setTargetColor] = useState("#b52126");
   const [subjectMask, setSubjectMask] = useState("");
   const [protectMask, setProtectMask] = useState("");
+  const [previewImage, setPreviewImage] = useState("");
+  const [showOriginal, setShowOriginal] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [mode, setMode] = useState<"protect" | "erase">("protect");
   const [brushSize, setBrushSize] = useState(6);
   const [zoom, setZoom] = useState(1);
   const [busy, setBusy] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
   const [message, setMessage] = useState("");
   const imageRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawingRef = useRef(false);
+  const previewTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     drawProtectMask();
   }, [uploaded, protectMask]);
+
+  useEffect(() => {
+    if (!uploaded) return;
+    if (previewTimerRef.current) {
+      window.clearTimeout(previewTimerRef.current);
+    }
+    previewTimerRef.current = window.setTimeout(() => {
+      refreshPreview();
+    }, 350);
+    return () => {
+      if (previewTimerRef.current) {
+        window.clearTimeout(previewTimerRef.current);
+      }
+    };
+  }, [targetColor, uploaded?.image_id]);
 
   async function upload(file?: File) {
     if (!file) return;
@@ -40,6 +59,8 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
       setUploaded(row);
       setSubjectMask("");
       setProtectMask("");
+      setPreviewImage("");
+      setShowOriginal(false);
       setResult(null);
       setMessage("");
     } catch (error: any) {
@@ -66,10 +87,25 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     return data;
   }
 
+  async function ensureMasks() {
+    if (subjectMask && protectMask) {
+      return {
+        subject_mask: subjectMask,
+        protect_mask: canvasRef.current?.toDataURL("image/png") || protectMask
+      };
+    }
+    const masks = await analyzeMasks();
+    return {
+      subject_mask: masks.subject_mask,
+      protect_mask: masks.protect_mask
+    };
+  }
+
   async function analyze() {
     setBusy(true);
     try {
       await analyzeMasks();
+      await refreshPreview();
     } catch (error: any) {
       setMessage(explainError(error));
     } finally {
@@ -77,25 +113,42 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     }
   }
 
-  async function apply() {
+  async function refreshPreview() {
+    if (!uploaded) {
+      return;
+    }
+    setPreviewBusy(true);
+    try {
+      const masks = await ensureMasks();
+      const data = await api.previewRecolor({
+        uploaded_image_id: uploaded.image_id,
+        target_color: targetColor,
+        subject_mask: masks.subject_mask,
+        protect_mask: masks.protect_mask
+      });
+      setPreviewImage(data.preview_image);
+      setShowOriginal(false);
+      setMessage("已生成调色预览，满意后点击保存结果。");
+    } catch (error: any) {
+      setMessage(explainError(error));
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
+
+  async function saveResult() {
     if (!uploaded) {
       setMessage("请先上传一张女包原图");
       return;
     }
     setBusy(true);
     try {
-      let activeSubjectMask = subjectMask;
-      let activeProtectMask = canvasRef.current?.toDataURL("image/png") || protectMask;
-      if (!activeSubjectMask || !activeProtectMask) {
-        const masks = await analyzeMasks();
-        activeSubjectMask = masks.subject_mask;
-        activeProtectMask = masks.protect_mask;
-      }
+      const masks = await ensureMasks();
       const data = await api.applyRecolor({
         uploaded_image_id: uploaded.image_id,
         target_color: targetColor,
-        subject_mask: activeSubjectMask,
-        protect_mask: activeProtectMask
+        subject_mask: masks.subject_mask,
+        protect_mask: masks.protect_mask
       });
       setResult(data);
       setMessage("调色结果已保存到历史记录，可下载或选为 AI 生成源图");
@@ -119,6 +172,10 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     mask.onload = () => {
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(mask, 0, 0, canvas.width, canvas.height);
+      context.globalCompositeOperation = "source-in";
+      context.fillStyle = "rgba(255, 176, 0, 0.9)";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.globalCompositeOperation = "source-over";
     };
     mask.src = protectMask;
   }
@@ -139,7 +196,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     const point = pointerPosition(event);
     context.save();
     context.globalCompositeOperation = mode === "protect" ? "source-over" : "destination-out";
-    context.fillStyle = "white";
+    context.fillStyle = "rgba(255, 176, 0, 0.9)";
     context.beginPath();
     context.arc(point.x, point.y, brushSize, 0, Math.PI * 2);
     context.fill();
@@ -148,6 +205,19 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
 
   function resetMask() {
     drawProtectMask();
+    window.setTimeout(() => refreshPreview(), 0);
+  }
+
+  function finishPaint() {
+    drawingRef.current = false;
+    refreshPreview();
+  }
+
+  function wheelZoom(event: React.WheelEvent<HTMLDivElement>) {
+    if (!uploaded) return;
+    event.preventDefault();
+    const delta = event.deltaY > 0 ? -0.1 : 0.1;
+    setZoom((value) => Math.min(3, Math.max(0.5, Number((value + delta).toFixed(2)))));
   }
 
   return (
@@ -177,20 +247,20 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
           {uploaded && (
             <div>
               <div className="stage-toolbar">
-                <button onClick={() => setZoom((value) => Math.max(0.5, Number((value - 0.25).toFixed(2))))}>
-                  <ZoomOut size={16} />
-                  缩小
+                <button className={!showOriginal ? "active-tool" : ""} onClick={() => setShowOriginal(false)} disabled={!previewImage}>
+                  <Eye size={16} />
+                  调色预览
+                </button>
+                <button className={showOriginal ? "active-tool" : ""} onClick={() => setShowOriginal(true)}>
+                  <ImageIcon size={16} />
+                  原图
                 </button>
                 <span>{Math.round(zoom * 100)}%</span>
-                <button onClick={() => setZoom((value) => Math.min(3, Number((value + 0.25).toFixed(2))))}>
-                  <ZoomIn size={16} />
-                  放大
-                </button>
                 <button onClick={() => setZoom(1)}>100%</button>
               </div>
-              <div className="mask-viewport">
+              <div className="mask-viewport" onWheel={wheelZoom}>
                 <div className="mask-canvas-wrap" style={{ width: `${zoom * 100}%` }}>
-                  <img ref={imageRef} src={uploaded.preview_url} onLoad={drawProtectMask} />
+                  <img ref={imageRef} src={showOriginal || !previewImage ? uploaded.preview_url : previewImage} onLoad={drawProtectMask} />
                   <canvas
                     ref={canvasRef}
                     onPointerDown={(event) => {
@@ -198,8 +268,8 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
                       paint(event);
                     }}
                     onPointerMove={paint}
-                    onPointerUp={() => (drawingRef.current = false)}
-                    onPointerLeave={() => (drawingRef.current = false)}
+                    onPointerUp={finishPaint}
+                    onPointerLeave={finishPaint}
                   />
                 </div>
               </div>
@@ -218,7 +288,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
               <button key={color} className="swatch" style={{ background: color }} onClick={() => setTargetColor(color)} title={color} />
             ))}
           </div>
-          <p className="recolor-help">可以直接点“应用当前颜色并保存”。系统会先识别包身调色区域，再把当前目标色应用到包身、图案和花纹上；五金保护区可用画笔修正。</p>
+          <p className="recolor-help">点调色盘或修改颜色后会自动生成预览，不会保存历史。黄色区域是五金保护区，满意后再保存结果。</p>
           <div className="toolbar">
             <button onClick={analyze} disabled={busy || !uploaded}>
               <Pipette size={16} />
@@ -240,11 +310,12 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
               <RotateCcw size={16} />
               重置保护区
             </button>
-            <button className="primary" onClick={apply} disabled={busy || !uploaded}>
-              <Paintbrush size={16} />
-              应用当前颜色并保存
+            <button className="primary" onClick={saveResult} disabled={busy || previewBusy || !uploaded}>
+              <Save size={16} />
+              保存调色结果
             </button>
           </div>
+          {previewBusy && <div className="status running">正在更新预览...</div>}
           {message && <div className="notice">{message}</div>}
           {result?.image_url && (
             <div className="recolor-result">
