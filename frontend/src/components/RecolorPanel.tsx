@@ -38,7 +38,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
   }, [uploaded, protectMask]);
 
   useEffect(() => {
-    if (!uploaded) return;
+    if (!uploaded || !subjectMask || !protectMask || !/^#[0-9a-fA-F]{6}$/.test(targetColor)) return;
     if (previewTimerRef.current) {
       window.clearTimeout(previewTimerRef.current);
     }
@@ -60,7 +60,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
       setSubjectMask("");
       setProtectMask("");
       setPreviewImage("");
-      setShowOriginal(false);
+      setShowOriginal(true);
       setResult(null);
       setMessage("");
     } catch (error: any) {
@@ -94,18 +94,16 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
         protect_mask: canvasRef.current?.toDataURL("image/png") || protectMask
       };
     }
-    const masks = await analyzeMasks();
-    return {
-      subject_mask: masks.subject_mask,
-      protect_mask: masks.protect_mask
-    };
+    throw new Error("请先点击“自动识别”，确认五金保护区后再调色。");
   }
 
   async function analyze() {
     setBusy(true);
     try {
       await analyzeMasks();
-      await refreshPreview();
+      setPreviewImage("");
+      setShowOriginal(false);
+      setMessage("已识别保护区。蓝色区域会保持原色；确认后选择颜色开始预览。");
     } catch (error: any) {
       setMessage(explainError(error));
     } finally {
@@ -162,18 +160,19 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
   function drawProtectMask() {
     const canvas = canvasRef.current;
     const image = imageRef.current;
-    if (!canvas || !image || !protectMask) return;
+    if (!canvas || !image) return;
     canvas.width = image.naturalWidth || image.clientWidth;
     canvas.height = image.naturalHeight || image.clientHeight;
     const context = canvas.getContext("2d");
     if (!context) return;
     context.clearRect(0, 0, canvas.width, canvas.height);
+    if (!protectMask) return;
     const mask = new Image();
     mask.onload = () => {
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(mask, 0, 0, canvas.width, canvas.height);
       context.globalCompositeOperation = "source-in";
-      context.fillStyle = "rgba(255, 176, 0, 0.9)";
+      context.fillStyle = "rgba(0, 180, 255, 0.92)";
       context.fillRect(0, 0, canvas.width, canvas.height);
       context.globalCompositeOperation = "source-over";
     };
@@ -196,7 +195,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     const point = pointerPosition(event);
     context.save();
     context.globalCompositeOperation = mode === "protect" ? "source-over" : "destination-out";
-    context.fillStyle = "rgba(255, 176, 0, 0.9)";
+    context.fillStyle = "rgba(0, 180, 255, 0.92)";
     context.beginPath();
     context.arc(point.x, point.y, brushSize, 0, Math.PI * 2);
     context.fill();
@@ -205,12 +204,16 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
 
   function resetMask() {
     drawProtectMask();
-    window.setTimeout(() => refreshPreview(), 0);
+    setPreviewImage("");
+    setShowOriginal(false);
+    setMessage("已重置保护区，请确认后重新选择颜色预览。");
   }
 
   function finishPaint() {
     drawingRef.current = false;
-    refreshPreview();
+    if (previewImage) {
+      refreshPreview();
+    }
   }
 
   function wheelZoom(event: React.WheelEvent<HTMLDivElement>) {
@@ -218,6 +221,19 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     event.preventDefault();
     const delta = event.deltaY > 0 ? -0.1 : 0.1;
     setZoom((value) => Math.min(3, Math.max(0.5, Number((value + delta).toFixed(2)))));
+  }
+
+  function chooseColor(color: string) {
+    const normalized = color.trim();
+    const isSameColor = normalized.toLowerCase() === targetColor.toLowerCase();
+    setTargetColor(normalized);
+    if (!subjectMask || !protectMask) {
+      setMessage("请先点击“自动识别”，确认五金保护区后再调色。");
+      return;
+    }
+    if (isSameColor && subjectMask && protectMask && /^#[0-9a-fA-F]{6}$/.test(normalized)) {
+      refreshPreview();
+    }
   }
 
   return (
@@ -263,6 +279,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
                   <img ref={imageRef} src={showOriginal || !previewImage ? uploaded.preview_url : previewImage} onLoad={drawProtectMask} />
                   <canvas
                     ref={canvasRef}
+                    style={{ display: showOriginal ? "none" : "block" }}
                     onPointerDown={(event) => {
                       drawingRef.current = true;
                       paint(event);
@@ -280,15 +297,15 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
         <div className="recolor-controls">
           <label>目标颜色</label>
           <div className="color-row">
-            <input type="color" value={targetColor} onChange={(event) => setTargetColor(event.target.value)} />
-            <input value={targetColor} onChange={(event) => setTargetColor(event.target.value)} />
+            <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(targetColor) ? targetColor : "#000000"} onChange={(event) => chooseColor(event.target.value)} />
+            <input value={targetColor} onChange={(event) => chooseColor(event.target.value)} />
           </div>
           <div className="palette-row">
             {palette.map((color) => (
-              <button key={color} className="swatch" style={{ background: color }} onClick={() => setTargetColor(color)} title={color} />
+              <button key={color} className="swatch" style={{ background: color }} onClick={() => chooseColor(color)} title={color} />
             ))}
           </div>
-          <p className="recolor-help">点调色盘或修改颜色后会自动生成预览，不会保存历史。黄色区域是五金保护区，满意后再保存结果。</p>
+          <p className="recolor-help">先点“自动识别”并确认蓝色五金保护区。之后点调色盘或修改颜色才会生成预览，不会保存历史。</p>
           <div className="toolbar">
             <button onClick={analyze} disabled={busy || !uploaded}>
               <Pipette size={16} />
