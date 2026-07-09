@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.log
+111
+data/*
+backend/uploads/*
+backend/results/*
+backend/models/*
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo

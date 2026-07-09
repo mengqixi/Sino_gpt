@@ -11,3 +11,5 @@ backend/results/*
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+.playwright-cli/
+output/

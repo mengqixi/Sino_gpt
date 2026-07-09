@@ -82,6 +82,43 @@ def add_generated_image(job_id: int, image_path: str, source_type: str) -> None:
         )
 
 
+def create_local_recolor_job(upload_row, target_color: str, result_path: str) -> int:
+    ts = now_iso()
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO image_jobs (
+                task_type, status, original_image_path, original_image_name,
+                final_prompt, params_json, model_name, endpoint_path, output_count,
+                image_size, quality, request_payload_preview, created_at, updated_at
+            ) VALUES ('local_recolor', 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                upload_row["file_path"],
+                upload_row["file_name"],
+                f"本地智能调色：{target_color}",
+                json.dumps({"target_color": target_color}, ensure_ascii=False),
+                "local-opencv",
+                "/api/recolor/apply",
+                1,
+                "",
+                "",
+                json.dumps({"source": "local_recolor", "result_path": result_path}, ensure_ascii=False),
+                ts,
+                ts,
+            ),
+        )
+        job_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO generated_images (job_id, image_path, image_url, source_type, created_at)
+            VALUES (?, ?, ?, 'local_recolor', ?)
+            """,
+            (job_id, result_path, public_url_for(result_path), ts),
+        )
+        return job_id
+
+
 def get_upload(uploaded_image_id: int):
     with db_session() as conn:
         return conn.execute("SELECT * FROM uploaded_images WHERE id = ?", (uploaded_image_id,)).fetchone()

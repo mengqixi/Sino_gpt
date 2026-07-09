@@ -1,0 +1,14 @@
+name: bag-image-tool
+
+services:
+  bag-image-tool:
+    build: .
+    container_name: bag-image-tool
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./backend/uploads:/app/backend/uploads
+      - ./backend/results:/app/backend/results
+      - ./backend/models:/app/backend/models
+    restart: unless-stopped

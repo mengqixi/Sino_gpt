@@ -33,6 +33,9 @@ export const api = {
     return request<any>("/api/upload", { method: "POST", body: form });
   },
   uploadImages: (files: File[]) => Promise.all(files.map((file) => api.uploadImage(file))),
+  analyzeRecolor: (payload: any) => request<any>("/api/recolor/analyze", { method: "POST", body: JSON.stringify(payload) }),
+  applyRecolor: (payload: any) => request<any>("/api/recolor/apply", { method: "POST", body: JSON.stringify(payload) }),
+  reuseRecolor: (payload: any) => request<any>("/api/recolor/reuse", { method: "POST", body: JSON.stringify(payload) }),
   generate: (payload: any) => request<any>("/api/generate", { method: "POST", body: JSON.stringify(payload) }),
   reuseGeneratedImage: (id: number) => request<any>(`/api/generated-images/${id}/reuse`, { method: "POST" }),
   getHistory: () => request<any[]>("/api/history"),

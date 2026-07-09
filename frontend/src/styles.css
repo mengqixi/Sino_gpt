@@ -172,6 +172,104 @@ main {
   margin: 0 0 14px;
 }
 
+.recolor-panel {
+  margin-bottom: 16px;
+}
+
+.recolor-panel .panel-title-row p {
+  color: #665f55;
+  margin: 4px 0 0;
+}
+
+.recolor-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.2fr) minmax(280px, 0.8fr);
+  gap: 16px;
+}
+
+.recolor-stage {
+  background: #f2f5f2;
+  border-radius: 8px;
+  min-height: 360px;
+  overflow: hidden;
+}
+
+.recolor-upload {
+  min-height: 360px;
+}
+
+.mask-canvas-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.mask-canvas-wrap img {
+  display: block;
+  max-height: 620px;
+  object-fit: contain;
+  width: 100%;
+}
+
+.mask-canvas-wrap canvas {
+  cursor: crosshair;
+  height: 100%;
+  inset: 0;
+  mix-blend-mode: screen;
+  opacity: 0.56;
+  position: absolute;
+  width: 100%;
+}
+
+.recolor-controls {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.color-row {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 8px;
+}
+
+.color-row input[type="color"] {
+  min-height: 42px;
+  padding: 3px;
+}
+
+.palette-row {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.swatch {
+  border-radius: 6px;
+  min-height: 32px;
+  padding: 0;
+}
+
+.active-tool {
+  border-color: #1f4f43;
+  color: #1f4f43;
+  font-weight: 700;
+}
+
+.recolor-result {
+  border-top: 1px solid #e1e5e2;
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.recolor-result img {
+  background: #f2f5f2;
+  border-radius: 8px;
+  max-height: 260px;
+  object-fit: contain;
+  width: 100%;
+}
+
 .panel-title-row {
   align-items: center;
   display: flex;
@@ -698,6 +796,7 @@ main {
 
 @media (max-width: 1180px) {
   .generate-grid,
+  .recolor-layout,
   .manage-layout,
   .history-item {
     grid-template-columns: 1fr;

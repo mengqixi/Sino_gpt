@@ -1,6 +1,7 @@
 import { Copy, Download, HelpCircle, RotateCcw, Save, UploadCloud, Wand2, X, ZoomIn, ZoomOut } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import RecolorPanel from "../components/RecolorPanel";
 import { TASKS, taskLabel } from "../types";
 
 const defaultParams = {
@@ -29,7 +30,7 @@ const sizeOptions = [
 ];
 
 export default function Generate() {
-  const [taskType, setTaskType] = useState("color_change");
+  const [taskType, setTaskType] = useState("material_replace");
   const [prompts, setPrompts] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
   const [templateId, setTemplateId] = useState<number | "">("");
@@ -281,6 +282,7 @@ export default function Generate() {
     groups[item.group] = [...(groups[item.group] || []), item];
     return groups;
   }, {});
+  const visibleTasks = TASKS.filter((task) => task.value !== "color_change");
 
   return (
     <div className="page">
@@ -288,6 +290,12 @@ export default function Generate() {
         <h1>生成工作台</h1>
         <p>参数只用于生成提示词初稿，最终请求会使用文本框里的可编辑提示词。</p>
       </header>
+      <RecolorPanel
+        onUseAsSource={(image) => {
+          setUploadedImages([image]);
+          setMessage("????????????");
+        }}
+      />
       <div className="generate-grid">
         <section className="panel">
           <h2>图片与参数</h2>
@@ -309,7 +317,7 @@ export default function Generate() {
 
           <label>功能类型</label>
           <select value={taskType} onChange={(event) => setTaskType(event.target.value)}>
-            {TASKS.map((task) => (
+            {visibleTasks.map((task) => (
               <option key={task.value} value={task.value}>
                 {task.label}
               </option>
