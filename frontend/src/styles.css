@@ -191,7 +191,8 @@ main {
   background: #f2f5f2;
   border-radius: 8px;
   min-height: 360px;
-  overflow: hidden;
+  overflow: visible;
+  padding: 10px;
 }
 
 .recolor-upload {
@@ -199,13 +200,14 @@ main {
 }
 
 .mask-canvas-wrap {
+  min-width: 320px;
   position: relative;
   width: 100%;
 }
 
 .mask-canvas-wrap img {
   display: block;
-  max-height: 620px;
+  max-height: none;
   object-fit: contain;
   width: 100%;
 }
@@ -218,6 +220,27 @@ main {
   opacity: 0.56;
   position: absolute;
   width: 100%;
+}
+
+.mask-viewport {
+  background: #edf2ef;
+  border-radius: 8px;
+  max-height: 620px;
+  overflow: auto;
+}
+
+.stage-toolbar {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.stage-toolbar span {
+  color: #665f55;
+  min-width: 48px;
+  text-align: center;
 }
 
 .recolor-controls {
@@ -247,6 +270,13 @@ main {
   border-radius: 6px;
   min-height: 32px;
   padding: 0;
+}
+
+.recolor-help {
+  color: #665f55;
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0;
 }
 
 .active-tool {

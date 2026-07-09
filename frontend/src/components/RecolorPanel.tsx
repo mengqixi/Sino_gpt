@@ -1,4 +1,4 @@
-import { Download, Eraser, Paintbrush, Pipette, RotateCcw, Shield, UploadCloud } from "lucide-react";
+import { Download, Eraser, Paintbrush, Pipette, RotateCcw, Shield, UploadCloud, ZoomIn, ZoomOut } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -21,7 +21,8 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
   const [protectMask, setProtectMask] = useState("");
   const [result, setResult] = useState<any>(null);
   const [mode, setMode] = useState<"protect" | "erase">("protect");
-  const [brushSize, setBrushSize] = useState(18);
+  const [brushSize, setBrushSize] = useState(6);
+  const [zoom, setZoom] = useState(1);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -46,42 +47,60 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
     }
   }
 
-  async function analyze() {
-    if (!uploaded) {
-      setMessage("请先上传一张女包原图");
-      return;
+  function explainError(error: any) {
+    const text = String(error?.message || error || "");
+    if (text.includes("Method Not Allowed")) {
+      return "调色接口没有加载成功，请重启后端服务后再试。";
     }
+    return text || "操作失败";
+  }
+
+  async function analyzeMasks() {
+    if (!uploaded) {
+      throw new Error("请先上传一张女包原图");
+    }
+    const data = await api.analyzeRecolor({ uploaded_image_id: uploaded.image_id });
+    setSubjectMask(data.subject_mask);
+    setProtectMask(data.protect_mask);
+    setMessage(`已自动识别主体和五金候选区：${data.segmentation_backend}`);
+    return data;
+  }
+
+  async function analyze() {
     setBusy(true);
     try {
-      const data = await api.analyzeRecolor({ uploaded_image_id: uploaded.image_id });
-      setSubjectMask(data.subject_mask);
-      setProtectMask(data.protect_mask);
-      setMessage(`已自动识别主体和五金候选区：${data.segmentation_backend}`);
+      await analyzeMasks();
     } catch (error: any) {
-      setMessage(error.message);
+      setMessage(explainError(error));
     } finally {
       setBusy(false);
     }
   }
 
   async function apply() {
-    if (!uploaded || !subjectMask || !protectMask) {
-      setMessage("请先上传图片并自动识别调色区域");
+    if (!uploaded) {
+      setMessage("请先上传一张女包原图");
       return;
     }
     setBusy(true);
     try {
-      const editedProtectMask = canvasRef.current?.toDataURL("image/png") || protectMask;
+      let activeSubjectMask = subjectMask;
+      let activeProtectMask = canvasRef.current?.toDataURL("image/png") || protectMask;
+      if (!activeSubjectMask || !activeProtectMask) {
+        const masks = await analyzeMasks();
+        activeSubjectMask = masks.subject_mask;
+        activeProtectMask = masks.protect_mask;
+      }
       const data = await api.applyRecolor({
         uploaded_image_id: uploaded.image_id,
         target_color: targetColor,
-        subject_mask: subjectMask,
-        protect_mask: editedProtectMask
+        subject_mask: activeSubjectMask,
+        protect_mask: activeProtectMask
       });
       setResult(data);
       setMessage("调色结果已保存到历史记录，可下载或选为 AI 生成源图");
     } catch (error: any) {
-      setMessage(error.message);
+      setMessage(explainError(error));
     } finally {
       setBusy(false);
     }
@@ -156,18 +175,34 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
             </label>
           )}
           {uploaded && (
-            <div className="mask-canvas-wrap">
-              <img ref={imageRef} src={uploaded.preview_url} onLoad={drawProtectMask} />
-              <canvas
-                ref={canvasRef}
-                onPointerDown={(event) => {
-                  drawingRef.current = true;
-                  paint(event);
-                }}
-                onPointerMove={paint}
-                onPointerUp={() => (drawingRef.current = false)}
-                onPointerLeave={() => (drawingRef.current = false)}
-              />
+            <div>
+              <div className="stage-toolbar">
+                <button onClick={() => setZoom((value) => Math.max(0.5, Number((value - 0.25).toFixed(2))))}>
+                  <ZoomOut size={16} />
+                  缩小
+                </button>
+                <span>{Math.round(zoom * 100)}%</span>
+                <button onClick={() => setZoom((value) => Math.min(3, Number((value + 0.25).toFixed(2))))}>
+                  <ZoomIn size={16} />
+                  放大
+                </button>
+                <button onClick={() => setZoom(1)}>100%</button>
+              </div>
+              <div className="mask-viewport">
+                <div className="mask-canvas-wrap" style={{ width: `${zoom * 100}%` }}>
+                  <img ref={imageRef} src={uploaded.preview_url} onLoad={drawProtectMask} />
+                  <canvas
+                    ref={canvasRef}
+                    onPointerDown={(event) => {
+                      drawingRef.current = true;
+                      paint(event);
+                    }}
+                    onPointerMove={paint}
+                    onPointerUp={() => (drawingRef.current = false)}
+                    onPointerLeave={() => (drawingRef.current = false)}
+                  />
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -183,6 +218,7 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
               <button key={color} className="swatch" style={{ background: color }} onClick={() => setTargetColor(color)} title={color} />
             ))}
           </div>
+          <p className="recolor-help">可以直接点“应用当前颜色并保存”。系统会先识别包身调色区域，再把当前目标色应用到包身、图案和花纹上；五金保护区可用画笔修正。</p>
           <div className="toolbar">
             <button onClick={analyze} disabled={busy || !uploaded}>
               <Pipette size={16} />
@@ -197,16 +233,16 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
               擦除保护
             </button>
           </div>
-          <label>画笔大小</label>
-          <input type="range" min="6" max="60" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
+          <label>画笔大小：{brushSize}px</label>
+          <input type="range" min="1" max="30" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
           <div className="toolbar">
             <button onClick={resetMask} disabled={!protectMask}>
               <RotateCcw size={16} />
               重置保护区
             </button>
-            <button className="primary" onClick={apply} disabled={busy || !subjectMask}>
+            <button className="primary" onClick={apply} disabled={busy || !uploaded}>
               <Paintbrush size={16} />
-              应用并保存
+              应用当前颜色并保存
             </button>
           </div>
           {message && <div className="notice">{message}</div>}
