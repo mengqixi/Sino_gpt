@@ -220,7 +220,12 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
     for contour in contours:
         area = cv2.contourArea(contour)
         x, y, w, h = cv2.boundingRect(contour)
-        compact_logo = 3 <= area <= image_area * 0.004 and w <= rgb.shape[1] * 0.14 and h <= rgb.shape[0] * 0.05
+        compact_logo = (
+            3 <= area <= image_area * 0.004
+            and w >= max(8, h * 1.6)
+            and w <= rgb.shape[1] * 0.14
+            and h <= rgb.shape[0] * 0.05
+        )
         if compact_logo:
             cv2.drawContours(clean, [contour], -1, 255, thickness=-1)
 
