@@ -288,7 +288,7 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
     groups[item.group] = [...(groups[item.group] || []), item];
     return groups;
   }, {});
-  const visibleTasks = TASKS.filter((task) => task.value !== "color_change");
+  const visibleTasks = TASKS;
 
   return (
     <div className="page">
