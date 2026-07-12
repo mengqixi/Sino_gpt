@@ -387,18 +387,14 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
 
   return (
     <section className="panel recolor-panel">
-      <div className="panel-title-row">
-        <div>
-          <h2>智能调色</h2>
-          <p>本地换色：包身、图案和花纹跟随目标色变化，五金保护不变。</p>
-        </div>
-        {result?.image_url && (
+      {result?.image_url && (
+        <div className="panel-title-row">
           <a href={result.image_url} download="recolor.png">
             <Download size={16} />
             下载调色图
           </a>
-        )}
-      </div>
+        </div>
+      )}
 
       <div className="recolor-layout">
         <div className="recolor-stage">

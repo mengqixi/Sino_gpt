@@ -42,7 +42,7 @@ function statusLabel(status: string) {
 }
 
 export default function Generate({ initialUploadedImages = [] }: { initialUploadedImages?: any[] }) {
-  const [taskType, setTaskType] = useState("material_replace");
+  const [taskType, setTaskType] = useState("");
   const [prompts, setPrompts] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
   const [templateId, setTemplateId] = useState<number | "">("");
@@ -121,12 +121,16 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
   }, [taskType]);
 
   async function reload() {
-    const [promptRows, configRows] = await Promise.all([api.getPrompts(taskType), api.getApiConfigs()]);
+    const [promptRows, configRows] = await Promise.all([taskType ? api.getPrompts(taskType) : Promise.resolve([]), api.getApiConfigs()]);
     setPrompts(promptRows);
     const enabledConfigs = configRows.filter((item) => item.enabled);
     setConfigs(enabledConfigs);
     const defaultPrompt = promptRows.find((item) => item.is_default) || promptRows[0];
-    if (defaultPrompt) setTemplateId(defaultPrompt.id);
+    setTemplateId(defaultPrompt?.id || "");
+    if (!taskType) {
+      setFinalPrompt("");
+      setPromptTouched(false);
+    }
     const defaultConfig = preferredApiConfig(configRows);
     if (defaultConfig) setApiConfigId(defaultConfig.id);
     if (defaultConfig) setContinueApiConfigId(defaultConfig.id);
@@ -197,6 +201,10 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
     append = false,
     selectedConfigId: number | "" = apiConfigId
   ) {
+    if (!taskType) {
+      setMessage("请先选择功能类型，再填写参数和生成图片");
+      return null;
+    }
     if (!selectedConfigId) {
       setMessage("请先选择 API 配置");
       return null;
@@ -434,12 +442,14 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
 
           <label>功能类型</label>
           <select value={taskType} onChange={(event) => setTaskType(event.target.value)}>
+            <option value="" disabled>请先选择功能类型</option>
             {visibleTasks.map((task) => (
               <option key={task.value} value={task.value}>
                 {task.label}
               </option>
             ))}
           </select>
+          {!taskType && <div className="alert warning task-type-alert">请尽快选择功能类型，选择后才会加载对应参数和提示词。</div>}
 
           {taskType === "color_change" && (
             <>
@@ -522,7 +532,7 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
             </>
           )}
 
-          <label>图片尺寸</label>
+          {taskType && <><label>图片尺寸</label>
           <select value={sizeMode} onChange={(event) => setSizeMode(event.target.value)}>
             {Object.entries(groupedSizes).map(([group, items]) => (
               <optgroup key={group} label={group}>
@@ -535,7 +545,7 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
             ))}
             <option value="custom">自定义尺寸</option>
           </select>
-          {sizeMode === "custom" && <Input label="自定义尺寸" value={customImageSize} onChange={setCustomImageSize} />}
+          {sizeMode === "custom" && <Input label="自定义尺寸" value={customImageSize} onChange={setCustomImageSize} />}</>}
 
           <label>API 配置</label>
           <select value={apiConfigId} onChange={(event) => setApiConfigId(Number(event.target.value))}>
@@ -554,7 +564,8 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
               <Copy size={17} />
             </button>
           </div>
-          <label>模板选择</label>
+          {!taskType && <div className="empty-state">选择左侧功能类型后，这里会显示对应的最终提示词。</div>}
+          {taskType && <><label>模板选择</label>
           <select value={templateId} onChange={(event) => setTemplateId(Number(event.target.value))}>
             {prompts.map((prompt) => (
               <option key={prompt.id} value={prompt.id}>
@@ -579,11 +590,11 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
               setPromptTouched(true);
               setFinalPrompt(event.target.value);
             }}
-          />
-          <div className="preview-block">
+          /></>}
+          {taskType && <div className="preview-block">
             <strong>变量替换预览</strong>
             <pre>{JSON.stringify(mergedParams, null, 2)}</pre>
-          </div>
+          </div>}
         </section>
 
         <section className="panel result-panel">
@@ -591,7 +602,7 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
             <h2>生成结果</h2>
             <button onClick={restartConversation}>重开对话</button>
           </div>
-          <button className="primary" onClick={generate} disabled={loading}>
+          <button className="primary" onClick={generate} disabled={loading || !taskType}>
             <Wand2 size={18} />
             {loading ? "生成中" : "开始生成"}
           </button>
