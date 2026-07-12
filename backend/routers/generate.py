@@ -1,5 +1,4 @@
-from time import perf_counter
-from queue import Empty, Queue
+from time import perf_counter, sleep
 from threading import Thread
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -54,33 +53,32 @@ def _response_preview(value):
 
 def _run_generation(job_id: int, payload: dict, image_paths: list[str], config: dict):
     started = perf_counter()
+    hard_timeout = min(max(int(config.get("timeout_seconds") or 350), 30), 350)
+
+    def mark_unknown_if_running():
+        sleep(hard_timeout)
+        job = get_job(job_id)
+        if job and job["status"] == "running":
+            set_job_status(
+                job_id,
+                "unknown",
+                error_message=(
+                    f"中转站请求已等待 {hard_timeout} 秒，结果暂时未知且可能已经扣费；"
+                    "后台仍会继续接收本次响应，图片稍后返回时会自动更新为成功，系统不会重复提交。"
+                ),
+            )
+
+    Thread(target=mark_unknown_if_running, daemon=True, name=f"relay-watchdog-{job_id}").start()
     try:
-        result_queue: Queue = Queue(maxsize=1)
-
-        def request_relay():
-            try:
-                result_queue.put(("success", call_relay_image_api(
-                    config,
-                    image_paths,
-                    payload["final_prompt"],
-                    payload.get("output_count"),
-                    payload.get("image_size") or "1024x1024",
-                    payload.get("quality"),
-                )))
-            except Exception as exc:
-                result_queue.put(("error", exc))
-
-        hard_timeout = min(max(int(config.get("timeout_seconds") or 350), 30), 350)
-        Thread(target=request_relay, daemon=True, name=f"relay-job-{job_id}").start()
-        try:
-            outcome, value = result_queue.get(timeout=hard_timeout)
-        except Empty as exc:
-            raise RelayGatewayTimeoutError(
-                f"中转站请求超过应用硬超时 {hard_timeout} 秒，任务结果无法确认且可能已经扣费；系统不会自动重试。"
-            ) from exc
-        if outcome == "error":
-            raise value
-        response_json = value
+        relay_config = {**config, "timeout_seconds": max(hard_timeout, 900)}
+        response_json = call_relay_image_api(
+            relay_config,
+            image_paths,
+            payload["final_prompt"],
+            payload.get("output_count"),
+            payload.get("image_size") or "1024x1024",
+            payload.get("quality"),
+        )
         saved_images = save_images_from_response(response_json, config, job_id)
         auto_split = bool((payload.get("params") or {}).get("auto_split_grid", False))
         if auto_split and len(saved_images) == 1:

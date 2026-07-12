@@ -144,7 +144,9 @@ def call_relay_image_api(
         else:
             raise ValueError("Unsupported request_content_type")
     except requests.Timeout as exc:
-        raise ValueError("中转站请求超时，请增加 API 配置里的超时时间或稍后重试") from exc
+        raise RelayGatewayTimeoutError(
+            "中转站连接超时，结果无法确认且可能已经扣费；系统不会自动重试。"
+        ) from exc
     except requests.RequestException as exc:
         raise ValueError(f"中转站请求失败：{exc}") from exc
 

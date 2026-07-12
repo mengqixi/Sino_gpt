@@ -274,9 +274,31 @@ export default function Generate({
       const job = await api.getJob(jobId);
       setResult(job);
       setResultJobs((items) => items.map((item) => (item.job_id === jobId ? job : item)));
-      if (["success", "failed", "unknown"].includes(job.status)) return job;
+      if (job.status === "unknown") {
+        void watchLateJob(jobId);
+        return job;
+      }
+      if (["success", "failed"].includes(job.status)) return job;
     }
     throw new Error(`任务 ${jobId} 仍在后台生成，请稍后到历史记录查看，系统不会重复提交。`);
+  }
+
+  async function watchLateJob(jobId: number) {
+    const started = Date.now();
+    while (Date.now() - started < 15 * 60 * 1000) {
+      await new Promise((resolve) => window.setTimeout(resolve, 5000));
+      try {
+        const job = await api.getJob(jobId);
+        if (job.status === "success" || job.status === "failed") {
+          setResult(job);
+          setResultJobs((items) => items.map((item) => (item.job_id === jobId ? job : item)));
+          if (job.status === "success" && job.results?.[0]) setSelectedResult(job.results[0]);
+          return;
+        }
+      } catch {
+        return;
+      }
+    }
   }
 
   async function generate() {
