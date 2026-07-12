@@ -1,4 +1,6 @@
 from time import perf_counter
+from queue import Empty, Queue
+from threading import Thread
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -53,14 +55,32 @@ def _response_preview(value):
 def _run_generation(job_id: int, payload: dict, image_paths: list[str], config: dict):
     started = perf_counter()
     try:
-        response_json = call_relay_image_api(
-            config,
-            image_paths,
-            payload["final_prompt"],
-            payload.get("output_count"),
-            payload.get("image_size") or "1024x1024",
-            payload.get("quality"),
-        )
+        result_queue: Queue = Queue(maxsize=1)
+
+        def request_relay():
+            try:
+                result_queue.put(("success", call_relay_image_api(
+                    config,
+                    image_paths,
+                    payload["final_prompt"],
+                    payload.get("output_count"),
+                    payload.get("image_size") or "1024x1024",
+                    payload.get("quality"),
+                )))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        hard_timeout = min(max(int(config.get("timeout_seconds") or 180), 30), 180)
+        Thread(target=request_relay, daemon=True, name=f"relay-job-{job_id}").start()
+        try:
+            outcome, value = result_queue.get(timeout=hard_timeout)
+        except Empty as exc:
+            raise RelayGatewayTimeoutError(
+                f"中转站请求超过应用硬超时 {hard_timeout} 秒，任务结果无法确认且可能已经扣费；系统不会自动重试。"
+            ) from exc
+        if outcome == "error":
+            raise value
+        response_json = value
         saved_images = save_images_from_response(response_json, config, job_id)
         auto_split = bool((payload.get("params") or {}).get("auto_split_grid", False))
         if auto_split and len(saved_images) == 1:

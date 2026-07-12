@@ -17,10 +17,16 @@ export default function HistoryPage() {
 
   useEffect(() => {
     load();
+    const timer = window.setInterval(load, 3000);
+    return () => window.clearInterval(timer);
   }, []);
 
   async function load() {
-    setItems(await api.getHistory());
+    try {
+      setItems(await api.getHistory());
+    } catch (error: any) {
+      setMessage(error.message);
+    }
   }
 
   async function remove(id: number) {
