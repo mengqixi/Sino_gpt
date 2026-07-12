@@ -653,11 +653,7 @@ main {
 }
 
 .result-grid img {
-  aspect-ratio: 4 / 3;
   width: 100%;
-  object-fit: contain;
-  border-radius: 8px;
-  background: #eef2ef;
 }
 
 .result-actions {
@@ -675,9 +671,9 @@ main {
 }
 
 .selected-result {
-  border: 2px solid #1f4f43;
+  outline: 2px solid #1f4f43;
+  outline-offset: 6px;
   border-radius: 10px;
-  padding: 6px;
 }
 
 .continue-box,
@@ -736,9 +732,14 @@ main {
 }
 
 .conversation-list img {
-  aspect-ratio: 4 / 3;
+  width: 100%;
+}
+
+.generated-result-image {
   background: #eef2ef;
-  border-radius: 6px;
+  border-radius: 8px;
+  display: block;
+  height: auto;
   object-fit: contain;
   width: 100%;
 }

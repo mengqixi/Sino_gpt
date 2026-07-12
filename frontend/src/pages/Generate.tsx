@@ -691,7 +691,7 @@ export default function Generate({
                         }}
                         title="预览"
                       >
-                        <img src={image.image_url} />
+                        <img className="generated-result-image" src={image.image_url} />
                       </button>
                       <div className="result-actions">
                         <button
@@ -759,7 +759,7 @@ export default function Generate({
                   <p>{item.text}</p>
                   {item.imageUrl && (
                     <>
-                      <img src={item.imageUrl} />
+                      <img className="generated-result-image" src={item.imageUrl} />
                       <a href={item.imageUrl} download={`conversation_${index + 1}.png`}>
                         <Download size={15} />
                         下载
