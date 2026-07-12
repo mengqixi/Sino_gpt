@@ -39,6 +39,39 @@ function rgbToHex(r: number, g: number, b: number) {
   return `#${channel(r)}${channel(g)}${channel(b)}`;
 }
 
+function rgbToHsv({ r, g, b }: { r: number; g: number; b: number }) {
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const delta = max - min;
+  let h = 0;
+  if (delta) {
+    if (max === red) h = 60 * (((green - blue) / delta) % 6);
+    else if (max === green) h = 60 * ((blue - red) / delta + 2);
+    else h = 60 * ((red - green) / delta + 4);
+  }
+  if (h < 0) h += 360;
+  return { h, s: max ? (delta / max) * 100 : 0, v: max * 100 };
+}
+
+function hsvToHex(h: number, s: number, v: number) {
+  const saturation = s / 100;
+  const value = v / 100;
+  const chroma = value * saturation;
+  const section = h / 60;
+  const x = chroma * (1 - Math.abs((section % 2) - 1));
+  const offset = value - chroma;
+  const [red, green, blue] =
+    section < 1 ? [chroma, x, 0] :
+    section < 2 ? [x, chroma, 0] :
+    section < 3 ? [0, chroma, x] :
+    section < 4 ? [0, x, chroma] :
+    section < 5 ? [x, 0, chroma] : [chroma, 0, x];
+  return rgbToHex((red + offset) * 255, (green + offset) * 255, (blue + offset) * 255);
+}
+
 export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Props) {
   const [uploaded, setUploaded] = useState<UploadedImage | null>(null);
   const [targetColor, setTargetColor] = useState("#b52126");
@@ -414,6 +447,26 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
     ));
   }
 
+  function fineTunePicker(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (!event.key.startsWith("Arrow")) return;
+    const control = (event.target as HTMLElement).getAttribute("aria-label");
+    if (control !== "Color" && control !== "Hue") return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const hsv = rgbToHsv(hexToRgb(targetColor));
+    if (control === "Hue") {
+      const direction = event.key === "ArrowRight" || event.key === "ArrowUp" ? 0.5 : -0.5;
+      chooseColor(hsvToHex((hsv.h + direction + 360) % 360, hsv.s, hsv.v));
+      return;
+    }
+
+    const clamp = (value: number) => Math.min(100, Math.max(0, value));
+    const nextSaturation = clamp(hsv.s + (event.key === "ArrowRight" ? 0.5 : event.key === "ArrowLeft" ? -0.5 : 0));
+    const nextValue = clamp(hsv.v + (event.key === "ArrowUp" ? 0.5 : event.key === "ArrowDown" ? -0.5 : 0));
+    chooseColor(hsvToHex(hsv.h, nextSaturation, nextValue));
+  }
+
   const rgb = hexToRgb(targetColor);
 
   return (
@@ -504,7 +557,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
             <input value={targetColor} onChange={(event) => chooseColor(event.target.value)} />
           </div>
           {pickerOpen && (
-            <div className="large-color-picker">
+            <div className="large-color-picker" onKeyDownCapture={fineTunePicker}>
               <HexColorPicker color={targetColor} onChange={chooseColor} />
               <div className="rgb-fields">
                 <label>
