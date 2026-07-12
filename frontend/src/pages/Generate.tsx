@@ -41,7 +41,20 @@ function statusLabel(status: string) {
   return status;
 }
 
-export default function Generate({ initialUploadedImages = [] }: { initialUploadedImages?: any[] }) {
+type GenerateIntent = {
+  images: any[];
+  taskType?: string;
+  targetColor?: string;
+  message?: string;
+};
+
+export default function Generate({
+  initialIntent,
+  onIntentConsumed
+}: {
+  initialIntent?: GenerateIntent | null;
+  onIntentConsumed?: () => void;
+}) {
   const [taskType, setTaskType] = useState("");
   const [prompts, setPrompts] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
@@ -78,11 +91,22 @@ export default function Generate({ initialUploadedImages = [] }: { initialUpload
   const uploaded = uploadedImages[0] || null;
 
   useEffect(() => {
-    if (initialUploadedImages.length) {
-      setUploadedImages(initialUploadedImages);
-      setMessage("已将调色结果选为生成源图");
+    if (!initialIntent) return;
+
+    setUploadedImages(initialIntent.images || []);
+    if (initialIntent.taskType) setTaskType(initialIntent.taskType);
+    if (initialIntent.targetColor) {
+      setParams((current) => ({ ...current, target_color: initialIntent.targetColor || "" }));
     }
-  }, [initialUploadedImages]);
+    setFinalPrompt("");
+    setPromptTouched(false);
+    setResult(null);
+    setResultJobs([]);
+    setSelectedResult(null);
+    setConversation([]);
+    setMessage(initialIntent.message || "已带入生成源图");
+    onIntentConsumed?.();
+  }, [initialIntent]);
 
   const bagDimensionExtra = useMemo(() => {
     const length = params.bag_length_cm.trim();

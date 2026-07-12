@@ -11,9 +11,16 @@ import "./styles.css";
 
 type Page = "recolor" | "ecommerce" | "generate" | "prompts" | "api" | "history";
 
+type GenerateIntent = {
+  images: any[];
+  taskType?: string;
+  targetColor?: string;
+  message?: string;
+};
+
 function App() {
   const [page, setPage] = useState<Page>("recolor");
-  const [generateSources, setGenerateSources] = useState<any[]>([]);
+  const [generateIntent, setGenerateIntent] = useState<GenerateIntent | null>(null);
   const nav = [
     { key: "recolor" as Page, label: "智能调色", icon: Palette },
     { key: "generate" as Page, label: "AI 生成", icon: Wand2 },
@@ -49,12 +56,23 @@ function App() {
         {page === "recolor" && (
           <RecolorPage
             onUseAsSource={(image) => {
-              setGenerateSources([image]);
+              setGenerateIntent({ images: [image], message: "已将调色结果选为生成源图" });
+              setPage("generate");
+            }}
+            onSendOriginalToAi={(image, targetColor) => {
+              setGenerateIntent({
+                images: [image],
+                taskType: "color_change",
+                targetColor,
+                message: `已带入原图和目标颜色 ${targetColor}`
+              });
               setPage("generate");
             }}
           />
         )}
-        {page === "generate" && <Generate initialUploadedImages={generateSources} />}
+        {page === "generate" && (
+          <Generate initialIntent={generateIntent} onIntentConsumed={() => setGenerateIntent(null)} />
+        )}
         {page === "ecommerce" && <Ecommerce />}
         {page === "prompts" && <PromptTemplates />}
         {page === "api" && <ApiConfigs />}

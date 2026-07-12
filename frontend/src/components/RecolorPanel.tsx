@@ -1,4 +1,4 @@
-import { Download, Eraser, Eye, Image as ImageIcon, Pipette, RotateCcw, Save, ScanSearch, Shield, UploadCloud } from "lucide-react";
+import { Download, Eraser, Eye, Image as ImageIcon, Pipette, RotateCcw, Save, ScanSearch, Shield, UploadCloud, Wand2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -10,6 +10,7 @@ type UploadedImage = {
 
 type Props = {
   onUseAsSource: (image: UploadedImage) => void;
+  onSendOriginalToAi: (image: UploadedImage, targetColor: string) => void;
 };
 
 const palette = ["#111111", "#f5f2ea", "#b52126", "#8a1f1d", "#2f4d3c", "#5f4635", "#d9c7a3", "#6f7d8f"];
@@ -22,7 +23,7 @@ type SelectionBox = {
   action: "add" | "remove";
 };
 
-export default function RecolorPanel({ onUseAsSource }: Props) {
+export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Props) {
   const [uploaded, setUploaded] = useState<UploadedImage | null>(null);
   const [targetColor, setTargetColor] = useState("#b52126");
   const [recolorStrength, setRecolorStrength] = useState(86);
@@ -477,6 +478,15 @@ export default function RecolorPanel({ onUseAsSource }: Props) {
               <button key={color} className="swatch" style={{ background: color }} onClick={() => chooseColor(color)} title={color} />
             ))}
           </div>
+          <button
+            className="primary recolor-to-ai"
+            disabled={!uploaded || !/^#[0-9a-fA-F]{6}$/.test(targetColor)}
+            onClick={() => uploaded && onSendOriginalToAi(uploaded, targetColor)}
+            title="只带入原图和当前目标颜色，不使用本地调色预览及调节参数"
+          >
+            <Wand2 size={17} />
+            原图和当前颜色去 AI 换色
+          </button>
           <div className="recolor-adjustments">
             <label>
               <span>调色强度</span>
