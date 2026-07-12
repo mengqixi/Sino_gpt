@@ -266,7 +266,7 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
         min_x, max_x = int(xs.min()), int(xs.max())
         min_y, max_y = int(ys.min()), int(ys.max())
         logo_region[
-            int(min_y + (max_y - min_y) * 0.28) : int(min_y + (max_y - min_y) * 0.9) + 1,
+            int(min_y + (max_y - min_y) * 0.5) : int(min_y + (max_y - min_y) * 0.9) + 1,
             int(min_x + (max_x - min_x) * 0.2) : int(min_x + (max_x - min_x) * 0.8) + 1,
         ] = True
 
@@ -288,43 +288,13 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 55, 150)
     local_gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=9)
-    border = max(6, min(rgb.shape[:2]) // 40)
-    background_samples = np.concatenate(
-        [
-            rgb[:border, :, :].reshape(-1, 3),
-            rgb[-border:, :, :].reshape(-1, 3),
-            rgb[:, :border, :].reshape(-1, 3),
-            rgb[:, -border:, :].reshape(-1, 3),
-        ],
-        axis=0,
-    )
-    background_color = np.median(background_samples, axis=0)
-    background_distance = np.linalg.norm(rgb.astype(np.float32) - background_color.astype(np.float32), axis=2)
     bright_detail = (
         subject_interior
         & logo_region
-        & (value >= 185)
+        & (value >= 145)
         & (saturation <= 150)
-        & (background_distance >= 28)
         & (gray.astype(np.int16) - local_gray.astype(np.int16) >= 28)
     )
-    local_contrast = np.abs(gray.astype(np.int16) - local_gray.astype(np.int16))
-    pale_gold = (
-        (hue >= 4)
-        & (hue <= 48)
-        & (saturation >= 18)
-        & (saturation <= 135)
-        & (value >= 135)
-        & (rgb[:, :, 0] >= rgb[:, :, 2] + 8)
-    )
-    subject_values = value[subject_core]
-    subject_value_median = float(np.median(subject_values)) if subject_values.size else 145.0
-    elle_logo_plate = (
-        subject_core
-        & logo_region
-        & pale_gold
-        & (value >= max(165.0, subject_value_median + 20.0))
-    ).astype(np.uint8) * 255
 
     zipper_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 2))
     horizontal_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, zipper_kernel)
@@ -358,33 +328,6 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
         if compact_logo:
             cv2.drawContours(clean, [contour], -1, 255, thickness=-1)
 
-    # ELLE bags commonly use pale-gold letter marks and geometric lock plates.
-    # Use brightness relative to the bag itself, then fill the compact plate so
-    # engraved/negative-space letters are protected with the surrounding metal.
-    elle_logo_plate = cv2.morphologyEx(
-        elle_logo_plate,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 9)),
-        iterations=1,
-    )
-    contours, _ = cv2.findContours(elle_logo_plate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    subject_width = max(1, int(xs.max() - xs.min() + 1)) if len(xs) else rgb.shape[1]
-    subject_height = max(1, int(ys.max() - ys.min() + 1)) if len(ys) else rgb.shape[0]
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        x, y, w, h = cv2.boundingRect(contour)
-        candidate_density = float(np.count_nonzero(elle_logo_plate[y : y + h, x : x + w])) / max(1, w * h)
-        compact_elle_hardware = (
-            2 <= area <= image_area * 0.018
-            and w <= subject_width * 0.58
-            and h <= subject_height * 0.28
-            and w >= 3
-            and h >= 2
-            and candidate_density >= 0.2
-        )
-        if compact_elle_hardware:
-            cv2.drawContours(clean, [cv2.convexHull(contour)], -1, 255, thickness=-1)
-
     contours, _ = cv2.findContours(zipper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -394,38 +337,6 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
             cv2.drawContours(clean, [contour], -1, 255, thickness=-1)
     kernel = np.ones((3, 3), np.uint8)
     clean = cv2.dilate(clean, kernel, iterations=2)
-
-    # Product-sheet baselines and soft floor edges often sit immediately below
-    # the bag and share its warm color. They are not hardware. Remove only thin,
-    # horizontal components at the very bottom of the subject bounds.
-    if len(xs):
-        floor_y = int(ys.min() + subject_height * 0.91)
-        subject_contours, _ = cv2.findContours(subject_raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        main_subject = max(subject_contours, key=cv2.contourArea) if subject_contours else None
-        main_x, _, main_w, _ = cv2.boundingRect(main_subject) if main_subject is not None else (int(xs.min()), int(ys.min()), subject_width, subject_height)
-        center_left = int(main_x + main_w * 0.08)
-        center_right = int(main_x + main_w * 0.92)
-        horizontal = cv2.morphologyEx(
-            clean,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 2)),
-            iterations=1,
-        )
-        floor_strip = np.zeros_like(clean)
-        floor_strip[floor_y:, center_left:center_right] = horizontal[floor_y:, center_left:center_right]
-        logo_center_left = int(main_x + main_w * 0.35)
-        logo_center_right = int(main_x + main_w * 0.65)
-        floor_strip[:, logo_center_left:logo_center_right] = 0
-        floor_strip = cv2.dilate(floor_strip, np.ones((3, 3), np.uint8), iterations=1)
-        clean = cv2.bitwise_and(clean, cv2.bitwise_not(floor_strip))
-        filtered = np.zeros_like(clean)
-        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            floor_line = y >= floor_y and h <= max(8, int(subject_height * 0.055)) and w >= h * 1.8
-            if not floor_line:
-                cv2.drawContours(filtered, [contour], -1, 255, thickness=-1)
-        clean = filtered
     return Image.fromarray(clean, mode="L").filter(ImageFilter.GaussianBlur(0.8))
 
 
@@ -552,14 +463,7 @@ def select_hardware_region(
     }
 
 
-def render_recolor_image(
-    image_path: str,
-    target_color: str,
-    subject_mask: str,
-    protect_mask: str,
-    recolor_strength: int = 86,
-    texture_strength: int = 78,
-) -> Image.Image:
+def render_recolor_image(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> Image.Image:
     image = _load_rgb(image_path)
     target = _hex_to_rgb(target_color)
     subject_alpha = np.array(_data_url_to_mask(subject_mask, image.size)).astype(np.float32) / 255.0
@@ -569,38 +473,25 @@ def render_recolor_image(
         raise ValueError("没有可调色区域，请先识别主体或用画笔修正遮罩。")
 
     rgb = np.array(image).astype(np.float32)
-    strength = float(np.clip(recolor_strength, 0, 100)) / 100.0
-    texture_amount = float(np.clip(texture_strength, 0, 100)) / 100.0
     luminance = (0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]) / 255.0
-    preserved_shade = 0.28 + luminance[..., None] * 0.95
-    shade = (1.0 - texture_amount) * 0.82 + texture_amount * preserved_shade
+    shade = 0.28 + luminance[..., None] * 0.95
     recolored = np.clip(target[None, None, :] * shade, 0, 255)
     texture = rgb - luminance[..., None] * 255.0
-    recolored = np.clip(recolored + texture * (0.04 + texture_amount * 0.24), 0, 255)
+    recolored = np.clip(recolored + texture * 0.18, 0, 255)
 
     result = rgb.copy()
-    alpha = (recolor_alpha * strength)[..., None]
+    alpha = (recolor_alpha * 0.86)[..., None]
     result = rgb * (1 - alpha) + recolored * alpha
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), mode="RGB")
 
 
-def preview_recolor(
-    image_path: str, target_color: str, subject_mask: str, protect_mask: str,
-    recolor_strength: int = 86, texture_strength: int = 78,
-) -> dict:
-    result_image = render_recolor_image(
-        image_path, target_color, subject_mask, protect_mask, recolor_strength, texture_strength
-    )
+def preview_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> dict:
+    result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
     return {"preview_image": _image_to_data_url(result_image)}
 
 
-def apply_recolor(
-    image_path: str, target_color: str, subject_mask: str, protect_mask: str,
-    recolor_strength: int = 86, texture_strength: int = 78,
-) -> str:
-    result_image = render_recolor_image(
-        image_path, target_color, subject_mask, protect_mask, recolor_strength, texture_strength
-    )
+def apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
+    result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     output = RESULT_DIR / f"recolor_{uuid.uuid4().hex[:12]}.png"
     result_image.save(output)

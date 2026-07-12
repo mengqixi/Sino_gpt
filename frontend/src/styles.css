@@ -317,43 +317,25 @@ main {
 
 .color-row {
   display: grid;
-  grid-template-columns: 72px 1fr;
-  gap: 10px;
+  grid-template-columns: 96px 1fr;
+  gap: 12px;
 }
 
 .color-row input[type="color"] {
-  min-height: 52px;
-  padding: 4px;
+  min-height: 68px;
+  padding: 5px;
 }
 
 .palette-row {
   display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(4, minmax(72px, 1fr));
+  gap: 10px;
 }
 
 .swatch {
   border-radius: 6px;
-  min-height: 44px;
+  min-height: 58px;
   padding: 0;
-}
-
-.recolor-adjustments {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
-  padding: 12px 0 4px;
-}
-
-.recolor-adjustments label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.recolor-adjustments strong {
-  color: #1f4f43;
-  font-variant-numeric: tabular-nums;
 }
 
 .recolor-help {

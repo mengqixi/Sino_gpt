@@ -26,8 +26,6 @@ type SelectionBox = {
 export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Props) {
   const [uploaded, setUploaded] = useState<UploadedImage | null>(null);
   const [targetColor, setTargetColor] = useState("#b52126");
-  const [recolorStrength, setRecolorStrength] = useState(86);
-  const [textureStrength, setTextureStrength] = useState(78);
   const [subjectMask, setSubjectMask] = useState("");
   const [protectMask, setProtectMask] = useState("");
   const [initialProtectMask, setInitialProtectMask] = useState("");
@@ -65,7 +63,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
         window.clearTimeout(previewTimerRef.current);
       }
     };
-  }, [targetColor, recolorStrength, textureStrength, uploaded?.image_id]);
+  }, [targetColor, uploaded?.image_id]);
 
   async function upload(file?: File) {
     if (!file) return;
@@ -166,9 +164,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
         uploaded_image_id: uploaded.image_id,
         target_color: targetColor,
         subject_mask: masks.subject_mask,
-        protect_mask: masks.protect_mask,
-        recolor_strength: recolorStrength,
-        texture_strength: textureStrength
+        protect_mask: masks.protect_mask
       });
       setPreviewImage(data.preview_image);
       setShowOriginal(false);
@@ -193,9 +189,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
         uploaded_image_id: uploaded.image_id,
         target_color: targetColor,
         subject_mask: masks.subject_mask,
-        protect_mask: masks.protect_mask,
-        recolor_strength: recolorStrength,
-        texture_strength: textureStrength
+        protect_mask: masks.protect_mask
       });
       setResult(data);
       setMessage("调色结果已保存到历史记录，可下载或选为 AI 生成源图");
@@ -487,18 +481,6 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
             <Wand2 size={17} />
             原图和当前颜色去 AI 换色
           </button>
-          <div className="recolor-adjustments">
-            <label>
-              <span>调色强度</span>
-              <strong>{recolorStrength}%</strong>
-            </label>
-            <input type="range" min="0" max="100" value={recolorStrength} onChange={(event) => setRecolorStrength(Number(event.target.value))} />
-            <label>
-              <span>纹理保留</span>
-              <strong>{textureStrength}%</strong>
-            </label>
-            <input type="range" min="0" max="100" value={textureStrength} onChange={(event) => setTextureStrength(Number(event.target.value))} />
-          </div>
           <p className="recolor-help">先用“自动识别”得到初稿，再用“智能框选”修正：左键框选五金，右键框选可排除误识别。之后选择颜色生成预览。</p>
           <div className="toolbar">
             <button onClick={analyze} disabled={busy || !uploaded}>

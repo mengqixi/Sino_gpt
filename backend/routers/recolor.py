@@ -76,7 +76,6 @@ def apply(payload: ApplyPayload):
     try:
         result_path = apply_recolor(
             upload["file_path"], payload.target_color, payload.subject_mask, payload.protect_mask,
-            payload.recolor_strength, payload.texture_strength,
         )
         job_id = create_local_recolor_job(upload, payload.target_color, result_path)
         generated = get_job(job_id)["results"][0]
@@ -99,7 +98,6 @@ def preview(payload: ApplyPayload):
     try:
         return preview_recolor(
             upload["file_path"], payload.target_color, payload.subject_mask, payload.protect_mask,
-            payload.recolor_strength, payload.texture_strength,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
