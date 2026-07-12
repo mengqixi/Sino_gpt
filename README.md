@@ -49,6 +49,29 @@ Docker 会挂载以下目录，升级镜像时不会丢数据：
 - `backend/results/`：生成图和本地调色结果
 - `backend/models/`：预留 SAM/SAM2 模型目录
 
+## 轻量服务器更新
+
+生产服务器使用项目专属 Python 环境，前端在本地构建并将 `frontend/dist` 一同提交到 GitHub。服务器不运行 npm、Docker 或前端构建。
+
+本地发布：
+
+```powershell
+cd frontend
+npm run build
+cd ..
+git add -A
+git commit -m "更新说明"
+git push origin main
+```
+
+服务器更新：
+
+```bash
+/opt/sino-gpt/update.sh
+```
+
+更新脚本只拉取 `main` 分支并重启 `sino-gpt.service`。数据库、上传图和结果图位于 `/opt/sino-gpt/` 的独立持久化目录，不会被 Git 更新覆盖。
+
 ## 智能调色
 
 左侧“智能调色”是本地处理，不调用中转站 API。流程：
