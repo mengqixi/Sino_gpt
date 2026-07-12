@@ -321,9 +321,41 @@ main {
   gap: 12px;
 }
 
-.color-row input[type="color"] {
+.color-picker-trigger {
   min-height: 68px;
   padding: 5px;
+  border: 6px solid #fff;
+  box-shadow: 0 0 0 1px #d9d3c9;
+}
+
+.large-color-picker {
+  display: grid;
+  gap: 10px;
+  width: min(100%, 420px);
+  padding: 12px;
+  border: 1px solid #d9d3c9;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(32, 38, 35, 0.12);
+}
+
+.large-color-picker .react-colorful {
+  width: 100%;
+  height: 300px;
+}
+
+.large-color-picker .react-colorful__saturation {
+  border-radius: 4px 4px 0 0;
+}
+
+.large-color-picker .react-colorful__hue {
+  height: 30px;
+  border-radius: 0 0 4px 4px;
+}
+
+.large-color-picker .react-colorful__pointer {
+  width: 28px;
+  height: 28px;
 }
 
 .palette-row {

@@ -1,5 +1,6 @@
 import { Download, Eraser, Eye, Image as ImageIcon, Pipette, RotateCcw, Save, ScanSearch, Shield, UploadCloud, Wand2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { HexColorPicker } from "react-colorful";
 import { api } from "../api/client";
 
 type UploadedImage = {
@@ -26,6 +27,7 @@ type SelectionBox = {
 export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Props) {
   const [uploaded, setUploaded] = useState<UploadedImage | null>(null);
   const [targetColor, setTargetColor] = useState("#b52126");
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [subjectMask, setSubjectMask] = useState("");
   const [protectMask, setProtectMask] = useState("");
   const [initialProtectMask, setInitialProtectMask] = useState("");
@@ -464,9 +466,21 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
         <div className="recolor-controls">
           <label>目标颜色</label>
           <div className="color-row">
-            <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(targetColor) ? targetColor : "#000000"} onChange={(event) => chooseColor(event.target.value)} />
+            <button
+              className="color-picker-trigger"
+              style={{ background: /^#[0-9a-fA-F]{6}$/.test(targetColor) ? targetColor : "#000000" }}
+              onClick={() => setPickerOpen((current) => !current)}
+              title="打开大取色器"
+              aria-label="打开大取色器"
+            />
             <input value={targetColor} onChange={(event) => chooseColor(event.target.value)} />
           </div>
+          {pickerOpen && (
+            <div className="large-color-picker">
+              <HexColorPicker color={targetColor} onChange={chooseColor} />
+              <button onClick={() => setPickerOpen(false)}>收起取色器</button>
+            </div>
+          )}
           <div className="palette-row">
             {palette.map((color) => (
               <button key={color} className="swatch" style={{ background: color }} onClick={() => chooseColor(color)} title={color} />
