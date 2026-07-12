@@ -24,6 +24,21 @@ type SelectionBox = {
   action: "add" | "remove";
 };
 
+function hexToRgb(color: string) {
+  const match = /^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$/.exec(color);
+  if (!match) return { r: 0, g: 0, b: 0 };
+  return {
+    r: Number.parseInt(match[1], 16),
+    g: Number.parseInt(match[2], 16),
+    b: Number.parseInt(match[3], 16)
+  };
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  const channel = (value: number) => Math.min(255, Math.max(0, Math.round(value))).toString(16).padStart(2, "0");
+  return `#${channel(r)}${channel(g)}${channel(b)}`;
+}
+
 export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Props) {
   const [uploaded, setUploaded] = useState<UploadedImage | null>(null);
   const [targetColor, setTargetColor] = useState("#b52126");
@@ -388,6 +403,19 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
     }
   }
 
+  function chooseRgb(channel: "r" | "g" | "b", value: string) {
+    const current = hexToRgb(targetColor);
+    const next = Number.parseInt(value, 10);
+    if (Number.isNaN(next)) return;
+    chooseColor(rgbToHex(
+      channel === "r" ? next : current.r,
+      channel === "g" ? next : current.g,
+      channel === "b" ? next : current.b
+    ));
+  }
+
+  const rgb = hexToRgb(targetColor);
+
   return (
     <section className="panel recolor-panel">
       {result?.image_url && (
@@ -478,6 +506,20 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
           {pickerOpen && (
             <div className="large-color-picker">
               <HexColorPicker color={targetColor} onChange={chooseColor} />
+              <div className="rgb-fields">
+                <label>
+                  <span>R</span>
+                  <input type="number" min="0" max="255" step="1" value={rgb.r} onChange={(event) => chooseRgb("r", event.target.value)} />
+                </label>
+                <label>
+                  <span>G</span>
+                  <input type="number" min="0" max="255" step="1" value={rgb.g} onChange={(event) => chooseRgb("g", event.target.value)} />
+                </label>
+                <label>
+                  <span>B</span>
+                  <input type="number" min="0" max="255" step="1" value={rgb.b} onChange={(event) => chooseRgb("b", event.target.value)} />
+                </label>
+              </div>
               <button onClick={() => setPickerOpen(false)}>收起取色器</button>
             </div>
           )}
