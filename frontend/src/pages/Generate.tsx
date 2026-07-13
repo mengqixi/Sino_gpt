@@ -2,6 +2,7 @@ import { Copy, Crop, Download, HelpCircle, RotateCcw, Save, UploadCloud, Wand2, 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import { TASKS, taskLabel } from "../types";
+import { copyText } from "../utils/clipboard";
 
 const defaultParams = {
   target_color: "",
@@ -329,6 +330,11 @@ export default function Generate({
     setParams((current) => ({ ...current, [key]: value }));
   }
 
+  async function copyFinalPrompt() {
+    const copied = await copyText(finalPrompt);
+    setMessage(copied ? "提示词已复制" : "提示词为空或复制失败，请先选择功能类型并生成提示词");
+  }
+
   function togglePart(part: string) {
     setSelectedParts((current) => (current.includes(part) ? current.filter((item) => item !== part) : [...current, part]));
   }
@@ -631,7 +637,7 @@ export default function Generate({
         <section className="panel prompt-panel">
           <div className="panel-title-row">
             <h2>最终提示词</h2>
-            <button className="icon-button" onClick={() => navigator.clipboard.writeText(finalPrompt)} title="复制提示词">
+            <button className="icon-button" onClick={copyFinalPrompt} title="复制提示词" disabled={!finalPrompt.trim()}>
               <Copy size={17} />
             </button>
           </div>

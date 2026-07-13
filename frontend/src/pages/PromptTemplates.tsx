@@ -2,6 +2,7 @@ import { Copy, RotateCcw, Save, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { TASKS, VARIABLES, taskLabel } from "../types";
+import { copyText } from "../utils/clipboard";
 
 export default function PromptTemplates() {
   const [taskType, setTaskType] = useState("");
@@ -71,6 +72,11 @@ export default function PromptTemplates() {
     setSelected({ ...selected, template_content: `${selected.template_content || ""}{{${variable}}}` });
   }
 
+  async function copyTemplate() {
+    const copied = await copyText(selected?.template_content || "");
+    setMessage(copied ? "提示词已复制" : "提示词为空或复制失败");
+  }
+
   return (
     <div className="page">
       <header className="page-header">
@@ -110,7 +116,7 @@ export default function PromptTemplates() {
               <div className="panel-title-row">
                 <h2>编辑模板</h2>
                 <div className="toolbar compact">
-                  <button onClick={() => navigator.clipboard.writeText(selected.template_content || "")}>
+                  <button onClick={copyTemplate} disabled={!selected.template_content}>
                     <Copy size={16} />
                     复制
                   </button>
