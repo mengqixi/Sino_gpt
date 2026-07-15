@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_DIR, RESULT_DIR, UPLOAD_DIR
 from .database import init_db
-from .routers import api_configs, ecommerce, generate, history, prompts, recolor, upload
+from .routers import api_configs, ecommerce, generate, history, prompts, recolor, upload, vip_organizer
 from .seed_prompts import seed_prompt_templates
 
 
@@ -44,6 +44,7 @@ app.include_router(generate.router)
 app.include_router(history.router)
 app.include_router(recolor.router)
 app.include_router(ecommerce.router)
+app.include_router(vip_organizer.router)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/results", StaticFiles(directory=RESULT_DIR), name="results")

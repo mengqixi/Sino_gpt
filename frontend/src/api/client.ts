@@ -6,7 +6,14 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     headers: options.body instanceof FormData ? options.headers : { "Content-Type": "application/json", ...(options.headers || {}) }
   });
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  let data: any = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { detail: text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300) };
+    }
+  }
   if (!response.ok) {
     throw new Error(data?.detail || "请求失败");
   }
@@ -24,6 +31,18 @@ export const api = {
   getApiConfigs: () => request<any[]>("/api/api-configs"),
   getEcommerceTemplates: () => request<any[]>("/api/ecommerce/templates"),
   planEcommerceCampaign: (payload: any) => request<any>("/api/ecommerce/plan", { method: "POST", body: JSON.stringify(payload) }),
+  analyzeVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/analyze", { method: "POST", body: JSON.stringify(payload) }),
+  analyzeVipOrganizerWithApi: (payload: any) => request<any>("/api/vip-organizer/analyze-with-api", { method: "POST", body: JSON.stringify(payload) }),
+  getVipAnalysisConfig: () => request<any>("/api/vip-organizer/analysis-config"),
+  exportVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/export", { method: "POST", body: JSON.stringify(payload) }),
+  startVipOrganizerSession: () => request<{ session_id: string }>("/api/vip-organizer/session", { method: "POST" }),
+  uploadVipOrganizerAssets: (sessionId: string, assetType: string, files: File[]) => {
+    const form = new FormData();
+    form.append("session_id", sessionId);
+    form.append("asset_type", assetType);
+    files.forEach((file) => form.append("files", file));
+    return request<any[]>("/api/vip-organizer/upload", { method: "POST", body: form });
+  },
   createApiConfig: (payload: any) => request<any>("/api/api-configs", { method: "POST", body: JSON.stringify(payload) }),
   updateApiConfig: (id: number, payload: any) => request<any>(`/api/api-configs/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteApiConfig: (id: number) => request(`/api/api-configs/${id}`, { method: "DELETE" }),

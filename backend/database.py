@@ -120,6 +120,33 @@ def init_db() -> None:
                 height INTEGER,
                 created_at DATETIME
             );
+
+            CREATE TABLE IF NOT EXISTS vip_organizer_sessions (
+                id TEXT PRIMARY KEY,
+                created_at DATETIME
+            );
+
+            CREATE TABLE IF NOT EXISTS vip_organizer_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                asset_type TEXT NOT NULL,
+                file_name TEXT,
+                file_path TEXT NOT NULL,
+                file_size INTEGER,
+                mime_type TEXT,
+                width INTEGER,
+                height INTEGER,
+                created_at DATETIME,
+                FOREIGN KEY(session_id) REFERENCES vip_organizer_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS vip_analysis_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                api_base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                updated_at DATETIME
+            );
             """
         )
         count = conn.execute("SELECT COUNT(*) FROM api_configs").fetchone()[0]
