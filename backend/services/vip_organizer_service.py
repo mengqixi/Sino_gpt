@@ -45,8 +45,32 @@ SLOT_DEFINITIONS = [
     ("801.jpg", "吊牌信息", "750×750", "tag"),
 ]
 
-PRODUCT_ROLES = {"auto", "front", "side", "back", "top", "transparent", "logo", "interior", "detail", "ignore"}
-API_ANALYSIS_ROLES = PRODUCT_ROLES - {"auto", "ignore"}
+PRODUCT_ROLES = {
+    "auto",
+    "front",
+    "side",
+    "back",
+    "top",
+    "bottom",
+    "transparent",
+    "strap",
+    "detail",
+    "ignore",
+    # Keep accepting labels returned by older clients and API responses.
+    "logo",
+    "interior",
+}
+CANONICAL_PRODUCT_ROLES = PRODUCT_ROLES - {"auto", "ignore", "logo", "interior"}
+DETAIL_TAGS = {
+    "logo",
+    "hardware",
+    "strap_chain",
+    "zipper_opening",
+    "interior",
+    "inner_pocket_label",
+    "material_texture",
+}
+API_ANALYSIS_ROLES = CANONICAL_PRODUCT_ROLES
 
 
 def _analysis_config() -> dict[str, str]:
@@ -116,17 +140,27 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
     if not rows:
         raise ValueError("请至少上传一张商品原图")
     config = _analysis_config()
-    role_text = "front正面, side侧面, back背面, top顶视图, transparent透明底正面, logo ELLE Logo或五金近景, interior内里, detail其他细节"
+    role_text = (
+        "front正面主图, side侧面, back背面, top顶部或开口全景, bottom底部, "
+        "transparent透明底正面, strap肩带完整展示, detail局部细节"
+    )
+    tag_text = (
+        "logo ELLE Logo, hardware五金, strap_chain肩带或链条, "
+        "zipper_opening拉链或开口, interior内里, inner_pocket_label内袋或内标, "
+        "material_texture材质或纹理"
+    )
     content: list[dict[str, Any]] = [{
         "type": "text",
         "text": (
             "你是ELLE女包电商素材分类员。请逐张判断图片用途，只能从固定角色中选择："
-            f"{role_text}。每张图只能有一个角色；相似图片允许同角色。"
-            "重点区分完整产品图与链条/拉链近景。只有专门拍摄外部ELLE金属字标或主Logo的近景才标为logo；"
-            "链条调节扣、拉链和普通五金即使带ELLE小字也标为detail；出现内衬、内袋或包内空间的照片一律标为interior，"
-            "即使画面中有ELLE内里皮标。俯拍包口形状但不重点展示内袋时标为top。"
+            f"{role_text}。每张图只能有一个主类别；相似图片允许同类别。"
+            f"另外可从以下细节标签中选择零个或多个：{tag_text}。"
+            "完整产品图不能因为画面里有Logo或链条就标成局部细节。只有局部放大的照片才标为detail。"
+            "底部平放或仰拍标为bottom；整条肩带或链条长度为主要展示内容时标为strap；"
+            "出现内衬、内袋或包内空间时添加interior，内袋或内标近景再添加inner_pocket_label；"
+            "俯拍完整包口但重点不是局部拉链时标为top。无法可靠判断正反面时降低confidence。"
             "仅返回JSON对象，不要Markdown，格式："
-            '{"items":[{"index":1,"role":"front","confidence":90,"reason":"简短中文理由"}]}。'
+            '{"items":[{"index":1,"role":"front","tags":["logo","hardware"],"confidence":90,"reason":"简短中文理由"}]}。'
         ),
     }]
     for index, row in enumerate(rows, start=1):
@@ -153,22 +187,31 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
         raise ValueError("素材分析 API 未返回可读取的固定标签 JSON") from exc
     results: list[dict[str, Any]] = []
     roles: dict[int, str] = {}
+    tags_by_image: dict[int, list[str]] = {}
     for item in parsed.get("items", []):
         index = int(item.get("index", 0))
         role = str(item.get("role", "detail"))
+        raw_tags = item.get("tags", [])
+        tags = [str(tag) for tag in raw_tags if str(tag) in DETAIL_TAGS] if isinstance(raw_tags, list) else []
+        if role == "logo":
+            role, tags = "detail", list(dict.fromkeys([*tags, "logo", "hardware"]))
+        elif role == "interior":
+            role, tags = "detail", list(dict.fromkeys([*tags, "interior"]))
         if 1 <= index <= len(rows) and role in API_ANALYSIS_ROLES:
             image_id = int(rows[index - 1]["id"])
             roles[image_id] = role
+            tags_by_image[image_id] = tags
             results.append({
                 "image_id": image_id,
                 "file_name": rows[index - 1]["file_name"],
                 "role": role,
+                "tags": tags,
                 "confidence": max(0, min(100, int(item.get("confidence", 0)))),
                 "reason": str(item.get("reason", ""))[:160],
             })
     if not results:
         raise ValueError("素材分析 API 没有返回有效分类")
-    return {"asset_roles": roles, "items": results}
+    return {"asset_roles": roles, "asset_tags": tags_by_image, "items": results}
 
 
 def _uploaded_rows(image_ids: list[int]) -> list[dict[str, Any]]:
@@ -252,16 +295,78 @@ def _image_metrics(row: dict[str, Any]) -> dict[str, Any]:
         object_ratio = 1.0
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    edge_ratio = float(np.mean(cv2.Canny(gray, 80, 180) > 0))
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    gold = (
+        ((hue >= 8) & (hue <= 35) & (saturation >= 55) & (value >= 95))
+        | ((hue >= 15) & (hue <= 38) & (saturation >= 25) & (value >= 155))
+    )
+    center_gold = gold[int(sh * 0.25):int(sh * 0.78), int(sw * 0.25):int(sw * 0.75)]
+    foreground_ratio = float(foreground.mean())
+    foreground_fill_ratio = foreground_ratio / bbox_ratio if bbox_ratio else 0.0
     return {
         **row,
         "preview_url": f"/api/vip-organizer/assets/{row['id']}/thumbnail",
         "original_url": f"/uploads/vip_organizer/{Path(row['file_path']).name}",
         "alpha_ratio": round(alpha_ratio, 4),
-        "foreground_ratio": round(float(foreground.mean()), 4),
+        "foreground_ratio": round(foreground_ratio, 4),
+        "foreground_fill_ratio": round(float(foreground_fill_ratio), 4),
         "bbox_ratio": round(float(bbox_ratio), 4),
         "object_ratio": round(float(object_ratio), 4),
         "sharpness": round(sharpness, 2),
+        "edge_ratio": round(edge_ratio, 4),
+        "center_gold_ratio": round(float(center_gold.mean()) if center_gold.size else 0.0, 4),
     }
+
+
+def _classify_product_metrics(item: dict[str, Any]) -> tuple[str, list[str], int, str]:
+    """Return a lightweight primary role plus optional multi-label detail tags."""
+    alpha = float(item.get("alpha_ratio", 0))
+    foreground = float(item.get("foreground_ratio", 0))
+    fill = float(item.get("foreground_fill_ratio", 0))
+    bbox = float(item.get("bbox_ratio", 0))
+    ratio = float(item.get("object_ratio", 1))
+    sharpness = float(item.get("sharpness", 0))
+    edge_ratio = float(item.get("edge_ratio", 0))
+    center_gold = float(item.get("center_gold_ratio", 0))
+
+    if alpha > 0.02:
+        return "transparent", [], 99, "检测到透明通道，适合作为透明正面素材"
+    if ratio > 2.15 and bbox < 0.42:
+        return "bottom", [], 94, "主体呈横向扁平轮廓，判断为包底视图"
+    if ratio < 0.35 and foreground < 0.10:
+        return "strap", ["strap_chain"], 92, "主体纵向跨度很长且包体占比较小，判断为完整肩带展示"
+    if ratio < 0.68 and foreground < 0.14 and bbox < 0.32:
+        return "side", [], 90, "包体轮廓较窄，判断为侧面视图"
+    if 0.68 <= ratio <= 0.98 and bbox < 0.32 and foreground < 0.18:
+        return "top", ["zipper_opening", "interior"], 86, "俯拍轮廓和开口区域明显，判断为顶部或开口全景"
+
+    is_closeup = bbox >= 0.60 or foreground >= 0.28 or (bbox >= 0.48 and fill < 0.35)
+    if is_closeup:
+        tags: list[str] = []
+        if fill >= 0.60 and sharpness < 2000:
+            tags.extend(["interior", "inner_pocket_label"])
+        elif sharpness > 1800 or edge_ratio > 0.12:
+            tags.append("material_texture")
+        elif foreground >= 0.20 and fill >= 0.32:
+            tags.append("zipper_opening")
+        else:
+            tags.extend(["strap_chain", "hardware"])
+        if sharpness > 1800 or edge_ratio > 0.12:
+            tags.append("material_texture")
+        if sharpness > 1800 and center_gold > 0.008:
+            tags.extend(["logo", "hardware"])
+        if center_gold > 0.04 and "interior" not in tags and "hardware" not in tags:
+            tags.append("hardware")
+        tags = list(dict.fromkeys(tags))
+        confidence = 74 if tags else 62
+        return "detail", tags, confidence, "检测到局部放大画面，并按可见结构添加细节标签"
+
+    full_view_tags = ["logo", "hardware"] if center_gold > 0.012 else []
+    if center_gold > 0.012:
+        return "front", full_view_tags, 76, "检测到完整包体及中央五金/Logo候选，判断为正面主图"
+    return "back", [], 58, "检测到完整包体但缺少明确正面标志，暂判为背面，建议人工确认"
 
 
 def start_session() -> dict[str, str]:
@@ -400,6 +505,7 @@ def analyze_assets(
     model_image_ids: list[int],
     tag_image_ids: list[int],
     asset_roles: dict[int, str] | None = None,
+    asset_tags: dict[int, list[str]] | None = None,
 ) -> dict[str, Any]:
     _validate_session_assets(session_id, {
         "product": product_image_ids,
@@ -412,63 +518,90 @@ def analyze_assets(
     if not products:
         raise ValueError("请至少上传一张商品原图")
 
-    role_overrides = {
-        int(image_id): role
-        for image_id, role in (asset_roles or {}).items()
-        if role in PRODUCT_ROLES and role != "auto"
+    for item in products:
+        role, suggested_tags, confidence, reason = _classify_product_metrics(item)
+        item.update({
+            "suggested_role": role,
+            "suggested_tags": suggested_tags,
+            "role_confidence": confidence,
+            "role_reason": reason,
+        })
+
+    role_overrides: dict[int, str] = {}
+    tag_overrides = {
+        int(image_id): list(dict.fromkeys(tag for tag in image_tags if tag in DETAIL_TAGS))
+        for image_id, image_tags in (asset_tags or {}).items()
+        if isinstance(image_tags, list)
     }
-    usable_products = [item for item in products if role_overrides.get(item["id"]) != "ignore"]
+    for image_id, raw_role in (asset_roles or {}).items():
+        if raw_role not in PRODUCT_ROLES or raw_role == "auto":
+            continue
+        image_id = int(image_id)
+        if raw_role == "logo":
+            role_overrides[image_id] = "detail"
+            tag_overrides[image_id] = list(dict.fromkeys([*tag_overrides.get(image_id, []), "logo", "hardware"]))
+        elif raw_role == "interior":
+            role_overrides[image_id] = "detail"
+            tag_overrides[image_id] = list(dict.fromkeys([*tag_overrides.get(image_id, []), "interior"]))
+        else:
+            role_overrides[image_id] = raw_role
+
+    def effective_role(item: dict[str, Any]) -> str:
+        return role_overrides.get(item["id"], item["suggested_role"])
+
+    def effective_tags(item: dict[str, Any]) -> list[str]:
+        return tag_overrides.get(item["id"], item["suggested_tags"])
+
+    usable_products = [item for item in products if effective_role(item) != "ignore"]
     if not usable_products:
         raise ValueError("所有商品图都被标记为忽略，请至少保留一张")
 
     def assigned(role: str) -> dict[str, Any] | None:
-        return next((item for item in usable_products if role_overrides.get(item["id"]) == role), None)
+        fixed = [item for item in usable_products if role_overrides.get(item["id"]) == role]
+        candidates = fixed or [item for item in usable_products if effective_role(item) == role]
+        return max(candidates, key=lambda item: (item["role_confidence"], item["sharpness"])) if candidates else None
 
-    def assigned_all(role: str) -> list[dict[str, Any]]:
-        return [item for item in usable_products if role_overrides.get(item["id"]) == role]
+    def tagged(tag: str) -> list[dict[str, Any]]:
+        return [item for item in usable_products if tag in effective_tags(item)]
+
+    def selection_confidence(item: dict[str, Any], role: str | None = None, tag: str | None = None) -> int:
+        if role and role_overrides.get(item["id"]) == role:
+            return 100
+        if tag and item["id"] in tag_overrides and tag in tag_overrides[item["id"]]:
+            return 100
+        if (role and effective_role(item) == role) or (tag and tag in effective_tags(item)):
+            return int(item["role_confidence"])
+        return 45
 
     transparent = assigned("transparent") or max(usable_products, key=lambda item: item["alpha_ratio"])
-    has_transparent = role_overrides.get(transparent["id"]) == "transparent" or transparent["alpha_ratio"] > 0.02
+    has_transparent = effective_role(transparent) == "transparent" or transparent["alpha_ratio"] > 0.02
     non_transparent = [item for item in usable_products if item["id"] != transparent["id"]] if has_transparent else usable_products[:]
-    # Product folders normally mix clean full views with extreme close-ups. Keep
-    # those groups separate before ranking angles; otherwise a chain or zipper
-    # detail can look statistically closer to a full bag than an actual side view.
+    if not non_transparent:
+        non_transparent = [transparent]
     full_views = [
         item
         for item in non_transparent
-        if 0.04 <= item["foreground_ratio"] <= 0.26 and item["bbox_ratio"] <= 0.36
+        if effective_role(item) in {"front", "side", "back", "top"}
+        or (0.04 <= item["foreground_ratio"] <= 0.26 and item["bbox_ratio"] <= 0.36)
     ]
-    if len(full_views) < 3:
+    if not full_views:
         full_views = sorted(
             non_transparent,
             key=lambda item: (abs(item["foreground_ratio"] - 0.14), abs(item["bbox_ratio"] - 0.22)),
-        )[: max(3, min(6, len(non_transparent)))]
-
-    extreme_closeups = [
-        item
-        for item in non_transparent
-        if item["bbox_ratio"] >= 0.72 and item["foreground_ratio"] >= 0.30
-    ]
-    closeups = sorted(
-        extreme_closeups or non_transparent,
-        key=lambda item: (item["bbox_ratio"], item["foreground_ratio"], item["sharpness"]),
-        reverse=True,
-    )
-
-    def product_at(items: list[dict[str, Any]], index: int) -> int:
-        if not items:
-            return products[0]["id"]
-        return items[min(index, len(items) - 1)]["id"]
+        )[: max(1, min(6, len(non_transparent)))]
 
     regular_views = [item for item in full_views if 0.9 <= item["object_ratio"] <= 1.8]
-    regular_views.sort(key=lambda item: item["id"])
-    front_view = assigned("front") or (regular_views[0] if regular_views else full_views[0])
-    back_view = assigned("back") or (regular_views[1] if len(regular_views) > 1 else next(
-        (item for item in full_views if item["id"] != front_view["id"]),
-        front_view,
-    ))
+    front_view = assigned("front") or max(
+        regular_views or full_views,
+        key=lambda item: (item["center_gold_ratio"], item["role_confidence"], item["sharpness"]),
+    )
+    back_candidates = [item for item in regular_views if item["id"] != front_view["id"]]
+    back_view = assigned("back") or (min(
+        back_candidates,
+        key=lambda item: (item["center_gold_ratio"], -item["sharpness"]),
+    ) if back_candidates else front_view)
     front_id = transparent["id"] if has_transparent else front_view["id"]
-    side_candidates = [item for item in full_views if item["object_ratio"] < 0.75 and item["foreground_ratio"] >= 0.055]
+    side_candidates = [item for item in full_views if item["object_ratio"] < 0.75 and item["foreground_ratio"] >= 0.04]
     side_candidates.sort(key=lambda item: (abs(item["object_ratio"] - 0.45), -item["sharpness"]))
     side_view = assigned("side") or (side_candidates[0] if side_candidates else min(full_views, key=lambda item: item["object_ratio"]))
     side_id = side_view["id"]
@@ -484,26 +617,34 @@ def analyze_assets(
     back_id = back_view["id"]
     top_id = top_view["id"]
 
-    # A metal wordmark close-up usually has much stronger fine edges than an
-    # interior-lining photo. This remains a draft; both selections stay editable.
-    assigned_logos = assigned_all("logo")
-    logo_view = max(assigned_logos, key=lambda item: item["sharpness"]) if assigned_logos else max(closeups, key=lambda item: item["sharpness"])
-    interior_views = sorted(
-        (item for item in closeups if item["id"] != logo_view["id"]),
-        key=lambda item: item["id"],
+    detail_views = [item for item in non_transparent if effective_role(item) in {"detail", "bottom", "strap"}]
+    detail_views = detail_views or sorted(
+        non_transparent,
+        key=lambda item: (item["bbox_ratio"], item["foreground_ratio"], item["sharpness"]),
+        reverse=True,
     )
-    assigned_interiors = assigned_all("interior")
-    close_interiors = [
-        item for item in assigned_interiors
-        if item["bbox_ratio"] >= 0.72 and item["foreground_ratio"] >= 0.60
+    logo_candidates = tagged("logo")
+    logo_view = max(
+        logo_candidates or detail_views,
+        key=lambda item: (effective_role(item) == "detail", item["bbox_ratio"], item["sharpness"]),
+    )
+    interior_candidates = [
+        item for item in usable_products
+        if "interior" in effective_tags(item) or "inner_pocket_label" in effective_tags(item)
     ]
-    if close_interiors:
-        assigned_interiors = close_interiors
-    interior_view = assigned_interiors[0] if assigned_interiors else (interior_views[0] if interior_views else logo_view)
-    if len(assigned_interiors) > 1:
-        secondary_detail = assigned_interiors[1]
-    else:
-        secondary_detail = assigned("detail") or (interior_views[1] if len(interior_views) > 1 else interior_view)
+    interior_view = max(
+        interior_candidates or [item for item in detail_views if item["id"] != logo_view["id"]] or [logo_view],
+        key=lambda item: (effective_role(item) == "detail", item["foreground_fill_ratio"], item["bbox_ratio"]),
+    )
+    secondary_candidates = [
+        item for item in detail_views
+        if item["id"] not in {logo_view["id"], interior_view["id"]}
+        and any(tag in effective_tags(item) for tag in {"inner_pocket_label", "zipper_opening", "material_texture"})
+    ]
+    secondary_detail = max(
+        secondary_candidates or [item for item in detail_views if item["id"] not in {logo_view["id"], interior_view["id"]}] or [interior_view],
+        key=lambda item: ("inner_pocket_label" in effective_tags(item), item["bbox_ratio"], item["sharpness"]),
+    )
     logo_id = logo_view["id"]
     interior_id = interior_view["id"]
 
@@ -513,45 +654,43 @@ def analyze_assets(
 
     slot_values = {
         "1.jpg": (model_pick(0), 88 if models else 0, "来自独立模特图区，优先选择清晰度较高的照片"),
-        "2.jpg": ([front_view["id"]], 72, "从完整产品图中按上传顺序选择首张标准展示图，建议确认是否符合渠道要求"),
-        "3.jpg": ([back_id], 58, "从完整产品图中选择第二张正背面候选，正背面仍需人工确认"),
-        "4.jpg": ([logo_id], 76, "从超近景中选择细节边缘最清晰的图片，建议确认是否为ELLE Logo"),
-        "15.jpg": ([interior_id], 70, "排除Logo后，从超近景中选择首张内里候选"),
+        "2.jpg": ([side_view["id"]], selection_confidence(side_view, role="side"), "优先使用侧面或半侧面主类别，低可信时请人工确认"),
+        "3.jpg": ([back_id], selection_confidence(back_view, role="back"), "优先使用背面标签，缺少明确背面图时会回退到完整产品图"),
+        "4.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "优先使用局部细节中的ELLE Logo标签"),
+        "15.jpg": ([interior_id], selection_confidence(interior_view, tag="interior"), "优先使用带内里或内袋标签的局部细节"),
         "30.png": ([front_id], 98 if has_transparent else 35, "检测到透明通道" if has_transparent else "未检测到透明图，暂用正面候选图"),
         "50.jpg": (model_pick(0), 88 if models else 0, "与1.jpg使用同一张模特图，仅按竖版规格重新排版"),
-        "401.jpg": ([front_id], 100, "根据正面产品图和商品资料套用信息页模板"),
+        "401.jpg": ([front_id], 98 if has_transparent else selection_confidence(front_view, role="front"), "根据正面产品图和商品资料套用信息页模板"),
         "601.jpg": (model_pick(0), 90 if models else 0, "模特图自动留白排版"),
         "602.jpg": (model_pick(1), 90 if models else 0, "模特图自动留白排版"),
         "603.jpg": (model_pick(2), 90 if models else 0, "模特图自动留白排版"),
-        "604.jpg": ([secondary_detail["id"]], 65, "使用另一张内里或结构细节候选，保留手动调整"),
-        "605.jpg": ([logo_id], 76, "复用ELLE Logo清晰近景候选"),
-        "606.jpg": ([front_view["id"], side_id, back_id, top_id], 62, "按完整正面、窄侧面、背面和顶视轮廓生成四角度初稿"),
+        "604.jpg": ([secondary_detail["id"]], selection_confidence(secondary_detail, tag="inner_pocket_label"), "优先使用另一张内里、拉链开口或结构细节"),
+        "605.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "复用ELLE Logo清晰近景候选"),
+        "606.jpg": ([front_view["id"], side_id, back_id, top_id], min(
+            selection_confidence(front_view, role="front"),
+            selection_confidence(side_view, role="side"),
+            selection_confidence(back_view, role="back"),
+            selection_confidence(top_view, role="top"),
+        ), "按正面、侧面、背面和顶部主类别生成四角度初稿"),
         "801.jpg": (tag_ids, 95 if tags else 0, "使用独立上传的吊牌图片" if tags else "尚未上传吊牌图片"),
     }
     slots = [
         _slot(file_name, title, size, kind, *slot_values[file_name])
         for file_name, title, size, kind in SLOT_DEFINITIONS
     ]
-    suggested_roles: dict[int, str] = {
-        front_view["id"]: "front",
-        side_id: "side",
-        back_id: "back",
-        top_id: "top",
-        logo_id: "logo",
-        interior_id: "interior",
-        secondary_detail["id"]: "detail",
-    }
-    if has_transparent:
-        suggested_roles[transparent["id"]] = "transparent"
     for item in products:
         item["selected_role"] = role_overrides.get(item["id"], "auto")
-        item["suggested_role"] = suggested_roles.get(item["id"], "detail")
+        item["selected_tags"] = tag_overrides.get(item["id"], [])
     for item in models:
         item["selected_role"] = "model"
         item["suggested_role"] = "model"
+        item["suggested_tags"] = []
+        item["role_confidence"] = 100
     for item in tags:
         item["selected_role"] = "tag"
         item["suggested_role"] = "tag"
+        item["suggested_tags"] = []
+        item["role_confidence"] = 100
     return {"assets": {"product": products, "model": models, "tag": tags}, "slots": slots}
 
 

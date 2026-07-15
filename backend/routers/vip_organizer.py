@@ -25,6 +25,7 @@ class AnalyzePayload(BaseModel):
     model_image_ids: list[int] = Field(default_factory=list)
     tag_image_ids: list[int] = Field(default_factory=list)
     asset_roles: dict[int, str] = Field(default_factory=dict)
+    asset_tags: dict[int, list[str]] = Field(default_factory=dict)
 
 
 class ExportPayload(BaseModel):
@@ -79,6 +80,7 @@ def analyze(payload: AnalyzePayload):
             payload.model_image_ids,
             payload.tag_image_ids,
             payload.asset_roles,
+            payload.asset_tags,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

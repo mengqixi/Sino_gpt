@@ -24,18 +24,28 @@ type Slot = {
 
 const PRODUCT_ROLE_OPTIONS = [
   ["auto", "使用自动判断"],
-  ["front", "正面"],
+  ["front", "正面主图"],
   ["side", "侧面"],
   ["back", "背面"],
-  ["top", "顶视图"],
+  ["top", "顶部 / 开口全景"],
+  ["bottom", "底部"],
   ["transparent", "透明正面"],
-  ["logo", "ELLE Logo / 五金"],
-  ["interior", "内里"],
-  ["detail", "其他细节"],
+  ["strap", "肩带完整展示"],
+  ["detail", "局部细节"],
   ["ignore", "忽略此图"]
 ] as const;
 
 const ROLE_LABELS = Object.fromEntries(PRODUCT_ROLE_OPTIONS) as Record<string, string>;
+const DETAIL_TAG_OPTIONS = [
+  ["logo", "ELLE Logo"],
+  ["hardware", "五金"],
+  ["strap_chain", "肩带 / 链条"],
+  ["zipper_opening", "拉链 / 开口"],
+  ["interior", "内里"],
+  ["inner_pocket_label", "内袋 / 内标"],
+  ["material_texture", "材质 / 纹理"]
+] as const;
+const TAG_LABELS = Object.fromEntries(DETAIL_TAG_OPTIONS) as Record<string, string>;
 const SUPPORTED_IMAGE_NAME = /\.(jpe?g|png|webp)$/i;
 
 function displayMillimeters(value: string) {
@@ -110,6 +120,7 @@ export default function VipOrganizer() {
   const [slots, setSlots] = useState<Slot[]>([]);
   const [assets, setAssets] = useState<Record<string, any[]>>({ product: [], model: [], tag: [] });
   const [assetRoles, setAssetRoles] = useState<Record<number, string>>({});
+  const [assetTags, setAssetTags] = useState<Record<number, string[]>>({});
   const [apiRoleNotes, setApiRoleNotes] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -137,6 +148,7 @@ export default function VipOrganizer() {
     setSlots([]);
     setAssets({ product: [], model: [], tag: [] });
     setAssetRoles({});
+    setAssetTags({});
     setApiRoleNotes({});
     setExportResult(null);
   }
@@ -206,7 +218,8 @@ export default function VipOrganizer() {
         product_image_ids: products.map((item) => item.image_id),
         model_image_ids: models.map((item) => item.image_id),
         tag_image_ids: tags.map((item) => item.image_id),
-        asset_roles: rolesOverride || assetRoles
+        asset_roles: rolesOverride || assetRoles,
+        asset_tags: assetTags
       });
       setSlots(result.slots);
       setAssets(result.assets);
@@ -228,14 +241,20 @@ export default function VipOrganizer() {
         product_image_ids: products.map((item) => item.image_id)
       });
       const nextRoles = apiResult.asset_roles as Record<number, string>;
+      const nextTags = (apiResult.asset_tags || {}) as Record<number, string[]>;
       setAssetRoles(nextRoles);
-      setApiRoleNotes(Object.fromEntries(apiResult.items.map((item: any) => [item.image_id, `${item.confidence}% · ${item.reason}`])));
+      setAssetTags(nextTags);
+      setApiRoleNotes(Object.fromEntries(apiResult.items.map((item: any) => [
+        item.image_id,
+        `${item.confidence}% · ${item.reason}${item.tags?.length ? ` · ${item.tags.map((tag: string) => TAG_LABELS[tag] || tag).join("、")}` : ""}`
+      ])));
       const result = await api.analyzeVipOrganizer({
         session_id: sessionId,
         product_image_ids: products.map((item) => item.image_id),
         model_image_ids: models.map((item) => item.image_id),
         tag_image_ids: tags.map((item) => item.image_id),
-        asset_roles: nextRoles
+        asset_roles: nextRoles,
+        asset_tags: nextTags
       });
       setSlots(result.slots);
       setAssets(result.assets);
@@ -257,6 +276,29 @@ export default function VipOrganizer() {
     });
     setExportResult(null);
     setMessage("固定标签已修改，请点击“按标签重新整理”更新输出位置。");
+  }
+
+  function effectiveAssetTags(asset: any) {
+    return assetTags[asset.id] ?? asset.suggested_tags ?? [];
+  }
+
+  function toggleAssetTag(asset: any, tag: string) {
+    setAssetTags((current) => {
+      const selected = current[asset.id] ?? asset.suggested_tags ?? [];
+      const nextTags = selected.includes(tag) ? selected.filter((item: string) => item !== tag) : [...selected, tag];
+      return { ...current, [asset.id]: nextTags };
+    });
+    setExportResult(null);
+    setMessage("细节标签已修改，请点击“按标签重新整理”更新输出位置。");
+  }
+
+  function resetAssetTags(imageId: number) {
+    setAssetTags((current) => {
+      const next = { ...current };
+      delete next[imageId];
+      return next;
+    });
+    setExportResult(null);
   }
 
   function optionsFor(slot: Slot) {
@@ -292,7 +334,8 @@ export default function VipOrganizer() {
     const fixedRole = assetRoles[asset.id];
     const role = fixedRole || asset.suggested_role || "detail";
     const source = fixedRole ? "固定" : "自动";
-    return `【${source}·${ROLE_LABELS[role] || "其他细节"}】${asset.file_name}`;
+    const tagText = effectiveAssetTags(asset).slice(0, 2).map((tag: string) => TAG_LABELS[tag] || tag).join("+");
+    return `【${source}·${ROLE_LABELS[role] || "局部细节"}${tagText ? `·${tagText}` : ""}】${asset.file_name}`;
   }
 
   async function exportZip() {
@@ -344,7 +387,7 @@ export default function VipOrganizer() {
       {slots.length > 0 && <>
         <section className="panel organizer-analysis-panel">
           <div className="section-title-row">
-            <div><h2>2. 素材分析</h2><p>先看自动判断；不准确时选择固定标签，再按标签重新整理。</p></div>
+            <div><h2>2. 素材分析</h2><p>主类别决定图片用途，细节标签可以多选；低可信度结果建议人工确认或调用一次API。</p></div>
             <div className="button-row">
               <button disabled={busy} onClick={analyzeWithApi}><RefreshCw size={18} />API 分析素材（1次）</button>
               <button className="primary" disabled={busy} onClick={() => analyze()}>
@@ -360,13 +403,22 @@ export default function VipOrganizer() {
                 </button>
                 <div>
                   <strong title={asset.file_name}>{asset.file_name}</strong>
-                  <small className="organizer-role-badge">
-                    <span>自动</span>{ROLE_LABELS[asset.suggested_role] || "其他细节"}
+                  <small className={`organizer-role-badge role-confidence-${asset.role_confidence >= 80 ? "high" : asset.role_confidence >= 60 ? "medium" : "low"}`} title={asset.role_reason}>
+                    <span>自动 {asset.role_confidence}%</span>{ROLE_LABELS[asset.suggested_role] || "局部细节"}
                   </small>
+                  <small className="organizer-auto-reason" title={asset.role_reason}>{asset.role_reason}</small>
                   {apiRoleNotes[asset.id] && <small className="api-role-note">API：{apiRoleNotes[asset.id]}</small>}
                   <select value={assetRoles[asset.id] || "auto"} onChange={(event) => updateAssetRole(asset.id, event.target.value)}>
                     {PRODUCT_ROLE_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
                   </select>
+                  <div className="organizer-tag-editor">
+                    <span>细节标签（可多选）</span>
+                    <div>{DETAIL_TAG_OPTIONS.map(([value, label]) => {
+                      const active = effectiveAssetTags(asset).includes(value);
+                      return <button type="button" className={active ? "is-active" : ""} aria-pressed={active} key={value} onClick={() => toggleAssetTag(asset, value)}>{label}</button>;
+                    })}</div>
+                    {assetTags[asset.id] !== undefined && <button type="button" className="organizer-tags-reset" onClick={() => resetAssetTags(asset.id)}>恢复自动标签</button>}
+                  </div>
                 </div>
               </article>
             ))}
