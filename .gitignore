@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 data/*.db
+data/vip_organizer/
 backend/uploads/*
 backend/results/*
 *.log

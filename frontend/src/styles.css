@@ -19,9 +19,9 @@
 .section-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .section-title-row p { margin: -6px 0 0; color: #657169; }
 .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
-.organizer-api-select { display: flex; align-items: center; gap: 7px; padding: 0 9px; border: 1px solid #d9dfdb; border-radius: 5px; background: #fff; }
-.organizer-api-select span { flex: none; color: #68736d; font-size: 12px; }
-.organizer-api-select select { min-width: 210px; padding: 7px 26px 7px 8px; border: 0; background-color: transparent; }
+.organizer-api-select { display: grid; gap: 5px; min-width: 280px; }
+.organizer-api-select span { color: #68736d; font-size: 12px; font-weight: 600; }
+.organizer-api-select select { width: 100%; min-width: 0; height: 42px; padding: 8px 34px 8px 10px; background-color: #fff; }
 .template-group { padding: 15px 0; border-top: 1px solid #e5e9e6; }
 .template-group h3 { margin: 0 0 10px; font-size: 15px; color: #526159; }
 .template-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
@@ -59,6 +59,11 @@
 .organizer-page { max-width: 1700px; }
 .organizer-source-panel, .organizer-analysis-panel, .organizer-info-panel, .organizer-slots-panel, .organizer-export-result { margin-bottom: 16px; padding: 20px; }
 .organizer-source-panel h2, .organizer-analysis-panel h2, .organizer-info-panel h2, .organizer-slots-panel h2, .organizer-export-result h2 { margin: 0 0 10px; font-size: 20px; }
+.organizer-analysis-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 22px; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #e2e7e4; }
+.organizer-analysis-header h2 { margin-bottom: 6px; }
+.organizer-analysis-header p { max-width: 760px; margin: 0; color: #657169; line-height: 1.55; }
+.organizer-analysis-toolbar { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto; align-items: end; gap: 9px; }
+.organizer-analysis-toolbar > button { height: 42px; white-space: nowrap; }
 .organizer-upload-columns { display: grid; grid-template-columns: 1.2fr 1.2fr .8fr; gap: 12px; }
 .organizer-upload-block { min-width: 0; padding: 14px; border: 1px solid #dfe4e1; border-radius: 6px; background: #fafbfa; transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease; }
 .organizer-upload-block.is-dragging { background: #edf5ef; border-color: #1f5b4c; box-shadow: inset 0 0 0 2px rgba(31, 91, 76, .12); }
@@ -142,8 +147,9 @@
 .organizer-export-previews button { position: relative; padding: 0; aspect-ratio: 1; overflow: hidden; }
 .organizer-export-previews img { width: 100%; height: 100%; object-fit: contain; }
 .organizer-export-previews svg { position: absolute; right: 6px; bottom: 6px; padding: 3px; width: 24px; height: 24px; border-radius: 4px; background: white; }
+@media (max-width: 1350px) { .organizer-analysis-header { grid-template-columns: 1fr; align-items: stretch; } .organizer-analysis-toolbar { grid-template-columns: minmax(260px, 1fr) auto auto; } }
 @media (max-width: 1200px) { .organizer-analysis-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .organizer-slot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .organizer-info-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .organizer-info-grid .wide { grid-column: span 3; } }
-@media (max-width: 800px) { .organizer-upload-columns, .organizer-analysis-grid, .organizer-slot-grid { grid-template-columns: 1fr; } .organizer-info-grid { grid-template-columns: 1fr; } .organizer-info-grid .wide { grid-column: auto; } .organizer-export-previews { grid-template-columns: repeat(4, minmax(0, 1fr)); } .organizer-api-select { width: 100%; } .organizer-api-select select { width: 100%; min-width: 0; } }
+@media (max-width: 800px) { .organizer-upload-columns, .organizer-analysis-grid, .organizer-slot-grid { grid-template-columns: 1fr; } .organizer-info-grid { grid-template-columns: 1fr; } .organizer-info-grid .wide { grid-column: auto; } .organizer-export-previews { grid-template-columns: repeat(4, minmax(0, 1fr)); } .organizer-analysis-toolbar { grid-template-columns: 1fr; } .organizer-api-select { width: 100%; min-width: 0; } .organizer-api-select select { width: 100%; min-width: 0; } }
 
 * {
   box-sizing: border-box;

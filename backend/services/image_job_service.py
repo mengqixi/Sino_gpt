@@ -1,17 +1,36 @@
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from ..database import db_session, now_iso
 from .file_service import public_url_for
 
-MAX_HISTORY_JOBS = 20
+MAX_HISTORY_JOBS = 50
+FAILED_HISTORY_DAYS = 7
+
+
+def _upload_ids_from_preview(value: str | None) -> set[int]:
+    if not value:
+        return set()
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return set()
+    result: set[int] = set()
+    for item in payload.get("uploaded_image_ids") or []:
+        try:
+            result.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def prune_job_history(max_jobs: int = MAX_HISTORY_JOBS) -> int:
     image_paths: list[str] = []
+    upload_paths: list[str] = []
     with db_session() as conn:
-        stale_jobs = conn.execute(
+        overflow_jobs = conn.execute(
             """
             SELECT id FROM image_jobs
             WHERE status != 'running'
@@ -20,18 +39,79 @@ def prune_job_history(max_jobs: int = MAX_HISTORY_JOBS) -> int:
             """,
             (max_jobs,),
         ).fetchall()
-        if not stale_jobs:
+        failed_cutoff = (datetime.now() - timedelta(days=FAILED_HISTORY_DAYS)).isoformat(timespec="seconds")
+        expired_jobs = conn.execute(
+            """
+            SELECT id FROM image_jobs
+            WHERE status IN ('failed', 'unknown') AND created_at < ?
+            """,
+            (failed_cutoff,),
+        ).fetchall()
+        stale_ids = sorted({int(row["id"]) for row in [*overflow_jobs, *expired_jobs]})
+        if not stale_ids:
             return 0
-        stale_ids = [int(row["id"]) for row in stale_jobs]
         placeholders = ",".join("?" for _ in stale_ids)
         images = conn.execute(
             f"SELECT image_path FROM generated_images WHERE job_id IN ({placeholders})",
             stale_ids,
         ).fetchall()
         image_paths = [row["image_path"] for row in images if row["image_path"]]
+
+        stale_jobs = conn.execute(
+            f"""
+            SELECT original_image_path, request_payload_preview
+            FROM image_jobs WHERE id IN ({placeholders})
+            """,
+            stale_ids,
+        ).fetchall()
+        candidate_upload_ids: set[int] = set()
+        candidate_upload_paths: set[str] = set()
+        for row in stale_jobs:
+            if row["original_image_path"]:
+                candidate_upload_paths.add(row["original_image_path"])
+            candidate_upload_ids.update(_upload_ids_from_preview(row["request_payload_preview"]))
+
         conn.execute(f"DELETE FROM image_jobs WHERE id IN ({placeholders})", stale_ids)
+
+        retained_jobs = conn.execute(
+            "SELECT original_image_path, request_payload_preview FROM image_jobs"
+        ).fetchall()
+        retained_upload_ids: set[int] = set()
+        retained_upload_paths: set[str] = set()
+        for row in retained_jobs:
+            if row["original_image_path"]:
+                retained_upload_paths.add(row["original_image_path"])
+            retained_upload_ids.update(_upload_ids_from_preview(row["request_payload_preview"]))
+
+        removable_upload_ids = candidate_upload_ids - retained_upload_ids
+        removable_upload_paths = candidate_upload_paths - retained_upload_paths
+        if removable_upload_ids:
+            upload_placeholders = ",".join("?" for _ in removable_upload_ids)
+            rows = conn.execute(
+                f"SELECT id, file_path FROM uploaded_images WHERE id IN ({upload_placeholders})",
+                tuple(removable_upload_ids),
+            ).fetchall()
+            removable_upload_paths.update(row["file_path"] for row in rows if row["file_path"])
+            conn.execute(
+                f"DELETE FROM uploaded_images WHERE id IN ({upload_placeholders})",
+                tuple(removable_upload_ids),
+            )
+        if removable_upload_paths:
+            path_placeholders = ",".join("?" for _ in removable_upload_paths)
+            rows = conn.execute(
+                f"SELECT file_path FROM uploaded_images WHERE file_path IN ({path_placeholders})",
+                tuple(removable_upload_paths),
+            ).fetchall()
+            upload_paths.extend(row["file_path"] for row in rows if row["file_path"])
+            conn.execute(
+                f"DELETE FROM uploaded_images WHERE file_path IN ({path_placeholders})",
+                tuple(removable_upload_paths),
+            )
+            upload_paths.extend(removable_upload_paths)
     for image_path in image_paths:
         Path(image_path).unlink(missing_ok=True)
+    for upload_path in set(upload_paths):
+        Path(upload_path).unlink(missing_ok=True)
     return len(stale_ids)
 
 
@@ -39,6 +119,8 @@ def create_job(payload: dict[str, Any], upload_row, config: dict[str, Any]) -> i
     ts = now_iso()
     preview = {
         "api_config_id": payload["api_config_id"],
+        "uploaded_image_ids": payload.get("uploaded_image_ids")
+        or ([payload["uploaded_image_id"]] if payload.get("uploaded_image_id") else []),
         "request_content_type": config.get("request_content_type"),
         "endpoint_path": config.get("endpoint_path"),
         "model": config.get("model_name"),

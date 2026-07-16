@@ -76,7 +76,9 @@ function App() {
           <Generate initialIntent={generateIntent} onIntentConsumed={() => setGenerateIntent(null)} />
         </div>
         {page === "ecommerce" && <Ecommerce />}
-        {page === "organizer" && <VipOrganizer />}
+        <div style={{ display: page === "organizer" ? "block" : "none" }}>
+          <VipOrganizer />
+        </div>
         {page === "prompts" && <PromptTemplates />}
         {page === "api" && <ApiConfigs />}
         {page === "history" && <HistoryPage />}

@@ -20,13 +20,15 @@ import requests
 from fastapi import UploadFile
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from ..config import ALLOWED_IMAGE_EXTENSIONS, RESULT_DIR, UPLOAD_DIR
+from ..config import ALLOWED_IMAGE_EXTENSIONS, DATA_DIR, RESULT_DIR, UPLOAD_DIR
 from ..database import db_session, now_iso
 from .api_config_service import TEXT_API_TYPE, get_config, get_default_config, mask_api_key, require_config_type
 from .json_path_service import json_path_get
 
 
-ORGANIZER_UPLOAD_DIR = UPLOAD_DIR / "vip_organizer"
+ORGANIZER_DATA_DIR = DATA_DIR / "vip_organizer"
+ORGANIZER_UPLOAD_DIR = ORGANIZER_DATA_DIR / "uploads"
+ORGANIZER_RESULT_DIR = ORGANIZER_DATA_DIR / "results"
 UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
 BUNDLED_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "NotoSansSC-VF-GB2312.ttf"
 
@@ -378,7 +380,7 @@ def _image_metrics(row: dict[str, Any]) -> dict[str, Any]:
     return {
         **row,
         "preview_url": f"/api/vip-organizer/assets/{row['id']}/thumbnail",
-        "original_url": f"/uploads/vip_organizer/{Path(row['file_path']).name}",
+        "original_url": f"/api/vip-organizer/assets/{row['id']}/original",
         "alpha_ratio": round(alpha_ratio, 4),
         "foreground_ratio": round(foreground_ratio, 4),
         "foreground_fill_ratio": round(float(foreground_fill_ratio), 4),
@@ -443,12 +445,15 @@ def _classify_product_metrics(item: dict[str, Any]) -> tuple[str, list[str], int
 
 def start_session() -> dict[str, str]:
     """Keep organizer storage bounded to one current session."""
-    ORGANIZER_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    for path in ORGANIZER_UPLOAD_DIR.iterdir():
-        if path.is_file():
-            path.unlink(missing_ok=True)
-        elif path.is_dir():
-            shutil.rmtree(path)
+    for directory in (ORGANIZER_UPLOAD_DIR, ORGANIZER_RESULT_DIR):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+    # Remove files created by versions that shared the AI upload/result folders.
+    legacy_upload_dir = UPLOAD_DIR / "vip_organizer"
+    if legacy_upload_dir.exists():
+        shutil.rmtree(legacy_upload_dir)
     for path in RESULT_DIR.glob("vip_*"):
         if path.is_dir():
             shutil.rmtree(path)
@@ -524,7 +529,7 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
                     "image_id": int(cursor.lastrowid),
                     "file_name": item["file_name"],
                     "preview_url": f"/api/vip-organizer/assets/{cursor.lastrowid}/thumbnail",
-                    "original_url": f"/uploads/vip_organizer/{item['path'].name}",
+                    "original_url": f"/api/vip-organizer/assets/{cursor.lastrowid}/original",
                     "width": item["width"],
                     "height": item["height"],
                 })
@@ -557,6 +562,16 @@ def asset_thumbnail(image_id: int) -> Path:
     finally:
         temp_path.unlink(missing_ok=True)
     return thumbnail_path
+
+
+def asset_original(image_id: int) -> Path:
+    rows = _uploaded_rows([image_id])
+    if not rows:
+        raise ValueError("图片记录不存在")
+    path = Path(rows[0]["file_path"])
+    if not path.exists() or path.parent.resolve() != ORGANIZER_UPLOAD_DIR.resolve():
+        raise ValueError("图片文件不存在")
+    return path
 
 
 def _slot(file_name: str, title: str, size: str, kind: str, ids: list[int], confidence: int, reason: str) -> dict[str, Any]:
@@ -1038,7 +1053,7 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
         ],
     })
     export_id = uuid.uuid4().hex[:12]
-    folder = RESULT_DIR / f"vip_{export_id}"
+    folder = ORGANIZER_RESULT_DIR / export_id
     folder.mkdir(parents=True, exist_ok=True)
     missing: list[str] = []
 
@@ -1068,14 +1083,36 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
         else:
             _fit(_load_image(ids[0]), (800, 800)).save(output, quality=94)
 
-    zip_path = RESULT_DIR / f"唯品会套图_{export_id}.zip"
+    zip_path = ORGANIZER_RESULT_DIR / f"唯品会套图_{export_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(folder.iterdir()):
             archive.write(path, arcname=path.name)
-    previews = [f"/results/{folder.name}/{path.name}" for path in sorted(folder.iterdir()) if path.suffix.lower() in {".jpg", ".png"}]
+    previews = [
+        f"/api/vip-organizer/exports/{export_id}/files/{path.name}"
+        for path in sorted(folder.iterdir())
+        if path.suffix.lower() in {".jpg", ".png"}
+    ]
     return {
-        "download_url": f"/results/{zip_path.name}",
+        "download_url": f"/api/vip-organizer/exports/{export_id}/download",
         "previews": previews,
         "generated_count": len(previews),
         "missing": missing,
     }
+
+
+def export_file(export_id: str, file_name: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{12}", export_id) or not re.fullmatch(r"[0-9]+\.(?:jpg|png)", file_name):
+        raise ValueError("导出文件不存在")
+    path = ORGANIZER_RESULT_DIR / export_id / file_name
+    if not path.is_file():
+        raise ValueError("导出文件不存在")
+    return path
+
+
+def export_zip(export_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{12}", export_id):
+        raise ValueError("导出文件不存在")
+    path = ORGANIZER_RESULT_DIR / f"唯品会套图_{export_id}.zip"
+    if not path.is_file():
+        raise ValueError("导出文件不存在")
+    return path

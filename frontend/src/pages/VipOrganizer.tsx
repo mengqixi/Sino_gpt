@@ -113,7 +113,7 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
 export default function VipOrganizer() {
   const [sessionId, setSessionId] = useState("");
   const sessionIdRef = useRef("");
-  const sessionPromiseRef = useRef<Promise<string> | null>(null);
+  const sessionPromiseRef = useRef<Promise<{ session_id: string }> | null>(null);
   const pendingUploadsRef = useRef(0);
   const [products, setProducts] = useState<UploadItem[]>([]);
   const [models, setModels] = useState<UploadItem[]>([]);
@@ -153,6 +153,25 @@ export default function VipOrganizer() {
       .catch((error: any) => setMessage(error.message));
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    const initialSession = api.startVipOrganizerSession();
+    sessionPromiseRef.current = initialSession;
+    initialSession.then(
+      (session) => {
+        if (active) applyNewSession(session.session_id);
+      },
+      (error: any) => {
+        if (active) setMessage(error.message);
+      }
+    );
+    initialSession.then(
+      () => { if (sessionPromiseRef.current === initialSession) sessionPromiseRef.current = null; },
+      () => { if (sessionPromiseRef.current === initialSession) sessionPromiseRef.current = null; }
+    );
+    return () => { active = false; };
+  }, []);
+
   function applyNewSession(nextSessionId: string) {
     sessionIdRef.current = nextSessionId;
     setSessionId(nextSessionId);
@@ -173,11 +192,11 @@ export default function VipOrganizer() {
       sessionPromiseRef.current = api.startVipOrganizerSession()
         .then((session) => {
           applyNewSession(session.session_id);
-          return session.session_id;
+          return session;
         })
         .finally(() => { sessionPromiseRef.current = null; });
     }
-    return sessionPromiseRef.current;
+    return sessionPromiseRef.current.then((session) => session.session_id);
   }
 
   async function startNewSession() {
@@ -402,9 +421,9 @@ export default function VipOrganizer() {
 
       {slots.length > 0 && <>
         <section className="panel organizer-analysis-panel">
-          <div className="section-title-row">
+          <div className="organizer-analysis-header">
             <div><h2>2. 素材分析</h2><p>主类别决定图片用途，细节标签可以多选；低可信度结果建议人工确认或调用一次API。</p></div>
-            <div className="button-row">
+            <div className="organizer-analysis-toolbar">
               <label className="organizer-api-select">
                 <span>图文分析 API</span>
                 <select value={analysisConfigId} onChange={(event) => setAnalysisConfigId(Number(event.target.value) || "")}>

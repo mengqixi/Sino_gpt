@@ -7,10 +7,13 @@ from pydantic import BaseModel, Field
 
 from ..services.vip_organizer_service import (
     analysis_config_status,
+    asset_original,
     asset_thumbnail,
     analyze_assets,
     analyze_assets_with_api,
     export_package,
+    export_file,
+    export_zip,
     save_analysis_config,
     save_assets,
     start_session,
@@ -68,6 +71,33 @@ def get_asset_thumbnail(image_id: int):
     try:
         path = asset_thumbnail(image_id)
         return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/assets/{image_id}/original")
+def get_asset_original(image_id: int):
+    try:
+        path = asset_original(image_id)
+        return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/exports/{export_id}/files/{file_name}")
+def get_export_file(export_id: str, file_name: str):
+    try:
+        path = export_file(export_id, file_name)
+        return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/exports/{export_id}/download")
+def download_export(export_id: str):
+    try:
+        path = export_zip(export_id)
+        return FileResponse(path, media_type="application/zip", filename=path.name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
