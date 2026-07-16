@@ -25,7 +25,8 @@ type Slot = {
 const PRODUCT_ROLE_OPTIONS = [
   ["auto", "使用自动判断"],
   ["front", "正面主图"],
-  ["side", "侧面"],
+  ["semi_side", "半侧面 / 三分之二角度"],
+  ["side", "完整侧面"],
   ["back", "背面"],
   ["top", "顶部 / 开口全景"],
   ["bottom", "底部"],
@@ -134,7 +135,7 @@ export default function VipOrganizer() {
     main_material: "",
     lining_material: "",
     wearing_method: "",
-    disclaimer: "商品尺寸均为手工测量，存在少量误差属于正常情况。\n因拍摄光线和显示设备不同，商品颜色请以实物为准。"
+    disclaimer: "包身长宽高测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
   });
 
   const allAssets = useMemo(() => [...(assets.product || []), ...(assets.model || []), ...(assets.tag || [])], [assets]);

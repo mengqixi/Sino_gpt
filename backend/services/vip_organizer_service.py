@@ -10,6 +10,7 @@ import shutil
 import textwrap
 import uuid
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from ..database import db_session, now_iso
 
 ORGANIZER_UPLOAD_DIR = UPLOAD_DIR / "vip_organizer"
 UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
+BUNDLED_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "NotoSansSC-VF-GB2312.ttf"
 
 
 SLOT_DEFINITIONS = [
@@ -41,13 +43,14 @@ SLOT_DEFINITIONS = [
     ("603.jpg", "模特展示三", "750×750", "model"),
     ("604.jpg", "内里/结构细节", "750×750", "product"),
     ("605.jpg", "ELLE Logo/五金细节", "750×750", "product"),
-    ("606.jpg", "正面、侧面、背面、顶视图", "750×750", "composite"),
+    ("606.jpg", "半侧面、正面、背面、顶视图", "750×750", "composite"),
     ("801.jpg", "吊牌信息", "750×750", "tag"),
 ]
 
 PRODUCT_ROLES = {
     "auto",
     "front",
+    "semi_side",
     "side",
     "back",
     "top",
@@ -141,7 +144,7 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
         raise ValueError("请至少上传一张商品原图")
     config = _analysis_config()
     role_text = (
-        "front正面主图, side侧面, back背面, top顶部或开口全景, bottom底部, "
+        "front正面主图, semi_side半侧面或三分之二角度, side完整侧面, back背面, top顶部或开口全景, bottom底部, "
         "transparent透明底正面, strap肩带完整展示, detail局部细节"
     )
     tag_text = (
@@ -156,6 +159,7 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
             f"{role_text}。每张图只能有一个主类别；相似图片允许同类别。"
             f"另外可从以下细节标签中选择零个或多个：{tag_text}。"
             "完整产品图不能因为画面里有Logo或链条就标成局部细节。只有局部放大的照片才标为detail。"
+            "半侧面能同时看到包身正面和一侧厚度，标为semi_side；只看到窄侧廓时才标为side。"
             "底部平放或仰拍标为bottom；整条肩带或链条长度为主要展示内容时标为strap；"
             "出现内衬、内袋或包内空间时添加interior，内袋或内标近景再添加inner_pocket_label；"
             "俯拍完整包口但重点不是局部拉链时标为top。无法可靠判断正反面时降低confidence。"
@@ -364,6 +368,8 @@ def _classify_product_metrics(item: dict[str, Any]) -> tuple[str, list[str], int
         return "detail", tags, confidence, "检测到局部放大画面，并按可见结构添加细节标签"
 
     full_view_tags = ["logo", "hardware"] if center_gold > 0.012 else []
+    if center_gold > 0.012 and 1.05 <= ratio <= 1.24 and fill >= 0.60 and bbox <= 0.27:
+        return "semi_side", full_view_tags, 84, "完整包体同时露出正面和一侧厚度，判断为半侧面视图"
     if center_gold > 0.012:
         return "front", full_view_tags, 76, "检测到完整包体及中央五金/Logo候选，判断为正面主图"
     return "back", [], 58, "检测到完整包体但缺少明确正面标志，暂判为背面，建议人工确认"
@@ -581,7 +587,7 @@ def analyze_assets(
     full_views = [
         item
         for item in non_transparent
-        if effective_role(item) in {"front", "side", "back", "top"}
+        if effective_role(item) in {"front", "semi_side", "side", "back", "top"}
         or (0.04 <= item["foreground_ratio"] <= 0.26 and item["bbox_ratio"] <= 0.36)
     ]
     if not full_views:
@@ -591,9 +597,16 @@ def analyze_assets(
         )[: max(1, min(6, len(non_transparent)))]
 
     regular_views = [item for item in full_views if 0.9 <= item["object_ratio"] <= 1.8]
-    front_view = assigned("front") or max(
-        regular_views or full_views,
-        key=lambda item: (item["center_gold_ratio"], item["role_confidence"], item["sharpness"]),
+    fixed_front_views = [item for item in usable_products if role_overrides.get(item["id"]) == "front"]
+    labeled_front_views = fixed_front_views or [item for item in regular_views if effective_role(item) == "front"]
+    front_view = max(
+        labeled_front_views or regular_views or full_views,
+        key=lambda item: (
+            item["foreground_fill_ratio"],
+            -abs(item["object_ratio"] - 1.30),
+            item["center_gold_ratio"],
+            item["sharpness"],
+        ),
     )
     back_candidates = [item for item in regular_views if item["id"] != front_view["id"]]
     back_view = assigned("back") or (min(
@@ -605,13 +618,27 @@ def analyze_assets(
     side_candidates.sort(key=lambda item: (abs(item["object_ratio"] - 0.45), -item["sharpness"]))
     side_view = assigned("side") or (side_candidates[0] if side_candidates else min(full_views, key=lambda item: item["object_ratio"]))
     side_id = side_view["id"]
+    semi_side_candidates = [
+        item
+        for item in full_views
+        if item["id"] not in {front_view["id"], back_view["id"]}
+        and 1.02 <= item["object_ratio"] <= 1.26
+        and item["foreground_fill_ratio"] >= 0.52
+    ]
+    semi_side_candidates.sort(key=lambda item: (
+        abs(item["object_ratio"] - 1.16),
+        -item["foreground_fill_ratio"],
+        -item["sharpness"],
+    ))
+    angle_view = assigned("semi_side") or (semi_side_candidates[0] if semi_side_candidates else side_view)
+    angle_role = "semi_side" if effective_role(angle_view) == "semi_side" else "side"
     top_candidates = [
         item for item in full_views
-        if item["id"] not in {front_view["id"], back_view["id"], side_id}
+        if item["id"] not in {front_view["id"], back_view["id"], side_id, angle_view["id"]}
         and 0.72 <= item["object_ratio"] <= 0.95
     ]
     top_view = assigned("top") or (min(top_candidates, key=lambda item: item["sharpness"]) if top_candidates else next(
-        (item for item in full_views if item["id"] not in {front_view["id"], back_view["id"], side_id}),
+        (item for item in full_views if item["id"] not in {front_view["id"], back_view["id"], side_id, angle_view["id"]}),
         back_view,
     ))
     back_id = back_view["id"]
@@ -654,24 +681,24 @@ def analyze_assets(
 
     slot_values = {
         "1.jpg": (model_pick(0), 88 if models else 0, "来自独立模特图区，优先选择清晰度较高的照片"),
-        "2.jpg": ([side_view["id"]], selection_confidence(side_view, role="side"), "优先使用侧面或半侧面主类别，低可信时请人工确认"),
+        "2.jpg": ([angle_view["id"]], selection_confidence(angle_view, role=angle_role), "优先使用半侧面（三分之二角度），缺少时才回退到完整侧面"),
         "3.jpg": ([back_id], selection_confidence(back_view, role="back"), "优先使用背面标签，缺少明确背面图时会回退到完整产品图"),
         "4.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "优先使用局部细节中的ELLE Logo标签"),
         "15.jpg": ([interior_id], selection_confidence(interior_view, tag="interior"), "优先使用带内里或内袋标签的局部细节"),
         "30.png": ([front_id], 98 if has_transparent else 35, "检测到透明通道" if has_transparent else "未检测到透明图，暂用正面候选图"),
         "50.jpg": (model_pick(0), 88 if models else 0, "与1.jpg使用同一张模特图，仅按竖版规格重新排版"),
-        "401.jpg": ([front_id], 98 if has_transparent else selection_confidence(front_view, role="front"), "根据正面产品图和商品资料套用信息页模板"),
+        "401.jpg": ([angle_view["id"]], selection_confidence(angle_view, role=angle_role), "按示例优先使用半侧面产品图和商品资料套用信息页模板"),
         "601.jpg": (model_pick(0), 90 if models else 0, "模特图自动留白排版"),
         "602.jpg": (model_pick(1), 90 if models else 0, "模特图自动留白排版"),
         "603.jpg": (model_pick(2), 90 if models else 0, "模特图自动留白排版"),
         "604.jpg": ([secondary_detail["id"]], selection_confidence(secondary_detail, tag="inner_pocket_label"), "优先使用另一张内里、拉链开口或结构细节"),
         "605.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "复用ELLE Logo清晰近景候选"),
-        "606.jpg": ([front_view["id"], side_id, back_id, top_id], min(
+        "606.jpg": ([angle_view["id"], front_view["id"], back_id, top_id], min(
+            selection_confidence(angle_view, role=angle_role),
             selection_confidence(front_view, role="front"),
-            selection_confidence(side_view, role="side"),
             selection_confidence(back_view, role="back"),
             selection_confidence(top_view, role="top"),
-        ), "按正面、侧面、背面和顶部主类别生成四角度初稿"),
+        ), "按半侧面、正面、背面和顶部的示例顺序生成四角度模板"),
         "801.jpg": (tag_ids, 95 if tags else 0, "使用独立上传的吊牌图片" if tags else "尚未上传吊牌图片"),
     }
     slots = [
@@ -714,15 +741,23 @@ def _fit(image: Image.Image, size: tuple[int, int], margin: int = 0, contain: bo
     return target
 
 
+@lru_cache(maxsize=64)
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = [
+        BUNDLED_FONT_PATH,
         Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     ]
     for path in candidates:
         if path.exists():
-            return ImageFont.truetype(str(path), size=size)
+            font = ImageFont.truetype(str(path), size=size)
+            if path == BUNDLED_FONT_PATH and bold:
+                try:
+                    font.set_variation_by_name("Bold")
+                except (AttributeError, OSError):
+                    pass
+            return font
     return ImageFont.load_default()
 
 
@@ -859,13 +894,34 @@ def _info_page(info: dict[str, str], product_image: Image.Image | None = None) -
     draw.line((685, 450, 696, 465), fill=line_color, width=2)
     _draw_rotated_text(image, _dimension_mm(info.get("product_width") or ""), (640, 493), 26, _font(18))
 
-    disclaimer = info.get("disclaimer") or "商品尺寸均为手工测量，存在少量误差属于正常情况。"
+    disclaimer = info.get("disclaimer") or "包身长宽高测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
     notes = [line.strip() for line in disclaimer.splitlines() if line.strip()]
     if len(notes) < 2:
         notes = textwrap.wrap(disclaimer.replace("\n", " "), width=31)[:2]
     for index, line in enumerate(notes):
         draw.text((329, 580 + index * 27), f"* {line[:34]}", font=_font(15), fill="#222222")
     return image
+
+
+def _model_showcase_page(source: Image.Image) -> Image.Image:
+    """Match the 601-603 reference: cropped model photo with a fixed white frame."""
+    canvas = Image.new("RGB", (750, 750), "white")
+    rendered = ImageOps.fit(source.convert("RGB"), (638, 634), Image.Resampling.LANCZOS, centering=(0.5, 0.46))
+    canvas.paste(rendered, (56, 65))
+    return canvas
+
+
+def _detail_showcase_page(source: Image.Image) -> Image.Image:
+    """Match the 604-605 reference: title, white border and a large detail crop."""
+    canvas = Image.new("RGB", (750, 750), "white")
+    draw = ImageDraw.Draw(canvas)
+    title = "细节展示"
+    title_font = _font(34, True)
+    title_box = draw.textbbox((0, 0), title, font=title_font)
+    draw.text(((750 - (title_box[2] - title_box[0])) / 2, 70), title, font=title_font, fill="#aaaaaa")
+    rendered = ImageOps.fit(source.convert("RGB"), (640, 522), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    canvas.paste(rendered, (55, 181))
+    return canvas
 
 
 def _multi_angle_page(image_ids: list[int]) -> Image.Image:
@@ -876,10 +932,10 @@ def _multi_angle_page(image_ids: list[int]) -> Image.Image:
     title_box = draw.textbbox((0, 0), title, font=title_font)
     draw.text(((750 - (title_box[2] - title_box[0])) / 2, 62), title, font=title_font, fill="#111111")
     boxes = [
-        (65, 180, 305, 355),
-        (445, 180, 685, 355),
-        (65, 500, 305, 675),
-        (445, 500, 685, 675),
+        (62, 177, 307, 360),
+        (443, 177, 688, 360),
+        (62, 494, 307, 682),
+        (443, 494, 688, 682),
     ]
     for image_id, box in zip(image_ids[:4], boxes):
         _paste_product(canvas, _load_image(image_id), box)
@@ -937,7 +993,11 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
             _save_png_30(_load_image(ids[0]), output)
         elif file_name == "50.jpg":
             _fit(_load_image(ids[0]), (950, 1200)).save(output, quality=94)
-        elif file_name.startswith("60") or file_name == "801.jpg":
+        elif file_name in {"601.jpg", "602.jpg", "603.jpg"}:
+            _model_showcase_page(_load_image(ids[0])).save(output, quality=94)
+        elif file_name in {"604.jpg", "605.jpg"}:
+            _detail_showcase_page(_load_image(ids[0])).save(output, quality=94)
+        elif file_name == "801.jpg":
             _fit(_load_image(ids[0]), (750, 750), margin=40, contain=True).save(output, quality=94)
         else:
             _fit(_load_image(ids[0]), (800, 800)).save(output, quality=94)
