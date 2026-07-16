@@ -30,7 +30,7 @@ const sizeOptions = [
 ];
 
 function preferredApiConfig(rows: any[]) {
-  const enabled = rows.filter((item) => item.enabled);
+  const enabled = rows.filter((item) => item.enabled && (item.api_type || "image_generation") === "image_generation");
   return enabled.find((item) => item.config_name?.trim() === "快速") || enabled.find((item) => item.is_default) || enabled[0] || null;
 }
 
@@ -154,7 +154,7 @@ export default function Generate({
   }, [taskType]);
 
   async function reload() {
-    const [promptRows, configRows] = await Promise.all([taskType ? api.getPrompts(taskType) : Promise.resolve([]), api.getApiConfigs()]);
+    const [promptRows, configRows] = await Promise.all([taskType ? api.getPrompts(taskType) : Promise.resolve([]), api.getApiConfigs("image_generation")]);
     setPrompts(promptRows);
     const enabledConfigs = configRows.filter((item) => item.enabled);
     setConfigs(enabledConfigs);

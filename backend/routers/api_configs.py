@@ -5,13 +5,21 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..database import db_session, now_iso
-from ..services.api_config_service import API_CONFIG_FIELDS, get_config, row_to_config, set_default_config
+from ..services.api_config_service import (
+    API_CONFIG_FIELDS,
+    IMAGE_API_TYPE,
+    VALID_API_TYPES,
+    get_config,
+    row_to_config,
+    set_default_config,
+)
 
 router = APIRouter(prefix="/api/api-configs", tags=["api-configs"])
 
 
 class ApiConfigPayload(BaseModel):
     config_name: str
+    api_type: str = IMAGE_API_TYPE
     api_base_url: str
     api_key: str | None = None
     model_name: str | None = "gpt-image-2"
@@ -30,13 +38,15 @@ class ApiConfigPayload(BaseModel):
     extra_params_json: str | None = "{}"
     response_image_type: str | None = "base64"
     response_image_path: str | None = "data.0.b64_json"
-    timeout_seconds: int | None = 300
+    response_text_path: str | None = "choices.0.message.content"
+    timeout_seconds: int | None = 350
     enabled: bool | None = True
     is_default: bool | None = False
 
 
 class ApiConfigPatch(BaseModel):
     config_name: str | None = None
+    api_type: str | None = None
     api_base_url: str | None = None
     api_key: str | None = None
     model_name: str | None = None
@@ -55,6 +65,7 @@ class ApiConfigPatch(BaseModel):
     extra_params_json: str | None = None
     response_image_type: str | None = None
     response_image_path: str | None = None
+    response_text_path: str | None = None
     timeout_seconds: int | None = None
     enabled: bool | None = None
     is_default: bool | None = None
@@ -71,10 +82,24 @@ def _validate_extra_params(value: str | None) -> None:
         raise HTTPException(status_code=400, detail="额外参数 JSON 必须是对象")
 
 
+def _validate_api_type(value: str | None) -> None:
+    if value is not None and value not in VALID_API_TYPES:
+        raise HTTPException(status_code=400, detail="API 用途必须是生图或文本分析")
+
+
 @router.get("")
-def list_configs():
+def list_configs(api_type: str | None = None):
+    _validate_api_type(api_type)
     with db_session() as conn:
-        rows = conn.execute("SELECT * FROM api_configs ORDER BY is_default DESC, id DESC").fetchall()
+        if api_type:
+            rows = conn.execute(
+                "SELECT * FROM api_configs WHERE api_type = ? ORDER BY is_default DESC, id DESC",
+                (api_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM api_configs ORDER BY api_type, is_default DESC, id DESC"
+            ).fetchall()
         return [row_to_config(row, include_secret=False) for row in rows]
 
 
@@ -82,12 +107,13 @@ def list_configs():
 def create_config(payload: ApiConfigPayload):
     _validate_extra_params(payload.extra_params_json)
     data = payload.model_dump()
+    _validate_api_type(data.get("api_type"))
     data["enabled"] = 1 if data.get("enabled") else 0
     data["is_default"] = 1 if data.get("is_default") else 0
     ts = now_iso()
     with db_session() as conn:
         if data["is_default"]:
-            conn.execute("UPDATE api_configs SET is_default = 0")
+            conn.execute("UPDATE api_configs SET is_default = 0 WHERE api_type = ?", (data["api_type"],))
         fields = [field for field in API_CONFIG_FIELDS if field in data]
         placeholders = ", ".join("?" for _ in fields)
         cursor = conn.execute(
@@ -102,6 +128,7 @@ def create_config(payload: ApiConfigPayload):
 def update_config(config_id: int, payload: ApiConfigPatch):
     data = payload.model_dump(exclude_unset=True)
     _validate_extra_params(data.get("extra_params_json"))
+    _validate_api_type(data.get("api_type"))
     if "enabled" in data:
         data["enabled"] = 1 if data["enabled"] else 0
     if "is_default" in data:
@@ -120,8 +147,9 @@ def update_config(config_id: int, payload: ApiConfigPatch):
         row = conn.execute("SELECT * FROM api_configs WHERE id = ?", (config_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="API 配置不存在")
+        target_type = data.get("api_type") or row["api_type"] or IMAGE_API_TYPE
         if data.get("is_default"):
-            conn.execute("UPDATE api_configs SET is_default = 0")
+            conn.execute("UPDATE api_configs SET is_default = 0 WHERE api_type = ?", (target_type,))
         conn.execute(f"UPDATE api_configs SET {', '.join(updates)} WHERE id = ?", [*values, config_id])
         updated = conn.execute("SELECT * FROM api_configs WHERE id = ?", (config_id,)).fetchone()
         return row_to_config(updated, include_secret=False)

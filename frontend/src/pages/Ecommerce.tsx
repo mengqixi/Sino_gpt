@@ -6,7 +6,7 @@ const BASIC_IDS = ["hero-image", "lifestyle-scene", "detail-macro", "model-showc
 const SIZES = ["1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "1152x2048"];
 
 function preferredConfig(rows: any[]) {
-  const enabled = rows.filter((item) => item.enabled);
+  const enabled = rows.filter((item) => item.enabled && (item.api_type || "image_generation") === "image_generation");
   return enabled.find((item) => item.config_name?.trim() === "快速") || enabled.find((item) => item.is_default) || enabled[0] || null;
 }
 
@@ -40,7 +40,7 @@ export default function Ecommerce() {
   const [preview, setPreview] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([api.getEcommerceTemplates(), api.getApiConfigs()])
+    Promise.all([api.getEcommerceTemplates(), api.getApiConfigs("image_generation")])
       .then(([templateRows, configRows]) => {
         setTemplates(templateRows);
         setConfigs(configRows.filter((item: any) => item.enabled));

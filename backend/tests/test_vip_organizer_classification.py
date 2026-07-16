@@ -66,6 +66,8 @@ class VipOrganizerClassificationTests(unittest.TestCase):
     def test_export_templates_have_bundled_chinese_font_and_fixed_white_frames(self):
         self.assertTrue(BUNDLED_FONT_PATH.exists())
         self.assertEqual(getattr(_font(24), "path", ""), str(BUNDLED_FONT_PATH))
+        self.assertEqual(_font(24).getname()[1], "Regular")
+        self.assertEqual(_font(24, True).getname()[1], "Bold")
 
         source = Image.new("RGB", (320, 480), "#b52226")
         model_page = _model_showcase_page(source)
@@ -99,7 +101,7 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         slots = {slot["file_name"]: slot["image_ids"] for slot in result["slots"]}
         self.assertEqual(slots["2.jpg"], [1])
         self.assertEqual(slots["401.jpg"], [1])
-        self.assertEqual(slots["606.jpg"], [1, 2, 3, 4])
+        self.assertEqual(slots["606.jpg"], [2, 1, 3, 4])
 
 
 if __name__ == "__main__":

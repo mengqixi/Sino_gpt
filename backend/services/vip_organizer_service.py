@@ -22,6 +22,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from ..config import ALLOWED_IMAGE_EXTENSIONS, RESULT_DIR, UPLOAD_DIR
 from ..database import db_session, now_iso
+from .api_config_service import TEXT_API_TYPE, get_config, get_default_config, mask_api_key, require_config_type
+from .json_path_service import json_path_get
 
 
 ORGANIZER_UPLOAD_DIR = UPLOAD_DIR / "vip_organizer"
@@ -43,7 +45,7 @@ SLOT_DEFINITIONS = [
     ("603.jpg", "模特展示三", "750×750", "model"),
     ("604.jpg", "内里/结构细节", "750×750", "product"),
     ("605.jpg", "ELLE Logo/五金细节", "750×750", "product"),
-    ("606.jpg", "半侧面、正面、背面、顶视图", "750×750", "composite"),
+    ("606.jpg", "正面、半侧面或全侧、背面、开口顶视图", "750×750", "composite"),
     ("801.jpg", "吊牌信息", "750×750", "tag"),
 ]
 
@@ -76,19 +78,14 @@ DETAIL_TAGS = {
 API_ANALYSIS_ROLES = CANONICAL_PRODUCT_ROLES
 
 
-def _analysis_config() -> dict[str, str]:
-    env_key = os.getenv("VIP_ANALYSIS_API_KEY", "").strip()
-    if env_key:
-        return {
-            "api_base_url": os.getenv("VIP_ANALYSIS_BASE_URL", "https://n.tokeness.io/v1").strip(),
-            "api_key": env_key,
-            "model_name": os.getenv("VIP_ANALYSIS_MODEL", "gpt-5.6-sol").strip(),
-        }
-    with db_session() as conn:
-        row = conn.execute("SELECT api_base_url, api_key, model_name FROM vip_analysis_config WHERE id = 1").fetchone()
-    if not row:
-        raise ValueError("尚未配置素材分析 API")
-    return dict(row)
+def _analysis_config(config_id: int | None = None) -> dict[str, Any]:
+    config = get_config(config_id, include_secret=True) if config_id else get_default_config(TEXT_API_TYPE, include_secret=True)
+    if not config:
+        raise ValueError("尚未配置可用的文本分析 API，请先在 API 设置中新增")
+    if not config.get("enabled"):
+        raise ValueError("所选文本分析 API 未启用")
+    require_config_type(config, TEXT_API_TYPE)
+    return config
 
 
 def save_analysis_config(api_base_url: str, api_key: str, model_name: str) -> dict[str, Any]:
@@ -98,19 +95,39 @@ def save_analysis_config(api_base_url: str, api_key: str, model_name: str) -> di
     if not base_url or not key or not model:
         raise ValueError("API Base URL、API Key 和模型名称不能为空")
     with db_session() as conn:
-        conn.execute(
-            """
-            INSERT INTO vip_analysis_config (id, api_base_url, api_key, model_name, updated_at)
-            VALUES (1, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                api_base_url = excluded.api_base_url,
-                api_key = excluded.api_key,
-                model_name = excluded.model_name,
-                updated_at = excluded.updated_at
-            """,
-            (base_url, key, model, now_iso()),
-        )
-    return {"configured": True, "api_base_url": base_url, "model_name": model}
+        row = conn.execute(
+            "SELECT id FROM api_configs WHERE api_type = ? ORDER BY is_default DESC, id ASC LIMIT 1",
+            (TEXT_API_TYPE,),
+        ).fetchone()
+        ts = now_iso()
+        if row:
+            conn.execute(
+                """
+                UPDATE api_configs
+                SET api_base_url = ?, api_key = ?, model_name = ?, endpoint_path = ?,
+                    request_content_type = ?, response_text_path = ?, enabled = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (base_url, key, model, "/chat/completions", "application/json", "choices.0.message.content", ts, row["id"]),
+            )
+            config_id = row["id"]
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO api_configs (
+                    config_name, api_type, api_base_url, api_key, model_name,
+                    endpoint_path, request_content_type, response_text_path,
+                    timeout_seconds, enabled, is_default, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "素材分析（文本）", TEXT_API_TYPE, base_url, key, model,
+                    "/chat/completions", "application/json", "choices.0.message.content",
+                    350, 1, 1, ts, ts,
+                ),
+            )
+            config_id = cursor.lastrowid
+    return {"configured": True, "config_id": config_id, "api_base_url": base_url, "model_name": model}
 
 
 def analysis_config_status() -> dict[str, Any]:
@@ -118,13 +135,12 @@ def analysis_config_status() -> dict[str, Any]:
         config = _analysis_config()
     except ValueError:
         return {"configured": False}
-    key = config["api_key"]
-    masked = f"{key[:4]}****{key[-4:]}" if len(key) > 8 else "****"
     return {
         "configured": True,
+        "config_id": config["id"],
         "api_base_url": config["api_base_url"],
         "model_name": config["model_name"],
-        "api_key_masked": masked,
+        "api_key_masked": mask_api_key(config.get("api_key")),
     }
 
 
@@ -137,12 +153,12 @@ def _analysis_data_url(path: Path) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> dict[str, Any]:
+def analyze_assets_with_api(session_id: str, product_image_ids: list[int], api_config_id: int) -> dict[str, Any]:
     _validate_session_assets(session_id, {"product": product_image_ids})
     rows = _uploaded_rows(product_image_ids)
     if not rows:
         raise ValueError("请至少上传一张商品原图")
-    config = _analysis_config()
+    config = _analysis_config(api_config_id)
     role_text = (
         "front正面主图, semi_side半侧面或三分之二角度, side完整侧面, back背面, top顶部或开口全景, bottom底部, "
         "transparent透明底正面, strap肩带完整展示, detail局部细节"
@@ -160,6 +176,8 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
             f"另外可从以下细节标签中选择零个或多个：{tag_text}。"
             "完整产品图不能因为画面里有Logo或链条就标成局部细节。只有局部放大的照片才标为detail。"
             "半侧面能同时看到包身正面和一侧厚度，标为semi_side；只看到窄侧廓时才标为side。"
+            "front必须是完整正面且包口、Logo或主要五金朝向镜头；back是完整背面，不要仅因没有明显Logo就草率判断。"
+            "不要把肩带横向铺开的正面图误判为半侧面；判断视角时以包身主体透视和侧边厚度为准。"
             "底部平放或仰拍标为bottom；整条肩带或链条长度为主要展示内容时标为strap；"
             "出现内衬、内袋或包内空间时添加interior，内袋或内标近景再添加inner_pocket_label；"
             "俯拍完整包口但重点不是局部拉链时标为top。无法可靠判断正反面时降低confidence。"
@@ -167,24 +185,70 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
             '{"items":[{"index":1,"role":"front","tags":["logo","hardware"],"confidence":90,"reason":"简短中文理由"}]}。'
         ),
     }]
+    local_hints: dict[int, tuple[str, int]] = {}
     for index, row in enumerate(rows, start=1):
-        content.append({"type": "text", "text": f"图片 {index}，文件名：{row['file_name']}"})
+        metrics = _image_metrics(row)
+        local_role, _, local_confidence, _ = _classify_product_metrics(metrics)
+        local_hints[index] = (local_role, local_confidence)
+        content.append({
+            "type": "text",
+            "text": (
+                f"图片 {index}，文件名：{row['file_name']}。"
+                f"轻量本地初判：{local_role}（{local_confidence}%），仅供参考，请以画面为准。"
+            ),
+        })
         content.append({"type": "image_url", "image_url": {"url": _analysis_data_url(Path(row["file_path"])), "detail": "low"}})
-    url = config["api_base_url"].rstrip("/") + "/chat/completions"
+    base_url = (config.get("api_base_url") or "").strip()
+    endpoint_path = (config.get("endpoint_path") or "").strip()
+    if not base_url or not endpoint_path:
+        raise ValueError("文本分析 API 的 Base URL 或接口路径为空")
+    if (config.get("method") or "POST").upper() != "POST":
+        raise ValueError("文本分析 API 当前仅支持 POST 请求")
+    if (config.get("request_content_type") or "application/json").lower() != "application/json":
+        raise ValueError("文本分析 API 必须使用 application/json 请求格式")
+    headers = {"Content-Type": "application/json"}
+    auth_type = (config.get("auth_type") or "bearer").lower()
+    api_key = config.get("api_key") or ""
+    if auth_type != "none":
+        if not api_key:
+            raise ValueError("所选文本分析 API 尚未配置 API Key")
+        header_name = config.get("auth_header_name") or "Authorization"
+        if auth_type == "bearer":
+            prefix = config.get("auth_header_prefix") or "Bearer"
+            headers[header_name] = f"{prefix} {api_key}".strip()
+        elif auth_type == "raw":
+            headers[header_name] = api_key
+        else:
+            raise ValueError("文本分析 API 的认证方式无效")
+    try:
+        request_payload = json.loads(config.get("extra_params_json") or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("文本分析 API 的额外参数 JSON 格式错误") from exc
+    if not isinstance(request_payload, dict):
+        raise ValueError("文本分析 API 的额外参数 JSON 必须是对象")
+    request_payload.update({
+        config.get("model_field_name") or "model": config.get("model_name") or "",
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0,
+    })
+    url = base_url.rstrip("/") + "/" + endpoint_path.lstrip("/")
     response = requests.post(
         url,
-        headers={"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"},
-        json={
-            "model": config["model_name"],
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0,
-        },
-        timeout=350,
+        headers=headers,
+        json=request_payload,
+        timeout=max(10, int(config.get("timeout_seconds") or 350)),
     )
     if not response.ok:
         raise ValueError(f"素材分析 API 返回 HTTP {response.status_code}：{response.text[:300]}")
     try:
-        raw = response.json()["choices"][0]["message"]["content"]
+        response_json = response.json()
+        response_values = json_path_get(
+            response_json,
+            config.get("response_text_path") or "choices.0.message.content",
+        )
+        raw = response_values[0]
+        if not isinstance(raw, str):
+            raw = json.dumps(raw, ensure_ascii=False)
         match = re.search(r"\{.*\}", raw, re.S)
         parsed = json.loads(match.group(0) if match else raw)
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -201,6 +265,8 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int]) -> di
             role, tags = "detail", list(dict.fromkeys([*tags, "logo", "hardware"]))
         elif role == "interior":
             role, tags = "detail", list(dict.fromkeys([*tags, "interior"]))
+        if local_hints.get(index, ("", 0))[0] == "transparent":
+            role = "transparent"
         if 1 <= index <= len(rows) and role in API_ANALYSIS_ROLES:
             image_id = int(rows[index - 1]["id"])
             roles[image_id] = role
@@ -693,12 +759,12 @@ def analyze_assets(
         "603.jpg": (model_pick(2), 90 if models else 0, "模特图自动留白排版"),
         "604.jpg": ([secondary_detail["id"]], selection_confidence(secondary_detail, tag="inner_pocket_label"), "优先使用另一张内里、拉链开口或结构细节"),
         "605.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "复用ELLE Logo清晰近景候选"),
-        "606.jpg": ([angle_view["id"], front_view["id"], back_id, top_id], min(
-            selection_confidence(angle_view, role=angle_role),
+        "606.jpg": ([front_view["id"], angle_view["id"], back_id, top_id], min(
             selection_confidence(front_view, role="front"),
+            selection_confidence(angle_view, role=angle_role),
             selection_confidence(back_view, role="back"),
             selection_confidence(top_view, role="top"),
-        ), "按半侧面、正面、背面和顶部的示例顺序生成四角度模板"),
+        ), "按正面、半侧面或全侧、背面、开口顶视图的固定顺序生成四角度模板"),
         "801.jpg": (tag_ids, 95 if tags else 0, "使用独立上传的吊牌图片" if tags else "尚未上传吊牌图片"),
     }
     slots = [
@@ -752,9 +818,9 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.I
     for path in candidates:
         if path.exists():
             font = ImageFont.truetype(str(path), size=size)
-            if path == BUNDLED_FONT_PATH and bold:
+            if path == BUNDLED_FONT_PATH:
                 try:
-                    font.set_variation_by_name("Bold")
+                    font.set_variation_by_name("Bold" if bold else "Regular")
                 except (AttributeError, OSError):
                     pass
             return font
@@ -981,12 +1047,12 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
         output = folder / file_name
         if file_name == "401.jpg":
             source = _load_image(ids[0]) if ids else None
-            _info_page(product_info, source).save(output, quality=94)
+            _info_page(product_info, source).save(output, quality=98, subsampling=0)
         elif file_name == "606.jpg":
             if len(ids) < 4:
                 missing.append(file_name)
                 continue
-            _multi_angle_page(ids).save(output, quality=94)
+            _multi_angle_page(ids).save(output, quality=98, subsampling=0)
         elif not ids:
             missing.append(file_name)
         elif file_name == "30.png":

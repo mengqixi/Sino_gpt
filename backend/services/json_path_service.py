@@ -3,7 +3,7 @@ from typing import Any
 
 def json_path_get(data: Any, path: str) -> list[Any]:
     if not path:
-        raise ValueError("返回图片字段路径为空")
+        raise ValueError("返回字段路径为空")
     parts = path.split(".")
     current = [data]
     for part in parts:

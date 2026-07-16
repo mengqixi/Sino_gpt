@@ -4,7 +4,7 @@ from threading import Thread
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
-from ..services.api_config_service import get_config
+from ..services.api_config_service import IMAGE_API_TYPE, get_config, require_config_type
 from ..services.file_service import crop_generated_image, save_existing_image_as_upload, split_image_grid
 from ..services.image_job_service import (
     add_generated_image,
@@ -118,6 +118,10 @@ def generate(payload: GeneratePayload, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="API 配置不存在")
     if not config.get("enabled"):
         raise HTTPException(status_code=400, detail="API 配置未启用")
+    try:
+        require_config_type(config, IMAGE_API_TYPE)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not payload.final_prompt.strip():
         raise HTTPException(status_code=400, detail="最终提示词不能为空")
 

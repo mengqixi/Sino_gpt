@@ -37,6 +37,7 @@ class ExportPayload(BaseModel):
 class ApiAnalyzePayload(BaseModel):
     session_id: str
     product_image_ids: list[int] = Field(default_factory=list)
+    api_config_id: int
 
 
 class AnalysisConfigPayload(BaseModel):
@@ -102,7 +103,7 @@ def update_analysis_config(payload: AnalysisConfigPayload):
 @router.post("/analyze-with-api")
 def analyze_with_api(payload: ApiAnalyzePayload):
     try:
-        return analyze_assets_with_api(payload.session_id, payload.product_image_ids)
+        return analyze_assets_with_api(payload.session_id, payload.product_image_ids, payload.api_config_id)
     except (ValueError, requests.RequestException) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

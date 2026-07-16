@@ -40,6 +40,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS api_configs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 config_name TEXT NOT NULL,
+                api_type TEXT DEFAULT 'image_generation',
                 api_base_url TEXT NOT NULL,
                 api_key TEXT,
                 model_name TEXT,
@@ -58,6 +59,7 @@ def init_db() -> None:
                 extra_params_json TEXT DEFAULT '{}',
                 response_image_type TEXT DEFAULT 'base64',
                 response_image_path TEXT DEFAULT 'data.0.b64_json',
+                response_text_path TEXT DEFAULT 'choices.0.message.content',
                 timeout_seconds INTEGER DEFAULT 350,
                 enabled INTEGER DEFAULT 1,
                 is_default INTEGER DEFAULT 0,
@@ -149,23 +151,91 @@ def init_db() -> None:
             );
             """
         )
-        count = conn.execute("SELECT COUNT(*) FROM api_configs").fetchone()[0]
-        if count == 0:
+        api_config_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(api_configs)").fetchall()
+        }
+        if "api_type" not in api_config_columns:
+            conn.execute("ALTER TABLE api_configs ADD COLUMN api_type TEXT DEFAULT 'image_generation'")
+        if "response_text_path" not in api_config_columns:
+            conn.execute(
+                "ALTER TABLE api_configs ADD COLUMN response_text_path TEXT DEFAULT 'choices.0.message.content'"
+            )
+        conn.execute(
+            """
+            UPDATE api_configs
+            SET api_type = 'image_generation'
+            WHERE api_type IS NULL OR api_type NOT IN ('image_generation', 'text_analysis')
+            """
+        )
+
+        legacy_analysis = conn.execute(
+            "SELECT api_base_url, api_key, model_name FROM vip_analysis_config WHERE id = 1"
+        ).fetchone()
+        if legacy_analysis:
+            existing_analysis = conn.execute(
+                """
+                SELECT id FROM api_configs
+                WHERE api_type = 'text_analysis' AND api_base_url = ? AND model_name = ?
+                LIMIT 1
+                """,
+                (legacy_analysis["api_base_url"], legacy_analysis["model_name"]),
+            ).fetchone()
+            if not existing_analysis:
+                ts = now_iso()
+                text_config_count = conn.execute(
+                    "SELECT COUNT(*) FROM api_configs WHERE api_type = 'text_analysis'"
+                ).fetchone()[0]
+                conn.execute(
+                    """
+                    INSERT INTO api_configs (
+                        config_name, api_type, api_base_url, api_key, model_name,
+                        endpoint_path, method, request_content_type, auth_type,
+                        auth_header_name, auth_header_prefix, extra_params_json,
+                        response_text_path, timeout_seconds, enabled, is_default,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "素材分析（文本）",
+                        "text_analysis",
+                        legacy_analysis["api_base_url"],
+                        legacy_analysis["api_key"],
+                        legacy_analysis["model_name"],
+                        "/chat/completions",
+                        "POST",
+                        "application/json",
+                        "bearer",
+                        "Authorization",
+                        "Bearer",
+                        "{}",
+                        "choices.0.message.content",
+                        350,
+                        1,
+                        1 if text_config_count == 0 else 0,
+                        ts,
+                        ts,
+                    ),
+                )
+        image_config_count = conn.execute(
+            "SELECT COUNT(*) FROM api_configs WHERE api_type = 'image_generation'"
+        ).fetchone()[0]
+        if image_config_count == 0:
             ts = now_iso()
             conn.execute(
                 """
                 INSERT INTO api_configs (
-                    config_name, api_base_url, api_key, model_name, endpoint_path,
+                    config_name, api_type, api_base_url, api_key, model_name, endpoint_path,
                     method, request_content_type, auth_type, auth_header_name,
                     auth_header_prefix, image_field_name, prompt_field_name,
                     model_field_name, count_field_name, size_field_name,
                     quality_field_name, extra_params_json, response_image_type,
-                    response_image_path, timeout_seconds, enabled, is_default,
+                    response_image_path, response_text_path, timeout_seconds, enabled, is_default,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "默认中转站配置",
+                    "image_generation",
                     "https://your-relay-domain.com",
                     "",
                     "gpt-image-2",
@@ -184,6 +254,7 @@ def init_db() -> None:
                     "{}",
                     "base64",
                     "data.0.b64_json",
+                    "choices.0.message.content",
                     350,
                     1,
                     1,
@@ -192,10 +263,14 @@ def init_db() -> None:
                 ),
             )
         fast = conn.execute(
-            "SELECT id FROM api_configs WHERE config_name = '快速' AND enabled = 1 ORDER BY id LIMIT 1"
+            """
+            SELECT id FROM api_configs
+            WHERE config_name = '快速' AND api_type = 'image_generation' AND enabled = 1
+            ORDER BY id LIMIT 1
+            """
         ).fetchone()
         if fast:
-            conn.execute("UPDATE api_configs SET is_default = 0")
+            conn.execute("UPDATE api_configs SET is_default = 0 WHERE api_type = 'image_generation'")
             conn.execute(
                 "UPDATE api_configs SET is_default = 1, updated_at = ? WHERE id = ?",
                 (now_iso(), fast["id"]),
