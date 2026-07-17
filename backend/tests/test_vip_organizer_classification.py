@@ -11,6 +11,7 @@ from backend.services.vip_organizer_service import (
     _font,
     _model_showcase_page,
     _paste_product,
+    _refine_product_classifications,
     analyze_assets,
 )
 
@@ -108,13 +109,68 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertIn("inner_pocket_label", tags)
         self.assertNotIn("hardware", tags)
 
-    def test_full_views_use_logo_hint_but_keep_low_back_confidence(self):
+    def test_full_views_use_logo_hint_but_keep_unknown_face_low_confidence(self):
         front_role, front_tags, _, _ = _classify_product_metrics(metrics(object_ratio=1.31, center_gold_ratio=0.02))
-        back_role, _, back_confidence, _ = _classify_product_metrics(metrics(object_ratio=1.31, center_gold_ratio=0.002))
+        unknown_role, _, unknown_confidence, _ = _classify_product_metrics(metrics(object_ratio=1.31, center_gold_ratio=0.002))
         self.assertEqual(front_role, "front")
         self.assertIn("logo", front_tags)
-        self.assertEqual(back_role, "back")
-        self.assertLess(back_confidence, 60)
+        self.assertEqual(unknown_role, "front")
+        self.assertLess(unknown_confidence, 60)
+
+    def test_batch_refinement_uses_depth_edges_without_mistaking_front_accessories(self):
+        samples = [
+            {
+                "id": 1,
+                "suggested_role": "front",
+                "suggested_tags": [],
+                "role_confidence": 76,
+                "main_component_ratio": 1.03,
+                "main_component_fill_ratio": 0.60,
+                "main_body_side_edge_ratio": 11.5,
+                "strict_center_gold_ratio": 0.002,
+                "bbox_ratio": 0.41,
+            },
+            {
+                "id": 2,
+                "suggested_role": "front",
+                "suggested_tags": [],
+                "role_confidence": 76,
+                "main_component_ratio": 0.94,
+                "main_component_fill_ratio": 0.61,
+                "main_body_side_edge_ratio": 2.15,
+                "strict_center_gold_ratio": 0.004,
+                "bbox_ratio": 0.44,
+            },
+            {
+                "id": 3,
+                "suggested_role": "front",
+                "suggested_tags": ["logo", "hardware"],
+                "role_confidence": 76,
+                "main_component_ratio": 1.03,
+                "main_component_fill_ratio": 0.60,
+                "main_body_side_edge_ratio": 0.85,
+                "strict_center_gold_ratio": 0.009,
+                "bbox_ratio": 0.42,
+            },
+            {
+                "id": 4,
+                "suggested_role": "front",
+                "suggested_tags": [],
+                "role_confidence": 58,
+                "main_component_ratio": 1.04,
+                "main_component_fill_ratio": 0.61,
+                "main_body_side_edge_ratio": 99.0,
+                "strict_center_gold_ratio": 0.0,
+                "bbox_ratio": 0.40,
+            },
+        ]
+
+        _refine_product_classifications(samples)
+
+        roles = {sample["id"]: sample["suggested_role"] for sample in samples}
+        self.assertEqual(roles[2], "semi_side")
+        self.assertEqual(roles[3], "front")
+        self.assertEqual(roles[4], "back")
 
     def test_export_templates_have_bundled_chinese_font_and_fixed_white_frames(self):
         self.assertTrue(BUNDLED_FONT_PATH.exists())

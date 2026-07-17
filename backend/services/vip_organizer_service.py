@@ -78,6 +78,7 @@ DETAIL_TAGS = {
     "interior",
     "inner_pocket_label",
     "material_texture",
+    "bottom_detail",
 }
 API_ANALYSIS_ROLES = CANONICAL_PRODUCT_ROLES
 
@@ -170,7 +171,7 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int], api_c
     tag_text = (
         "logo ELLE Logo, hardware五金, strap_chain肩带或链条, "
         "zipper_opening拉链或开口, interior内里, inner_pocket_label内袋或内标, "
-        "material_texture材质或纹理"
+        "material_texture材质或纹理, bottom_detail包底细节"
     )
     content: list[dict[str, Any]] = [{
         "type": "text",
@@ -184,6 +185,7 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int], api_c
             "不要把肩带横向铺开的正面图误判为半侧面；判断视角时以包身主体透视和侧边厚度为准。"
             "底部平放或仰拍标为bottom；整条肩带或链条长度为主要展示内容时标为strap；"
             "出现内衬、内袋或包内空间时添加interior，内袋或内标近景再添加inner_pocket_label；"
+            "包底完整视图主类别标为bottom；只有包脚、底部车线等局部放大图才标detail并添加bottom_detail；"
             "俯拍完整包口但重点不是局部拉链时标为top。无法可靠判断正反面时降低confidence。"
             "仅返回JSON对象，不要Markdown，格式："
             '{"items":[{"index":1,"role":"front","tags":["logo","hardware"],"confidence":90,"reason":"简短中文理由"}]}。'
@@ -359,7 +361,7 @@ def _image_metrics(row: dict[str, Any]) -> dict[str, Any]:
     background = np.median(border, axis=0)
     distance = np.linalg.norm(rgb.astype(np.float32) - background, axis=2)
     mask = (distance > 30).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
     keep_ids = [index for index in range(1, count) if stats[index, cv2.CC_STAT_AREA] > sh * sw * 0.00035]
     foreground = np.isin(labels, keep_ids)
     ys, xs = np.where(foreground)
@@ -371,16 +373,73 @@ def _image_metrics(row: dict[str, Any]) -> dict[str, Any]:
     else:
         bbox_ratio = 0.0
         object_ratio = 1.0
+    main_component_ratio = object_ratio
+    main_component_fill_ratio = foreground_fill_ratio = 0.0
+    main_symmetry_error = 0.0
+    main_angle_degrees = 0.0
+    main_center_x = 0.5
+    main_center_y = 0.5
+    main_top_fill_ratio = 0.0
+    main_bottom_fill_ratio = 0.0
+    main_body_side_edge_ratio = 999.0
+    if keep_ids:
+        main_id = max(keep_ids, key=lambda index: int(stats[index, cv2.CC_STAT_AREA]))
+        left = int(stats[main_id, cv2.CC_STAT_LEFT])
+        top = int(stats[main_id, cv2.CC_STAT_TOP])
+        main_width = int(stats[main_id, cv2.CC_STAT_WIDTH])
+        main_height = int(stats[main_id, cv2.CC_STAT_HEIGHT])
+        main_area = int(stats[main_id, cv2.CC_STAT_AREA])
+        main_component_ratio = main_width / max(1, main_height)
+        main_component_fill_ratio = main_area / max(1, main_width * main_height)
+        main_center_x = float(centroids[main_id, 0] / sw)
+        main_center_y = float(centroids[main_id, 1] / sh)
+        component_mask = (labels == main_id).astype(np.uint8)
+        component_crop = component_mask[top:top + main_height, left:left + main_width]
+        mirrored = cv2.flip(component_crop, 1)
+        main_symmetry_error = float(np.mean(component_crop != mirrored))
+        split = max(1, main_height // 2)
+        main_top_fill_ratio = float(component_crop[:split].mean())
+        main_bottom_fill_ratio = float(component_crop[split:].mean())
+        component_points = np.column_stack(np.where(component_mask > 0)[::-1]).astype(np.float32)
+        if len(component_points) >= 5:
+            _, eigenvectors, _ = cv2.PCACompute2(component_points, mean=None)
+            angle = abs(float(np.degrees(np.arctan2(eigenvectors[0, 1], eigenvectors[0, 0]))))
+            main_angle_degrees = min(angle, 180.0 - angle)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    edge_ratio = float(np.mean(cv2.Canny(gray, 80, 180) > 0))
+    edge_map = cv2.Canny(gray, 80, 180) > 0
+    edge_ratio = float(np.mean(edge_map))
+    if keep_ids and main_width >= 12 and main_height >= 12:
+        body_top = min(sh, top + int(main_height * 0.45))
+        body_bottom = min(sh, top + int(main_height * 0.95))
+        left_end = min(sw, left + int(main_width * 0.20))
+        center_start = left_end
+        center_end = min(sw, left + int(main_width * 0.80))
+        right_start = center_end
+        right_end = min(sw, left + main_width)
+        left_edges = edge_map[body_top:body_bottom, left:left_end]
+        center_edges = edge_map[body_top:body_bottom, center_start:center_end]
+        right_edges = edge_map[body_top:body_bottom, right_start:right_end]
+        if left_edges.size and center_edges.size and right_edges.size:
+            side_density = min(float(left_edges.mean()), float(right_edges.mean()))
+            center_density = float(center_edges.mean())
+            main_body_side_edge_ratio = side_density / max(0.0001, center_density)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     hue, saturation, value = cv2.split(hsv)
     gold = (
         ((hue >= 8) & (hue <= 35) & (saturation >= 55) & (value >= 95))
         | ((hue >= 15) & (hue <= 38) & (saturation >= 25) & (value >= 155))
     )
+    strict_gold = (hue >= 8) & (hue <= 35) & (saturation >= 65) & (value >= 110)
     center_gold = gold[int(sh * 0.25):int(sh * 0.78), int(sw * 0.25):int(sw * 0.75)]
+    if keep_ids:
+        logo_left = max(0, int(left + main_width * 0.28))
+        logo_right = min(sw, int(left + main_width * 0.72))
+        logo_top = max(0, int(top + main_height * 0.45))
+        logo_bottom = min(sh, int(top + main_height * 0.92))
+        strict_center_gold = strict_gold[logo_top:logo_bottom, logo_left:logo_right]
+    else:
+        strict_center_gold = strict_gold[0:0, 0:0]
     foreground_ratio = float(foreground.mean())
     foreground_fill_ratio = foreground_ratio / bbox_ratio if bbox_ratio else 0.0
     return {
@@ -395,6 +454,17 @@ def _image_metrics(row: dict[str, Any]) -> dict[str, Any]:
         "sharpness": round(sharpness, 2),
         "edge_ratio": round(edge_ratio, 4),
         "center_gold_ratio": round(float(center_gold.mean()) if center_gold.size else 0.0, 4),
+        "strict_center_gold_ratio": round(float(strict_center_gold.mean()) if strict_center_gold.size else 0.0, 4),
+        "component_count": len(keep_ids),
+        "main_component_ratio": round(float(main_component_ratio), 4),
+        "main_component_fill_ratio": round(float(main_component_fill_ratio), 4),
+        "main_symmetry_error": round(float(main_symmetry_error), 4),
+        "main_angle_degrees": round(float(main_angle_degrees), 2),
+        "main_center_x": round(float(main_center_x), 4),
+        "main_center_y": round(float(main_center_y), 4),
+        "main_top_fill_ratio": round(float(main_top_fill_ratio), 4),
+        "main_bottom_fill_ratio": round(float(main_bottom_fill_ratio), 4),
+        "main_body_side_edge_ratio": round(float(main_body_side_edge_ratio), 4),
     }
 
 
@@ -408,45 +478,182 @@ def _classify_product_metrics(item: dict[str, Any]) -> tuple[str, list[str], int
     sharpness = float(item.get("sharpness", 0))
     edge_ratio = float(item.get("edge_ratio", 0))
     center_gold = float(item.get("center_gold_ratio", 0))
+    strict_center_gold = float(item.get("strict_center_gold_ratio", center_gold))
+    main_ratio = float(item.get("main_component_ratio", ratio))
+    main_fill = float(item.get("main_component_fill_ratio", fill))
+    main_symmetry = float(item.get("main_symmetry_error", 0))
+    main_angle = float(item.get("main_angle_degrees", 0))
+    main_center_y = float(item.get("main_center_y", 0.5))
+    main_top_fill = float(item.get("main_top_fill_ratio", 0))
+    main_bottom_fill = float(item.get("main_bottom_fill_ratio", 0))
+    component_count = int(item.get("component_count", 1))
+    has_shape_metrics = "main_component_ratio" in item
 
     if alpha > 0.02:
         return "transparent", [], 99, "检测到透明通道，适合作为透明正面素材"
-    if ratio > 2.15 and bbox < 0.42:
+    if 1.65 <= main_ratio <= 3.0 and bbox < 0.24 and foreground < 0.18 and main_fill >= 0.68:
         return "bottom", [], 94, "主体呈横向扁平轮廓，判断为包底视图"
-    if ratio < 0.35 and foreground < 0.10:
+    if main_ratio < 0.30 and foreground < 0.10:
         return "strap", ["strap_chain"], 92, "主体纵向跨度很长且包体占比较小，判断为完整肩带展示"
-    if ratio < 0.68 and foreground < 0.14 and bbox < 0.32:
+    if main_ratio < 0.47 and foreground < 0.14 and bbox < 0.32:
         return "side", [], 90, "包体轮廓较窄，判断为侧面视图"
-    if 0.68 <= ratio <= 0.98 and bbox < 0.32 and foreground < 0.18:
+    looks_like_open_top = (
+        main_symmetry >= 0.22
+        and main_fill >= 0.48
+        and main_center_y <= 0.57
+        and main_top_fill >= main_bottom_fill * 0.65
+        and bbox < 0.45
+        and foreground < 0.28
+    )
+    legacy_open_top = (
+        not has_shape_metrics
+        and 0.68 <= ratio <= 0.98
+        and bbox < 0.32
+        and foreground < 0.18
+    )
+    if looks_like_open_top or legacy_open_top:
         return "top", ["zipper_opening", "interior"], 86, "俯拍轮廓和开口区域明显，判断为顶部或开口全景"
 
-    is_closeup = bbox >= 0.60 or foreground >= 0.28 or (bbox >= 0.48 and fill < 0.35)
+    is_closeup = (
+        bbox >= 0.48
+        or foreground >= 0.28
+        or (bbox >= 0.38 and fill < 0.35)
+        or (main_ratio > 3.0 and bbox >= 0.20)
+    )
     if is_closeup:
         tags: list[str] = []
-        if fill >= 0.60 and sharpness < 2000:
-            tags.extend(["interior", "inner_pocket_label"])
-        elif sharpness > 1800 or edge_ratio > 0.12:
-            tags.append("material_texture")
-        elif foreground >= 0.20 and fill >= 0.32:
+        opening_interior = (
+            component_count >= 6
+            and main_symmetry >= 0.30
+            and main_top_fill > main_bottom_fill
+        ) or (
+            not has_shape_metrics
+            and fill >= 0.60
+            and sharpness < 2000
+        )
+        if opening_interior:
+            tags.append("interior")
+            if sharpness < 2000:
+                tags.append("inner_pocket_label")
+        if not opening_interior and (
+            main_ratio > 3.0 or strict_center_gold > 0.008 or center_gold > 0.04
+        ):
+            tags.extend(["logo", "hardware"])
+        if main_angle >= 60 or (foreground >= 0.20 and fill >= 0.32):
             tags.append("zipper_opening")
-        else:
-            tags.extend(["strap_chain", "hardware"])
         if sharpness > 1800 or edge_ratio > 0.12:
             tags.append("material_texture")
-        if sharpness > 1800 and center_gold > 0.008:
-            tags.extend(["logo", "hardware"])
-        if center_gold > 0.04 and "interior" not in tags and "hardware" not in tags:
-            tags.append("hardware")
+        if 1.5 <= main_ratio <= 3.0 and main_fill >= 0.75 and main_angle <= 15:
+            tags.append("bottom_detail")
+        if not tags:
+            tags.append("hardware" if strict_center_gold > 0.002 else "material_texture")
         tags = list(dict.fromkeys(tags))
         confidence = 74 if tags else 62
         return "detail", tags, confidence, "检测到局部放大画面，并按可见结构添加细节标签"
 
-    full_view_tags = ["logo", "hardware"] if center_gold > 0.012 else []
+    full_view_tags = ["logo", "hardware"] if strict_center_gold > 0.008 else []
     if center_gold > 0.012 and 1.05 <= ratio <= 1.24 and fill >= 0.60 and bbox <= 0.27:
         return "semi_side", full_view_tags, 84, "完整包体同时露出正面和一侧厚度，判断为半侧面视图"
-    if center_gold > 0.012:
+    if strict_center_gold > 0.008:
         return "front", full_view_tags, 76, "检测到完整包体及中央五金/Logo候选，判断为正面主图"
-    return "back", [], 58, "检测到完整包体但缺少明确正面标志，暂判为背面，建议人工确认"
+    return "front", [], 58, "检测到完整包体但缺少明确正反面标志，暂作正面候选，建议人工确认"
+
+
+def _refine_product_classifications(products: list[dict[str, Any]]) -> None:
+    """Use relative geometry within one product batch to correct obvious view mix-ups."""
+    full_roles = {"front", "semi_side", "side", "back", "top"}
+    candidates = [item for item in products if item.get("suggested_role") in full_roles]
+    if len(candidates) < 3:
+        return
+
+    regular = [
+        item for item in candidates
+        if float(item.get("main_component_fill_ratio", 0)) >= 0.45
+        and float(item.get("bbox_ratio", 0)) < 0.48
+    ]
+    if len(regular) < 3:
+        return
+
+    ratios = np.array([float(item.get("main_component_ratio", item.get("object_ratio", 1))) for item in regular])
+    median_ratio = float(np.median(ratios))
+    narrowest = min(regular, key=lambda item: float(item.get("main_component_ratio", 1)))
+    narrow_ratio = float(narrowest.get("main_component_ratio", 1))
+    if narrow_ratio < 0.48 and narrow_ratio <= median_ratio * 0.68:
+        narrowest.update({
+            "suggested_role": "side",
+            "suggested_tags": [],
+            "role_confidence": max(90, int(narrowest.get("role_confidence", 0))),
+            "role_reason": "同批完整视图中包体宽厚比最窄，校正为完整侧面",
+        })
+
+    face_candidates = [
+        item for item in regular
+        if item.get("suggested_role") not in {"top", "side"}
+        and float(item.get("main_component_fill_ratio", 0)) >= 0.52
+    ]
+    if len(face_candidates) < 2:
+        return
+
+    gold_values = [float(item.get("strict_center_gold_ratio", 0)) for item in face_candidates]
+    if max(gold_values, default=0) >= 0.008:
+        back = min(face_candidates, key=lambda item: float(item.get("strict_center_gold_ratio", 0)))
+        if float(back.get("strict_center_gold_ratio", 0)) <= max(gold_values) * 0.20:
+            back.update({
+                "suggested_role": "back",
+                "suggested_tags": [],
+                "role_confidence": 82,
+                "role_reason": "同批完整视图中未检测到正面中央Logo/五金，校正为背面",
+            })
+
+    remaining = [item for item in face_candidates if item.get("suggested_role") != "back"]
+    selected_semi_side: dict[str, Any] | None = None
+    if len(remaining) >= 2:
+        edge_candidates = [
+            item for item in remaining
+            if float(item.get("main_body_side_edge_ratio", 999)) < 999
+        ]
+        if edge_candidates:
+            face_median_ratio = float(np.median([
+                float(item.get("main_component_ratio", item.get("object_ratio", 1)))
+                for item in edge_candidates
+            ]))
+
+            def semi_side_score(item: dict[str, Any]) -> float:
+                edge_value = max(0.0001, float(item.get("main_body_side_edge_ratio", 999)))
+                item_ratio = float(item.get("main_component_ratio", item.get("object_ratio", 1)))
+                relative_narrowing = max(0.0, face_median_ratio - item_ratio)
+                return float(np.log(edge_value)) - relative_narrowing * 15.0
+
+            selected_semi_side = min(
+                edge_candidates,
+                key=semi_side_score,
+            )
+            if semi_side_score(selected_semi_side) > float(np.log(1.65)):
+                selected_semi_side = None
+        else:
+            symmetry_values = [float(item.get("main_symmetry_error", 0)) for item in remaining]
+            most_asymmetric = max(remaining, key=lambda item: float(item.get("main_symmetry_error", 0)))
+            if float(most_asymmetric.get("main_symmetry_error", 0)) >= min(symmetry_values) + 0.015:
+                selected_semi_side = most_asymmetric
+
+        if selected_semi_side is not None:
+            selected_semi_side.update({
+                "suggested_role": "semi_side",
+                "role_confidence": max(82, int(selected_semi_side.get("role_confidence", 0))),
+                "role_reason": "同批完整视图中包体左右边缘与中央结构的透视差异最明显，校正为半侧面",
+            })
+
+    for item in face_candidates:
+        if item.get("suggested_role") == "back":
+            continue
+        strict_gold = float(item.get("strict_center_gold_ratio", 0))
+        if item is not selected_semi_side and strict_gold >= 0.008:
+            item.update({
+                "suggested_role": "front",
+                "suggested_tags": ["logo", "hardware"],
+                "role_confidence": 78,
+                "role_reason": "同批视图校正后检测到正面中央Logo/五金，判断为正面主图",
+            })
 
 
 def _valid_session_id(session_id: str | None) -> bool:
@@ -677,6 +884,7 @@ def analyze_assets(
             "role_confidence": confidence,
             "role_reason": reason,
         })
+    _refine_product_classifications(products)
 
     role_overrides: dict[int, str] = {}
     tag_overrides = {
@@ -747,6 +955,7 @@ def analyze_assets(
     front_view = max(
         labeled_front_views or regular_views or full_views,
         key=lambda item: (
+            item["role_confidence"],
             item["foreground_fill_ratio"],
             -abs(item["object_ratio"] - 1.30),
             item["center_gold_ratio"],

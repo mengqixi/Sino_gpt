@@ -44,7 +44,8 @@ const DETAIL_TAG_OPTIONS = [
   ["zipper_opening", "拉链 / 开口"],
   ["interior", "内里"],
   ["inner_pocket_label", "内袋 / 内标"],
-  ["material_texture", "材质 / 纹理"]
+  ["material_texture", "材质 / 纹理"],
+  ["bottom_detail", "包底细节"]
 ] as const;
 const TAG_LABELS = Object.fromEntries(DETAIL_TAG_OPTIONS) as Record<string, string>;
 const SUPPORTED_IMAGE_NAME = /\.(jpe?g|png|webp)$/i;
