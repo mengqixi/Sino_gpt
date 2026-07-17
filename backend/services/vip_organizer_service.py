@@ -1232,14 +1232,35 @@ def _paste_product(canvas: Image.Image, source: Image.Image, box: tuple[int, int
     rendered = cutout.resize(rendered_size, Image.Resampling.LANCZOS)
     x = left + (box_width - rendered.width) // 2
     y = top + (box_height - rendered.height) // 2
-    canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
+    if canvas.mode == "RGBA":
+        canvas.alpha_composite(rendered, (x, y))
+    else:
+        canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
+
+
+def _normalized_product_page(
+    source: Image.Image,
+    size: tuple[int, int] = (800, 800),
+    box: tuple[int, int, int, int] | None = None,
+    transparent: bool = False,
+) -> Image.Image:
+    """Normalize non-model assets into a stable safe area regardless of source whitespace."""
+    width, height = size
+    safe_box = box or (
+        round(width * 0.15),
+        round(height * 0.2125),
+        round(width * 0.85),
+        round(height * 0.8875),
+    )
+    background = (255, 255, 255, 0) if transparent else "white"
+    canvas = Image.new("RGBA" if transparent else "RGB", size, background)
+    _paste_product(canvas, source, safe_box)
+    return canvas
 
 
 def _catalog_product_page(source: Image.Image) -> Image.Image:
     """Match the catalog reference with a stable white border and a lower visual center."""
-    canvas = Image.new("RGB", (800, 800), "white")
-    _paste_product(canvas, source, (120, 170, 680, 710))
-    return canvas
+    return _normalized_product_page(source)
 
 
 def _dimension_mm(value: str) -> str:
@@ -1329,8 +1350,7 @@ def _detail_showcase_page(source: Image.Image) -> Image.Image:
     title_font = _font(34, True)
     title_box = draw.textbbox((0, 0), title, font=title_font)
     draw.text(((750 - (title_box[2] - title_box[0])) / 2, 70), title, font=title_font, fill="#aaaaaa")
-    rendered = ImageOps.fit(source.convert("RGB"), (640, 522), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-    canvas.paste(rendered, (55, 181))
+    _paste_product(canvas, source, (55, 181, 695, 703))
     return canvas
 
 
@@ -1355,9 +1375,7 @@ def _multi_angle_page(image_ids: list[int]) -> Image.Image:
 
 
 def _save_png_30(image: Image.Image, path: Path) -> None:
-    rgba = ImageOps.contain(image.convert("RGBA"), (800, 800), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
-    canvas.alpha_composite(rgba, ((800 - rgba.width) // 2, (800 - rgba.height) // 2))
+    canvas = _normalized_product_page(image, transparent=True)
     canvas.save(path, optimize=True)
     size = path.stat().st_size
     if size < 100_000:
@@ -1409,11 +1427,15 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
         elif file_name in {"604.jpg", "605.jpg"}:
             _detail_showcase_page(_load_image(ids[0])).save(output, quality=94)
         elif file_name == "801.jpg":
-            _fit(_load_image(ids[0]), (750, 750), margin=40, contain=True).save(output, quality=94)
+            _normalized_product_page(
+                _load_image(ids[0]),
+                size=(750, 750),
+                box=(90, 105, 660, 665),
+            ).save(output, quality=94)
         elif file_name in {"2.jpg", "3.jpg"}:
             _catalog_product_page(_load_image(ids[0])).save(output, quality=98, subsampling=0)
         else:
-            _fit(_load_image(ids[0]), (800, 800)).save(output, quality=94)
+            _catalog_product_page(_load_image(ids[0])).save(output, quality=98, subsampling=0)
 
     zip_path = session_result_dir / f"唯品会套图_{export_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

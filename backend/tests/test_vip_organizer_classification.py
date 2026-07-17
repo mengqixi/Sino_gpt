@@ -11,6 +11,7 @@ from backend.services.vip_organizer_service import (
     _api_analysis_prompt,
     _font,
     _model_showcase_page,
+    _normalized_product_page,
     _paste_product,
     _refine_product_classifications,
     analyze_assets,
@@ -73,6 +74,39 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertLessEqual(large_bbox[2], 680)
         self.assertGreaterEqual(large_bbox[1], 170)
         self.assertLessEqual(large_bbox[3], 710)
+
+    def test_all_non_model_page_sizes_use_normalized_safe_areas(self):
+        source = self._small_catalog_product()
+        white_800 = Image.new("RGB", (800, 800), "white")
+        white_750 = Image.new("RGB", (750, 750), "white")
+
+        standard_bbox = ImageChops.difference(_normalized_product_page(source), white_800).getbbox()
+        tag_bbox = ImageChops.difference(
+            _normalized_product_page(source, size=(750, 750), box=(90, 105, 660, 665)),
+            white_750,
+        ).getbbox()
+        transparent = _normalized_product_page(source, transparent=True)
+
+        self.assertIsNotNone(standard_bbox)
+        self.assertIsNotNone(tag_bbox)
+        assert standard_bbox is not None and tag_bbox is not None
+        self.assertGreaterEqual(standard_bbox[0], 120)
+        self.assertLessEqual(standard_bbox[2], 680)
+        self.assertGreaterEqual(tag_bbox[0], 90)
+        self.assertLessEqual(tag_bbox[2], 660)
+        self.assertEqual(transparent.mode, "RGBA")
+        self.assertEqual(transparent.getpixel((0, 0))[3], 0)
+
+    def test_detail_page_contains_full_normalized_asset_without_edge_crop(self):
+        source = self._small_catalog_product()
+        rendered = _detail_showcase_page(source)
+        white = Image.new("RGB", rendered.size, "white")
+        bbox = ImageChops.difference(rendered.crop((0, 150, 750, 750)), white.crop((0, 150, 750, 750))).getbbox()
+
+        self.assertIsNotNone(bbox)
+        assert bbox is not None
+        self.assertGreaterEqual(bbox[0], 55)
+        self.assertLessEqual(bbox[2], 695)
 
     def test_template_product_box_allows_upscaling(self):
         canvas = Image.new("RGB", (750, 665), "white")
@@ -207,7 +241,8 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(model_page.getpixel((20, 20)), (255, 255, 255))
         self.assertEqual(model_page.getpixel((100, 100)), (181, 34, 38))
         self.assertEqual(detail_page.getpixel((20, 300)), (255, 255, 255))
-        self.assertEqual(detail_page.getpixel((100, 300)), (181, 34, 38))
+        self.assertEqual(detail_page.getpixel((100, 300)), (255, 255, 255))
+        self.assertEqual(detail_page.getpixel((375, 300)), (181, 34, 38))
 
     def test_slot_selection_keeps_semi_side_separate_from_front(self):
         samples = [
