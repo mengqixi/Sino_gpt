@@ -52,6 +52,8 @@ SLOT_DEFINITIONS = [
     ("606.jpg", "正面、半侧面或全侧、背面、开口顶视图", "750×750", "composite"),
     ("801.jpg", "吊牌信息", "750×750", "tag"),
 ]
+INFO_PRODUCT_BOX = (346, 258, 633, 458)
+INFO_LENGTH_LINE_Y = 486
 
 PRODUCT_ROLES = {
     "auto",
@@ -1305,7 +1307,7 @@ def _info_page(info: dict[str, str], product_image: Image.Image | None = None) -
         y += 96
 
     if product_image is not None:
-        _paste_product(image, product_image, (346, 288, 633, 488))
+        _paste_product(image, product_image, INFO_PRODUCT_BOX)
 
     line_color = "#8a8a8a"
     draw.line((390, 486, 590, 486), fill=line_color, width=2)

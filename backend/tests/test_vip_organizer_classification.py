@@ -5,6 +5,8 @@ from PIL import Image, ImageChops
 
 from backend.services.vip_organizer_service import (
     BUNDLED_FONT_PATH,
+    INFO_LENGTH_LINE_Y,
+    INFO_PRODUCT_BOX,
     _catalog_product_page,
     _classify_product_metrics,
     _detail_showcase_page,
@@ -117,6 +119,16 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         assert foreground is not None
         self.assertGreaterEqual(foreground[2] - foreground[0], 270)
         self.assertAlmostEqual((foreground[0] + foreground[2]) / 2, 521.5, delta=2)
+
+    def test_info_page_keeps_product_clear_of_lower_dimension_line(self):
+        page = Image.new("RGB", (750, 665), "white")
+        _paste_product(page, self._small_catalog_product(), INFO_PRODUCT_BOX)
+        foreground = ImageChops.difference(page, Image.new("RGB", page.size, "white")).getbbox()
+
+        self.assertIsNotNone(foreground)
+        assert foreground is not None
+        self.assertLessEqual(foreground[3], INFO_PRODUCT_BOX[3])
+        self.assertGreaterEqual(INFO_LENGTH_LINE_Y - foreground[3], 28)
 
     def test_high_confidence_primary_roles(self):
         cases = [
