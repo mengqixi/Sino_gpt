@@ -971,10 +971,24 @@ def _product_cutout(source: Image.Image) -> Image.Image:
 def _paste_product(canvas: Image.Image, source: Image.Image, box: tuple[int, int, int, int]) -> None:
     left, top, right, bottom = box
     cutout = _product_cutout(source)
-    cutout.thumbnail((right - left, bottom - top), Image.Resampling.LANCZOS)
-    x = left + (right - left - cutout.width) // 2
-    y = top + (bottom - top - cutout.height) // 2
-    canvas.paste(cutout.convert("RGB"), (x, y), cutout.getchannel("A"))
+    box_width = max(1, right - left)
+    box_height = max(1, bottom - top)
+    scale = min(box_width / cutout.width, box_height / cutout.height)
+    rendered_size = (
+        max(1, int(round(cutout.width * scale))),
+        max(1, int(round(cutout.height * scale))),
+    )
+    rendered = cutout.resize(rendered_size, Image.Resampling.LANCZOS)
+    x = left + (box_width - rendered.width) // 2
+    y = top + (box_height - rendered.height) // 2
+    canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
+
+
+def _catalog_product_page(source: Image.Image) -> Image.Image:
+    """Normalize catalog whitespace while retaining a consistent outer white border."""
+    canvas = Image.new("RGB", (800, 800), "white")
+    _paste_product(canvas, source, (64, 72, 736, 728))
+    return canvas
 
 
 def _dimension_mm(value: str) -> str:
@@ -1145,6 +1159,8 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
             _detail_showcase_page(_load_image(ids[0])).save(output, quality=94)
         elif file_name == "801.jpg":
             _fit(_load_image(ids[0]), (750, 750), margin=40, contain=True).save(output, quality=94)
+        elif file_name in {"2.jpg", "3.jpg"}:
+            _catalog_product_page(_load_image(ids[0])).save(output, quality=98, subsampling=0)
         else:
             _fit(_load_image(ids[0]), (800, 800)).save(output, quality=94)
 

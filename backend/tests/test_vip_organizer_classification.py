@@ -1,14 +1,16 @@
 import unittest
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from backend.services.vip_organizer_service import (
     BUNDLED_FONT_PATH,
+    _catalog_product_page,
     _classify_product_metrics,
     _detail_showcase_page,
     _font,
     _model_showcase_page,
+    _paste_product,
     analyze_assets,
 )
 
@@ -29,6 +31,34 @@ def metrics(**overrides):
 
 
 class VipOrganizerClassificationTests(unittest.TestCase):
+    @staticmethod
+    def _small_catalog_product() -> Image.Image:
+        image = Image.new("RGB", (800, 800), "white")
+        for x in range(300, 500):
+            for y in range(340, 460):
+                image.putpixel((x, y), (190, 115, 140))
+        return image
+
+    def test_catalog_product_is_cropped_upscaled_and_centered(self):
+        rendered = _catalog_product_page(self._small_catalog_product())
+        foreground = ImageChops.difference(rendered, Image.new("RGB", rendered.size, "white")).getbbox()
+
+        self.assertIsNotNone(foreground)
+        assert foreground is not None
+        self.assertGreaterEqual(foreground[2] - foreground[0], 640)
+        self.assertAlmostEqual((foreground[0] + foreground[2]) / 2, 400, delta=2)
+        self.assertAlmostEqual((foreground[1] + foreground[3]) / 2, 400, delta=2)
+
+    def test_template_product_box_allows_upscaling(self):
+        canvas = Image.new("RGB", (750, 665), "white")
+        _paste_product(canvas, self._small_catalog_product(), (378, 270, 665, 470))
+        foreground = ImageChops.difference(canvas, Image.new("RGB", canvas.size, "white")).getbbox()
+
+        self.assertIsNotNone(foreground)
+        assert foreground is not None
+        self.assertGreaterEqual(foreground[2] - foreground[0], 270)
+        self.assertAlmostEqual((foreground[0] + foreground[2]) / 2, 521.5, delta=2)
+
     def test_high_confidence_primary_roles(self):
         cases = [
             (metrics(alpha_ratio=0.4), "transparent"),
