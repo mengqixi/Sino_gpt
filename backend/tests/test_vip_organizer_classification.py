@@ -16,6 +16,8 @@ from backend.services.vip_organizer_service import (
     _normalized_product_page,
     _paste_product,
     _refine_product_classifications,
+    _render_slot_image,
+    _slot_map,
     analyze_assets,
 )
 
@@ -255,6 +257,34 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(detail_page.getpixel((20, 300)), (255, 255, 255))
         self.assertEqual(detail_page.getpixel((100, 300)), (255, 255, 255))
         self.assertEqual(detail_page.getpixel((375, 300)), (181, 34, 38))
+
+    def test_slot_renderer_keeps_model_layouts_separate_from_product_normalization(self):
+        source = Image.new("RGB", (320, 480), "#b52226")
+        with patch("backend.services.vip_organizer_service._load_image", return_value=source):
+            square_model = _render_slot_image("1.jpg", [11], {})
+            portrait_model = _render_slot_image("50.jpg", [11], {})
+            product = _render_slot_image("2.jpg", [12], {})
+
+        self.assertIsNotNone(square_model)
+        self.assertIsNotNone(portrait_model)
+        self.assertIsNotNone(product)
+        assert square_model is not None and portrait_model is not None and product is not None
+        self.assertEqual(square_model.size, (800, 800))
+        self.assertEqual(portrait_model.size, (950, 1200))
+        self.assertEqual(product.size, (800, 800))
+        self.assertEqual(square_model.getpixel((20, 20)), (181, 34, 38))
+        self.assertEqual(product.getpixel((20, 20)), (255, 255, 255))
+
+    def test_slot_map_links_the_two_model_output_sizes(self):
+        mapped = _slot_map([
+            {"file_name": "1.jpg", "image_ids": [7]},
+            {"file_name": "50.jpg", "image_ids": [9]},
+            {"file_name": "2.jpg", "image_ids": [3]},
+        ])
+
+        self.assertEqual(mapped["1.jpg"], [7])
+        self.assertEqual(mapped["50.jpg"], [7])
+        self.assertEqual(mapped["2.jpg"], [3])
 
     def test_slot_selection_keeps_semi_side_separate_from_front(self):
         samples = [

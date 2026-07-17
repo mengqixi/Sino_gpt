@@ -1386,10 +1386,14 @@ def _save_png_30(image: Image.Image, path: Path) -> None:
         canvas.quantize(colors=256).save(path, optimize=True)
 
 
-def export_package(session_id: str, slots: list[dict[str, Any]], product_info: dict[str, str]) -> dict[str, Any]:
+def _slot_map(slots: list[dict[str, Any]]) -> dict[str, list[int]]:
     slot_map = {item["file_name"]: [int(value) for value in item.get("image_ids", [])] for item in slots}
     # 1.jpg and 50.jpg are two layouts of the same model photo.
     slot_map["50.jpg"] = list(slot_map.get("1.jpg", []))
+    return slot_map
+
+
+def _validate_slot_map(session_id: str, slot_map: dict[str, list[int]]) -> None:
     model_slots = {"1.jpg", "50.jpg", "601.jpg", "602.jpg", "603.jpg"}
     _validate_session_assets(session_id, {
         "model": [image_id for name in model_slots for image_id in slot_map.get(name, [])],
@@ -1401,43 +1405,91 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
             for image_id in image_ids
         ],
     })
+
+
+def _render_slot_image(file_name: str, image_ids: list[int], product_info: dict[str, str]) -> Image.Image | None:
+    if file_name == "401.jpg":
+        source = _load_image(image_ids[0]) if image_ids else None
+        return _info_page(product_info, source)
+    if file_name == "606.jpg":
+        return _multi_angle_page(image_ids) if len(image_ids) >= 4 else None
+    if not image_ids:
+        return None
+
+    source = _load_image(image_ids[0])
+    if file_name == "1.jpg":
+        return _fit(source, (800, 800))
+    if file_name == "30.png":
+        return _normalized_product_page(source, transparent=True)
+    if file_name == "50.jpg":
+        return _fit(source, (950, 1200))
+    if file_name in {"601.jpg", "602.jpg", "603.jpg"}:
+        return _model_showcase_page(source)
+    if file_name in {"604.jpg", "605.jpg"}:
+        return _detail_showcase_page(source)
+    if file_name == "801.jpg":
+        return _normalized_product_page(source, size=(750, 750), box=(90, 105, 660, 665))
+    return _catalog_product_page(source)
+
+
+def _save_slot_image(image: Image.Image, file_name: str, output: Path) -> None:
+    if file_name.endswith(".png"):
+        image.save(output, optimize=True)
+        size = output.stat().st_size
+        if size < 100_000:
+            image.save(output, compress_level=0)
+        elif size > 600_000:
+            image.quantize(colors=256).save(output, optimize=True)
+        return
+    quality = 94 if file_name in {"1.jpg", "50.jpg", "601.jpg", "602.jpg", "603.jpg", "604.jpg", "605.jpg", "801.jpg"} else 98
+    image.convert("RGB").save(output, quality=quality, subsampling=0)
+
+
+def render_previews(session_id: str, slots: list[dict[str, Any]], product_info: dict[str, str]) -> dict[str, Any]:
+    slot_map = _slot_map(slots)
+    _validate_slot_map(session_id, slot_map)
+    preview_id = uuid.uuid4().hex[:12]
+    preview_root = _session_result_dir(session_id) / "previews"
+    folder = preview_root / preview_id
+    folder.mkdir(parents=True, exist_ok=True)
+    previews: dict[str, str] = {}
+    missing: list[str] = []
+
+    for file_name, _, _, _ in SLOT_DEFINITIONS:
+        image = _render_slot_image(file_name, slot_map.get(file_name, []), product_info)
+        if image is None:
+            missing.append(file_name)
+            continue
+        output = folder / file_name
+        _save_slot_image(image, file_name, output)
+        previews[file_name] = f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}"
+
+    preview_sets = sorted(
+        (path for path in preview_root.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in preview_sets[3:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    return {"previews": previews, "missing": missing}
+
+
+def export_package(session_id: str, slots: list[dict[str, Any]], product_info: dict[str, str]) -> dict[str, Any]:
+    slot_map = _slot_map(slots)
+    _validate_slot_map(session_id, slot_map)
     export_id = uuid.uuid4().hex[:12]
     session_result_dir = _session_result_dir(session_id)
     folder = session_result_dir / export_id
     folder.mkdir(parents=True, exist_ok=True)
     missing: list[str] = []
 
-    for file_name, _, _, kind in SLOT_DEFINITIONS:
-        ids = slot_map.get(file_name, [])
+    for file_name, _, _, _ in SLOT_DEFINITIONS:
         output = folder / file_name
-        if file_name == "401.jpg":
-            source = _load_image(ids[0]) if ids else None
-            _info_page(product_info, source).save(output, quality=98, subsampling=0)
-        elif file_name == "606.jpg":
-            if len(ids) < 4:
-                missing.append(file_name)
-                continue
-            _multi_angle_page(ids).save(output, quality=98, subsampling=0)
-        elif not ids:
+        image = _render_slot_image(file_name, slot_map.get(file_name, []), product_info)
+        if image is None:
             missing.append(file_name)
-        elif file_name == "30.png":
-            _save_png_30(_load_image(ids[0]), output)
-        elif file_name == "50.jpg":
-            _fit(_load_image(ids[0]), (950, 1200)).save(output, quality=94)
-        elif file_name in {"601.jpg", "602.jpg", "603.jpg"}:
-            _model_showcase_page(_load_image(ids[0])).save(output, quality=94)
-        elif file_name in {"604.jpg", "605.jpg"}:
-            _detail_showcase_page(_load_image(ids[0])).save(output, quality=94)
-        elif file_name == "801.jpg":
-            _normalized_product_page(
-                _load_image(ids[0]),
-                size=(750, 750),
-                box=(90, 105, 660, 665),
-            ).save(output, quality=94)
-        elif file_name in {"2.jpg", "3.jpg"}:
-            _catalog_product_page(_load_image(ids[0])).save(output, quality=98, subsampling=0)
-        else:
-            _catalog_product_page(_load_image(ids[0])).save(output, quality=98, subsampling=0)
+            continue
+        _save_slot_image(image, file_name, output)
 
     zip_path = session_result_dir / f"唯品会套图_{export_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -1462,6 +1514,15 @@ def export_file(session_id: str, export_id: str, file_name: str) -> Path:
     path = _session_result_dir(session_id) / export_id / file_name
     if not path.is_file():
         raise ValueError("导出文件不存在")
+    return path
+
+
+def preview_file(session_id: str, preview_id: str, file_name: str) -> Path:
+    if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", preview_id) or not re.fullmatch(r"[0-9]+\.(?:jpg|png)", file_name):
+        raise ValueError("预览文件不存在")
+    path = _session_result_dir(session_id) / "previews" / preview_id / file_name
+    if not path.is_file():
+        raise ValueError("预览文件不存在")
     return path
 
 

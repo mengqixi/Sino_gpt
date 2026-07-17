@@ -15,6 +15,8 @@ from ..services.vip_organizer_service import (
     export_package,
     export_file,
     export_zip,
+    preview_file,
+    render_previews,
     save_analysis_config,
     save_assets,
     start_session,
@@ -116,6 +118,15 @@ def download_export(session_id: str, export_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/previews/{session_id}/{preview_id}/{file_name}")
+def get_preview_file(session_id: str, preview_id: str, file_name: str):
+    try:
+        path = preview_file(session_id, preview_id, file_name)
+        return FileResponse(path, headers={"Cache-Control": "private, no-store"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/analyze")
 def analyze(payload: AnalyzePayload):
     try:
@@ -156,5 +167,13 @@ def analyze_with_api(payload: ApiAnalyzePayload):
 def export(payload: ExportPayload):
     try:
         return export_package(payload.session_id, payload.slots, payload.product_info)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/preview")
+def preview(payload: ExportPayload):
+    try:
+        return render_previews(payload.session_id, payload.slots, payload.product_info)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

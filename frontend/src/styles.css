@@ -57,8 +57,8 @@
 
 /* VIP.com deterministic asset organizer */
 .organizer-page { max-width: 1700px; }
-.organizer-source-panel, .organizer-analysis-panel, .organizer-info-panel, .organizer-slots-panel, .organizer-export-result { margin-bottom: 16px; padding: 20px; }
-.organizer-source-panel h2, .organizer-analysis-panel h2, .organizer-info-panel h2, .organizer-slots-panel h2, .organizer-export-result h2 { margin: 0 0 10px; font-size: 20px; }
+.organizer-source-panel, .organizer-analysis-panel, .organizer-info-panel, .organizer-slots-panel { margin-bottom: 16px; padding: 20px; }
+.organizer-source-panel h2, .organizer-analysis-panel h2, .organizer-info-panel h2, .organizer-slots-panel h2 { margin: 0 0 10px; font-size: 20px; }
 .organizer-analysis-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 22px; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #e2e7e4; }
 .organizer-analysis-header h2 { margin-bottom: 6px; }
 .organizer-analysis-header p { max-width: 760px; margin: 0; color: #657169; line-height: 1.55; }
@@ -75,6 +75,7 @@
 .organizer-upload-button input { display: none; }
 .organizer-thumb-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
 .organizer-thumb-row div { min-width: 0; }
+.organizer-thumb-row button { display: block; width: 100%; padding: 0; overflow: hidden; border: 0; background: transparent; cursor: zoom-in; }
 .organizer-thumb-row img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; background: #eef1ef; border-radius: 4px; }
 .organizer-thumb-row small { display: block; overflow: hidden; margin-top: 3px; color: #68736d; text-overflow: ellipsis; white-space: nowrap; }
 .organizer-analysis-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
@@ -108,32 +109,21 @@
 .organizer-info-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
 .organizer-info-grid label { display: grid; gap: 6px; }
 .organizer-info-grid .wide { grid-column: span 5; }
+.organizer-platform-switcher { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin: -2px -2px 22px; padding: 14px 16px; border: 1px solid #d9e4df; border-radius: 6px; background: #f5f8f6; }
+.organizer-platform-switcher > div:first-child { display: grid; gap: 3px; }
+.organizer-platform-switcher strong { color: #173f35; font-size: 15px; }
+.organizer-platform-switcher > div:first-child span { color: #66736e; font-size: 13px; }
+.organizer-platform-tabs { display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid #d2ddd8; border-radius: 5px; background: #fff; }
+.organizer-platform-tabs button { min-width: 104px; height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 4px; background: transparent; color: #52615c; }
+.organizer-platform-tabs button.active { background: #1f5a4b; color: #fff; font-weight: 700; }
+.organizer-platform-tabs button:disabled { cursor: not-allowed; color: #83908b; opacity: 1; }
+.organizer-platform-tabs button small { padding: 2px 5px; border: 1px solid #d6dfdb; border-radius: 3px; color: #78847f; font-size: 11px; line-height: 1; }
 .organizer-slot-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .organizer-slot { display: grid; grid-template-columns: 190px minmax(0, 1fr); min-width: 0; border: 1px solid #dde3df; border-radius: 6px; overflow: hidden; background: #fafbfa; }
-.organizer-slot-preview { min-height: 170px; padding: 7px; background: #eef1ef; }
-.organizer-slot-preview > button { width: 100%; height: 100%; min-height: 156px; padding: 0; border: 0; border-radius: 0; background: #fff; }
-.organizer-slot-preview > button img { display: block; width: 100%; height: 100%; min-height: 156px; object-fit: contain; }
+.organizer-slot-preview { position: relative; display: grid; min-height: 190px; padding: 7px; background: #eef1ef; }
+.organizer-slot-preview > button { width: 100%; height: 100%; min-height: 176px; padding: 0; overflow: hidden; border: 0; border-radius: 0; background: #fff; cursor: zoom-in; }
+.organizer-slot-preview > button img { display: block; width: 100%; height: 100%; min-height: 176px; object-fit: contain; }
 .generated-placeholder { display: grid; height: 100%; min-height: 150px; place-content: center; justify-items: center; gap: 6px; color: #738079; }
-.organizer-collage-preview { position: relative; width: 100%; aspect-ratio: 1; overflow: hidden; background: #fff; }
-.organizer-collage-preview > strong { position: absolute; inset: 7% 0 auto; z-index: 2; font-size: 12px; text-align: center; }
-.organizer-collage-preview > div { position: absolute; inset: 24% 7% 8%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24% 16%; }
-.organizer-collage-preview button { width: 100%; min-width: 0; min-height: 0; padding: 0; overflow: hidden; border: 0; background: #fff; }
-.organizer-collage-preview img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
-.organizer-collage-preview > span { position: absolute; inset: 55% auto auto 50%; z-index: 3; color: #aaa; font-size: 20px; line-height: 1; transform: translate(-50%, -50%); }
-.organizer-info-preview { position: relative; width: 100%; aspect-ratio: 750 / 665; overflow: hidden; background: #fff; }
-.organizer-info-preview > strong { position: absolute; inset: 6% 0 auto; font-size: 12px; text-align: center; }
-.organizer-info-preview dl { position: absolute; inset: 31% auto auto 5%; display: grid; gap: 8px; width: 30%; margin: 0; }
-.organizer-info-preview dl div { display: grid; font-size: 7px; }
-.organizer-info-preview dt { font-weight: 700; }
-.organizer-info-preview dd { margin: 1px 0 0; color: #666; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.organizer-info-product { position: absolute; inset: 36% 5% auto 43%; height: 37%; }
-.organizer-info-product button { width: 100%; height: 100%; min-height: 0; padding: 0; border: 0; background: #fff; }
-.organizer-info-product img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
-.organizer-info-product .measure { position: absolute; color: #666; font-size: 6px; white-space: nowrap; }
-.organizer-info-product .measure-height { left: -17%; top: 40%; transform: rotate(-90deg); }
-.organizer-info-product .measure-length { left: 42%; bottom: -13%; transform: translateX(-50%); }
-.organizer-info-product .measure-width { right: -5%; bottom: -7%; transform: rotate(-24deg); }
-.organizer-info-notes { position: absolute; left: 43%; bottom: 5%; display: grid; gap: 2px; color: #333; font-size: 5.5px; }
 .organizer-slot-body { min-width: 0; padding: 12px; }
 .organizer-slot-title { display: flex; align-items: baseline; gap: 7px; margin-bottom: 9px; }
 .organizer-slot-title strong { color: #1f4f43; }
@@ -141,6 +131,10 @@
 .organizer-slot-title small { margin-left: auto; color: #748078; white-space: nowrap; }
 .organizer-slot-body label { display: grid; gap: 4px; margin-top: 6px; color: #66716b; font-size: 12px; }
 .organizer-slot-body select { padding: 7px 8px; }
+.organizer-source-picker { display: grid; grid-template-columns: minmax(0, 1fr) 38px; gap: 6px; min-width: 0; }
+.organizer-source-picker select { width: 100%; min-width: 0; }
+.organizer-source-picker button { display: inline-flex; width: 38px; min-width: 38px; align-items: center; justify-content: center; padding: 0; }
+.organizer-preview-status { display: inline-flex; align-items: center; gap: 7px; color: #31594d; font-size: 13px; white-space: nowrap; }
 .confidence { margin-top: 9px; padding: 8px; border-radius: 4px; font-size: 12px; }
 .confidence span { font-weight: 700; }
 .confidence p { margin: 3px 0 0; line-height: 1.45; }
@@ -149,15 +143,9 @@
 .confidence-low { color: #9a3d31; background: #fbe5e1; }
 .organizer-export-bar { position: sticky; bottom: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px -20px -20px; padding: 14px 20px; border-top: 1px solid #dfe4e1; background: rgba(255,255,255,.97); }
 .organizer-export-bar span { display: inline-flex; align-items: center; gap: 7px; }
-.organizer-export-result { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 14px; }
-.organizer-export-result p { margin: 0; color: #68736d; }
-.organizer-export-previews { display: grid; grid-column: 1 / -1; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 8px; }
-.organizer-export-previews button { position: relative; padding: 0; aspect-ratio: 1; overflow: hidden; }
-.organizer-export-previews img { width: 100%; height: 100%; object-fit: contain; }
-.organizer-export-previews svg { position: absolute; right: 6px; bottom: 6px; padding: 3px; width: 24px; height: 24px; border-radius: 4px; background: white; }
 @media (max-width: 1350px) { .organizer-analysis-header { grid-template-columns: 1fr; align-items: stretch; } .organizer-analysis-toolbar { grid-template-columns: minmax(260px, 1fr) auto auto; } }
 @media (max-width: 1200px) { .organizer-analysis-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .organizer-slot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .organizer-info-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .organizer-info-grid .wide { grid-column: span 3; } }
-@media (max-width: 800px) { .organizer-upload-columns, .organizer-analysis-grid, .organizer-slot-grid { grid-template-columns: 1fr; } .organizer-info-grid { grid-template-columns: 1fr; } .organizer-info-grid .wide { grid-column: auto; } .organizer-export-previews { grid-template-columns: repeat(4, minmax(0, 1fr)); } .organizer-analysis-toolbar { grid-template-columns: 1fr; } .organizer-api-select { width: 100%; min-width: 0; } .organizer-api-select select { width: 100%; min-width: 0; } }
+@media (max-width: 800px) { .organizer-upload-columns, .organizer-analysis-grid, .organizer-slot-grid { grid-template-columns: 1fr; } .organizer-info-grid { grid-template-columns: 1fr; } .organizer-info-grid .wide { grid-column: auto; } .organizer-analysis-toolbar { grid-template-columns: 1fr; } .organizer-api-select { width: 100%; min-width: 0; } .organizer-api-select select { width: 100%; min-width: 0; } .organizer-platform-switcher, .organizer-export-bar { align-items: stretch; flex-direction: column; } .organizer-platform-tabs { width: 100%; } .organizer-platform-tabs button { flex: 1; min-width: 0; } }
 
 * {
   box-sizing: border-box;
