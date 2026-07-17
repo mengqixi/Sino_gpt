@@ -111,6 +111,7 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
 }
 
 export default function VipOrganizer() {
+  const sessionStorageKey = "vip-organizer-session-id";
   const [sessionId, setSessionId] = useState("");
   const sessionIdRef = useRef("");
   const sessionPromiseRef = useRef<Promise<{ session_id: string }> | null>(null);
@@ -155,7 +156,8 @@ export default function VipOrganizer() {
 
   useEffect(() => {
     let active = true;
-    const initialSession = api.startVipOrganizerSession();
+    const previousSessionId = window.sessionStorage.getItem(sessionStorageKey) || undefined;
+    const initialSession = api.startVipOrganizerSession(previousSessionId);
     sessionPromiseRef.current = initialSession;
     initialSession.then(
       (session) => {
@@ -172,8 +174,31 @@ export default function VipOrganizer() {
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    const cleanupCurrentSession = () => {
+      const currentSessionId = sessionIdRef.current;
+      if (!currentSessionId) return;
+      const body = JSON.stringify({ session_id: currentSessionId });
+      const sent = navigator.sendBeacon(
+        "/api/vip-organizer/session/cleanup",
+        new Blob([body], { type: "application/json" })
+      );
+      if (!sent) {
+        fetch("/api/vip-organizer/session/cleanup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          keepalive: true
+        }).catch(() => undefined);
+      }
+    };
+    window.addEventListener("pagehide", cleanupCurrentSession);
+    return () => window.removeEventListener("pagehide", cleanupCurrentSession);
+  }, []);
+
   function applyNewSession(nextSessionId: string) {
     sessionIdRef.current = nextSessionId;
+    window.sessionStorage.setItem(sessionStorageKey, nextSessionId);
     setSessionId(nextSessionId);
     setProducts([]);
     setModels([]);
@@ -203,7 +228,7 @@ export default function VipOrganizer() {
     setBusy(true);
     setMessage("");
     try {
-      const session = await api.startVipOrganizerSession();
+      const session = await api.startVipOrganizerSession(sessionIdRef.current || undefined);
       applyNewSession(session.session_id);
       setMessage("已开始新一轮，上一轮自动化整理素材和ZIP已删除。AI生成记录不受影响。");
     } catch (error: any) {

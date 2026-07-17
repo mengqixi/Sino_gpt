@@ -10,6 +10,7 @@ import shutil
 import textwrap
 import uuid
 import zipfile
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ import requests
 from fastapi import UploadFile
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from ..config import ALLOWED_IMAGE_EXTENSIONS, DATA_DIR, RESULT_DIR, UPLOAD_DIR
+from ..config import ALLOWED_IMAGE_EXTENSIONS, DATA_DIR
 from ..database import db_session, now_iso
 from .api_config_service import TEXT_API_TYPE, get_config, get_default_config, mask_api_key, require_config_type
 from .json_path_service import json_path_get
@@ -30,6 +31,7 @@ ORGANIZER_DATA_DIR = DATA_DIR / "vip_organizer"
 ORGANIZER_UPLOAD_DIR = ORGANIZER_DATA_DIR / "uploads"
 ORGANIZER_RESULT_DIR = ORGANIZER_DATA_DIR / "results"
 UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
+ORGANIZER_SESSION_TTL_HOURS = 24
 BUNDLED_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "NotoSansSC-VF-GB2312.ttf"
 
 
@@ -310,6 +312,10 @@ def _validate_session_assets(session_id: str, assets_by_type: dict[str, list[int
         session = conn.execute("SELECT id FROM vip_organizer_sessions WHERE id = ?", (session_id,)).fetchone()
         if not session:
             raise ValueError("整理会话已失效，请重新开始")
+        conn.execute(
+            "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
+            (now_iso(), session_id),
+        )
         for asset_type, image_ids in normalized.items():
             placeholders = ",".join("?" for _ in image_ids)
             rows = conn.execute(
@@ -443,27 +449,74 @@ def _classify_product_metrics(item: dict[str, Any]) -> tuple[str, list[str], int
     return "back", [], 58, "检测到完整包体但缺少明确正面标志，暂判为背面，建议人工确认"
 
 
-def start_session() -> dict[str, str]:
-    """Keep organizer storage bounded to one current session."""
-    for directory in (ORGANIZER_UPLOAD_DIR, ORGANIZER_RESULT_DIR):
-        if directory.exists():
-            shutil.rmtree(directory)
-        directory.mkdir(parents=True, exist_ok=True)
+def _valid_session_id(session_id: str | None) -> bool:
+    return bool(session_id and re.fullmatch(r"[0-9a-f]{32}", session_id))
 
-    # Remove files created by versions that shared the AI upload/result folders.
-    legacy_upload_dir = UPLOAD_DIR / "vip_organizer"
-    if legacy_upload_dir.exists():
-        shutil.rmtree(legacy_upload_dir)
-    for path in RESULT_DIR.glob("vip_*"):
-        if path.is_dir():
-            shutil.rmtree(path)
-    for path in RESULT_DIR.glob("唯品会套图_*.zip"):
-        path.unlink(missing_ok=True)
+
+def _session_upload_dir(session_id: str) -> Path:
+    if not _valid_session_id(session_id):
+        raise ValueError("Invalid organizer session")
+    return ORGANIZER_UPLOAD_DIR / session_id
+
+
+def _session_result_dir(session_id: str) -> Path:
+    if not _valid_session_id(session_id):
+        raise ValueError("Invalid organizer session")
+    return ORGANIZER_RESULT_DIR / session_id
+
+
+def delete_session(session_id: str) -> None:
+    """Delete one organizer session without touching other users."""
+    if not _valid_session_id(session_id):
+        return
     with db_session() as conn:
-        conn.execute("DELETE FROM vip_organizer_assets")
-        conn.execute("DELETE FROM vip_organizer_sessions")
-        session_id = uuid.uuid4().hex
-        conn.execute("INSERT INTO vip_organizer_sessions (id, created_at) VALUES (?, ?)", (session_id, now_iso()))
+        rows = conn.execute(
+            "SELECT id, file_path FROM vip_organizer_assets WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        conn.execute("DELETE FROM vip_organizer_sessions WHERE id = ?", (session_id,))
+
+    organizer_root = ORGANIZER_DATA_DIR.resolve()
+    for row in rows:
+        path = Path(row["file_path"])
+        try:
+            if os.path.commonpath((str(path.resolve()), str(organizer_root))) == str(organizer_root):
+                path.unlink(missing_ok=True)
+                (path.parent / f"thumb_{row['id']}.jpg").unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+    shutil.rmtree(_session_upload_dir(session_id), ignore_errors=True)
+    shutil.rmtree(_session_result_dir(session_id), ignore_errors=True)
+
+
+def _cleanup_expired_sessions() -> None:
+    cutoff = (datetime.now() - timedelta(hours=ORGANIZER_SESSION_TTL_HOURS)).isoformat(timespec="seconds")
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT id FROM vip_organizer_sessions WHERE COALESCE(updated_at, created_at) < ?",
+            (cutoff,),
+        ).fetchall()
+    for row in rows:
+        delete_session(row["id"])
+
+
+def start_session(previous_session_id: str | None = None) -> dict[str, str]:
+    """Replace only the caller's previous organizer session."""
+    ORGANIZER_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    ORGANIZER_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_expired_sessions()
+    if _valid_session_id(previous_session_id):
+        delete_session(previous_session_id)
+
+    session_id = uuid.uuid4().hex
+    ts = now_iso()
+    with db_session() as conn:
+        conn.execute(
+            "INSERT INTO vip_organizer_sessions (id, created_at, updated_at) VALUES (?, ?, ?)",
+            (session_id, ts, ts),
+        )
+    _session_upload_dir(session_id).mkdir(parents=True, exist_ok=True)
+    _session_result_dir(session_id).mkdir(parents=True, exist_ok=True)
     return {"session_id": session_id}
 
 
@@ -476,14 +529,15 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
         exists = conn.execute("SELECT id FROM vip_organizer_sessions WHERE id = ?", (session_id,)).fetchone()
     if not exists:
         raise ValueError("整理会话已失效，请重新开始")
-    ORGANIZER_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    session_upload_dir = _session_upload_dir(session_id)
+    session_upload_dir.mkdir(parents=True, exist_ok=True)
     prepared: list[dict[str, Any]] = []
     for file in files:
         original_name = file.filename or "image.png"
         suffix = Path(original_name).suffix.lower()
         if suffix not in ALLOWED_IMAGE_EXTENSIONS:
             continue
-        path = ORGANIZER_UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+        path = session_upload_dir / f"{uuid.uuid4().hex}{suffix}"
         try:
             with path.open("wb") as output:
                 shutil.copyfileobj(file.file, output, length=UPLOAD_COPY_BUFFER_SIZE)
@@ -533,6 +587,10 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
                     "width": item["width"],
                     "height": item["height"],
                 })
+            conn.execute(
+                "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
+                (now_iso(), session_id),
+            )
     except Exception:
         for item in prepared:
             item["path"].unlink(missing_ok=True)
@@ -545,11 +603,11 @@ def asset_thumbnail(image_id: int) -> Path:
     if not rows:
         raise ValueError("图片记录不存在")
     source_path = Path(rows[0]["file_path"])
-    thumbnail_path = ORGANIZER_UPLOAD_DIR / f"thumb_{image_id}.jpg"
+    thumbnail_path = source_path.parent / f"thumb_{image_id}.jpg"
     if thumbnail_path.exists() and thumbnail_path.stat().st_mtime >= source_path.stat().st_mtime:
         return thumbnail_path
 
-    temp_path = ORGANIZER_UPLOAD_DIR / f".{thumbnail_path.name}.{uuid.uuid4().hex}.tmp"
+    temp_path = source_path.parent / f".{thumbnail_path.name}.{uuid.uuid4().hex}.tmp"
     try:
         with Image.open(source_path) as source:
             source.draft("RGB", (420, 420))
@@ -569,7 +627,13 @@ def asset_original(image_id: int) -> Path:
     if not rows:
         raise ValueError("图片记录不存在")
     path = Path(rows[0]["file_path"])
-    if not path.exists() or path.parent.resolve() != ORGANIZER_UPLOAD_DIR.resolve():
+    try:
+        inside_uploads = os.path.commonpath(
+            (str(path.resolve()), str(ORGANIZER_UPLOAD_DIR.resolve()))
+        ) == str(ORGANIZER_UPLOAD_DIR.resolve())
+    except ValueError:
+        inside_uploads = False
+    if not path.exists() or not inside_uploads:
         raise ValueError("图片文件不存在")
     return path
 
@@ -1053,7 +1117,8 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
         ],
     })
     export_id = uuid.uuid4().hex[:12]
-    folder = ORGANIZER_RESULT_DIR / export_id
+    session_result_dir = _session_result_dir(session_id)
+    folder = session_result_dir / export_id
     folder.mkdir(parents=True, exist_ok=True)
     missing: list[str] = []
 
@@ -1083,36 +1148,36 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
         else:
             _fit(_load_image(ids[0]), (800, 800)).save(output, quality=94)
 
-    zip_path = ORGANIZER_RESULT_DIR / f"唯品会套图_{export_id}.zip"
+    zip_path = session_result_dir / f"唯品会套图_{export_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(folder.iterdir()):
             archive.write(path, arcname=path.name)
     previews = [
-        f"/api/vip-organizer/exports/{export_id}/files/{path.name}"
+        f"/api/vip-organizer/exports/{session_id}/{export_id}/files/{path.name}"
         for path in sorted(folder.iterdir())
         if path.suffix.lower() in {".jpg", ".png"}
     ]
     return {
-        "download_url": f"/api/vip-organizer/exports/{export_id}/download",
+        "download_url": f"/api/vip-organizer/exports/{session_id}/{export_id}/download",
         "previews": previews,
         "generated_count": len(previews),
         "missing": missing,
     }
 
 
-def export_file(export_id: str, file_name: str) -> Path:
-    if not re.fullmatch(r"[0-9a-f]{12}", export_id) or not re.fullmatch(r"[0-9]+\.(?:jpg|png)", file_name):
+def export_file(session_id: str, export_id: str, file_name: str) -> Path:
+    if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", export_id) or not re.fullmatch(r"[0-9]+\.(?:jpg|png)", file_name):
         raise ValueError("导出文件不存在")
-    path = ORGANIZER_RESULT_DIR / export_id / file_name
+    path = _session_result_dir(session_id) / export_id / file_name
     if not path.is_file():
         raise ValueError("导出文件不存在")
     return path
 
 
-def export_zip(export_id: str) -> Path:
-    if not re.fullmatch(r"[0-9a-f]{12}", export_id):
+def export_zip(session_id: str, export_id: str) -> Path:
+    if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", export_id):
         raise ValueError("导出文件不存在")
-    path = ORGANIZER_RESULT_DIR / f"唯品会套图_{export_id}.zip"
+    path = _session_result_dir(session_id) / f"唯品会套图_{export_id}.zip"
     if not path.is_file():
         raise ValueError("导出文件不存在")
     return path

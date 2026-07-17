@@ -11,6 +11,7 @@ from ..services.vip_organizer_service import (
     asset_thumbnail,
     analyze_assets,
     analyze_assets_with_api,
+    delete_session,
     export_package,
     export_file,
     export_zip,
@@ -49,9 +50,22 @@ class AnalysisConfigPayload(BaseModel):
     model_name: str
 
 
+class SessionPayload(BaseModel):
+    previous_session_id: str | None = None
+
+
+class SessionCleanupPayload(BaseModel):
+    session_id: str
+
+
 @router.post("/session")
-def create_session():
-    return start_session()
+def create_session(payload: SessionPayload | None = None):
+    return start_session(payload.previous_session_id if payload else None)
+
+
+@router.post("/session/cleanup", status_code=204)
+def cleanup_session(payload: SessionCleanupPayload):
+    delete_session(payload.session_id)
 
 
 @router.post("/upload")
@@ -84,19 +98,19 @@ def get_asset_original(image_id: int):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/exports/{export_id}/files/{file_name}")
-def get_export_file(export_id: str, file_name: str):
+@router.get("/exports/{session_id}/{export_id}/files/{file_name}")
+def get_export_file(session_id: str, export_id: str, file_name: str):
     try:
-        path = export_file(export_id, file_name)
+        path = export_file(session_id, export_id, file_name)
         return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/exports/{export_id}/download")
-def download_export(export_id: str):
+@router.get("/exports/{session_id}/{export_id}/download")
+def download_export(session_id: str, export_id: str):
     try:
-        path = export_zip(export_id)
+        path = export_zip(session_id, export_id)
         return FileResponse(path, media_type="application/zip", filename=path.name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

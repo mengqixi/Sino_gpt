@@ -11,9 +11,11 @@ def now_iso() -> str:
 
 def get_connection() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 15000")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -125,7 +127,8 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS vip_organizer_sessions (
                 id TEXT PRIMARY KEY,
-                created_at DATETIME
+                created_at DATETIME,
+                updated_at DATETIME
             );
 
             CREATE TABLE IF NOT EXISTS vip_organizer_assets (
@@ -154,6 +157,18 @@ def init_db() -> None:
         api_config_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(api_configs)").fetchall()
         }
+        organizer_session_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vip_organizer_sessions)").fetchall()
+        }
+        if "updated_at" not in organizer_session_columns:
+            conn.execute("ALTER TABLE vip_organizer_sessions ADD COLUMN updated_at DATETIME")
+        conn.execute(
+            "UPDATE vip_organizer_sessions SET updated_at = created_at WHERE updated_at IS NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vip_organizer_sessions_updated_at "
+            "ON vip_organizer_sessions(updated_at)"
+        )
         if "api_type" not in api_config_columns:
             conn.execute("ALTER TABLE api_configs ADD COLUMN api_type TEXT DEFAULT 'image_generation'")
         if "response_text_path" not in api_config_columns:

@@ -36,7 +36,10 @@ export const api = {
   analyzeVipOrganizerWithApi: (payload: any) => request<any>("/api/vip-organizer/analyze-with-api", { method: "POST", body: JSON.stringify(payload) }),
   getVipAnalysisConfig: () => request<any>("/api/vip-organizer/analysis-config"),
   exportVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/export", { method: "POST", body: JSON.stringify(payload) }),
-  startVipOrganizerSession: () => request<{ session_id: string }>("/api/vip-organizer/session", { method: "POST" }),
+  startVipOrganizerSession: (previousSessionId?: string) => request<{ session_id: string }>("/api/vip-organizer/session", {
+    method: "POST",
+    body: JSON.stringify({ previous_session_id: previousSessionId || null })
+  }),
   uploadVipOrganizerAssets: (sessionId: string, assetType: string, files: File[]) => {
     const form = new FormData();
     form.append("session_id", sessionId);
