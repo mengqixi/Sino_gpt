@@ -22,6 +22,13 @@ type Slot = {
   reason: string;
 };
 
+type ApiRoleNote = {
+  role: string;
+  confidence: number;
+  reason: string;
+  tags: string[];
+};
+
 const PRODUCT_ROLE_OPTIONS = [
   ["auto", "使用自动判断"],
   ["front", "正面主图"],
@@ -124,7 +131,7 @@ export default function VipOrganizer() {
   const [assets, setAssets] = useState<Record<string, any[]>>({ product: [], model: [], tag: [] });
   const [assetRoles, setAssetRoles] = useState<Record<number, string>>({});
   const [assetTags, setAssetTags] = useState<Record<number, string[]>>({});
-  const [apiRoleNotes, setApiRoleNotes] = useState<Record<number, string>>({});
+  const [apiRoleNotes, setApiRoleNotes] = useState<Record<number, ApiRoleNote>>({});
   const [analysisConfigs, setAnalysisConfigs] = useState<any[]>([]);
   const [analysisConfigId, setAnalysisConfigId] = useState<number | "">("");
   const [busy, setBusy] = useState(false);
@@ -307,7 +314,12 @@ export default function VipOrganizer() {
       setAssetTags(nextTags);
       setApiRoleNotes(Object.fromEntries(apiResult.items.map((item: any) => [
         item.image_id,
-        `${item.confidence}% · ${item.reason}${item.tags?.length ? ` · ${item.tags.map((tag: string) => TAG_LABELS[tag] || tag).join("、")}` : ""}`
+        {
+          role: item.role,
+          confidence: item.confidence,
+          reason: item.reason,
+          tags: item.tags || []
+        }
       ])));
       const result = await api.analyzeVipOrganizer({
         session_id: sessionId,
@@ -464,8 +476,9 @@ export default function VipOrganizer() {
             </div>
           </div>
           <div className="organizer-analysis-grid">
-            {(assets.product || []).map((asset: any) => (
-              <article key={asset.id} className="organizer-analysis-item">
+            {(assets.product || []).map((asset: any) => {
+              const apiNote = apiRoleNotes[asset.id];
+              return <article key={asset.id} className="organizer-analysis-item">
                 <button className="organizer-analysis-preview" onClick={() => setPreview(asset.original_url || asset.preview_url)}>
                   <img src={asset.preview_url} alt={asset.file_name} />
                 </button>
@@ -475,7 +488,18 @@ export default function VipOrganizer() {
                     <span>自动 {asset.role_confidence}%</span>{ROLE_LABELS[asset.suggested_role] || "局部细节"}
                   </small>
                   <small className="organizer-auto-reason" title={asset.role_reason}>{asset.role_reason}</small>
-                  {apiRoleNotes[asset.id] && <small className="api-role-note">API：{apiRoleNotes[asset.id]}</small>}
+                  {apiNote && <details className="api-role-details">
+                    <summary>
+                      <span>API 判断</span>
+                      <strong>{apiNote.confidence}% · {ROLE_LABELS[apiNote.role] || apiNote.role}</strong>
+                    </summary>
+                    <dl>
+                      <div><dt>主类别</dt><dd>{ROLE_LABELS[apiNote.role] || apiNote.role}</dd></div>
+                      <div><dt>可信度</dt><dd>{apiNote.confidence}%</dd></div>
+                      <div><dt>细节标签</dt><dd>{apiNote.tags.length ? apiNote.tags.map((tag) => TAG_LABELS[tag] || tag).join("、") : "无"}</dd></div>
+                      <div><dt>判断理由</dt><dd>{apiNote.reason || "API 未提供理由"}</dd></div>
+                    </dl>
+                  </details>}
                   <select value={assetRoles[asset.id] || "auto"} onChange={(event) => updateAssetRole(asset.id, event.target.value)}>
                     {PRODUCT_ROLE_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
                   </select>
@@ -488,8 +512,8 @@ export default function VipOrganizer() {
                     {assetTags[asset.id] !== undefined && <button type="button" className="organizer-tags-reset" onClick={() => resetAssetTags(asset.id)}>恢复自动标签</button>}
                   </div>
                 </div>
-              </article>
-            ))}
+              </article>;
+            })}
           </div>
         </section>
 

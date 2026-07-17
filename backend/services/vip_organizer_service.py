@@ -158,49 +158,89 @@ def _analysis_data_url(path: Path) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def analyze_assets_with_api(session_id: str, product_image_ids: list[int], api_config_id: int) -> dict[str, Any]:
-    _validate_session_assets(session_id, {"product": product_image_ids})
-    rows = _uploaded_rows(product_image_ids)
-    if not rows:
-        raise ValueError("请至少上传一张商品原图")
-    config = _analysis_config(api_config_id)
+def _api_analysis_prompt() -> str:
     role_text = (
-        "front正面主图, semi_side半侧面或三分之二角度, side完整侧面, back背面, top顶部或开口全景, bottom底部, "
-        "transparent透明底正面, strap肩带完整展示, detail局部细节"
+        "front正面主图, semi_side半侧面或三分之二角度, side完整侧面, back背面, "
+        "top顶部或开口全景, bottom完整包底, transparent透明底正面, "
+        "strap完整肩带或链条展示, detail局部细节"
     )
     tag_text = (
         "logo ELLE Logo, hardware五金, strap_chain肩带或链条, "
         "zipper_opening拉链或开口, interior内里, inner_pocket_label内袋或内标, "
         "material_texture材质或纹理, bottom_detail包底细节"
     )
+    return (
+        "你是ELLE女包电商素材分类员。请综合比较同批图片后逐张分类，"
+        f"主类别只能从以下固定角色中选择：{role_text}。每张图片只能有一个主类别，"
+        f"并可从以下细节标签中选择零个或多个：{tag_text}。"
+        "必须按输入顺序返回全部图片，每个index只出现一次，不得遗漏。\n"
+        "完整视图规则：front是完整正面，包身正面、包口、Logo或主要五金朝向镜头；"
+        "semi_side必须同时看到正面和一侧厚度，包体轮廓存在真实透视；"
+        "side只看到狭窄侧廓或包体厚度；back是完整背面。"
+        "不能因为肩带、链条、挂件横向铺开，或一侧配件较多，就把正面误判为semi_side。"
+        "不能只因没有明显Logo就把图片判为back，应与同批相同包型的正面、半侧和背面互相比较。"
+        "同款完整视图中，主体最窄且主要展示厚度的通常是side；"
+        "能看到一侧厚度且仍保留大部分正面的通常是semi_side；"
+        "中央Logo或主五金朝向镜头的通常是front；相同轮廓但背部结构朝向镜头的才是back。\n"
+        "特殊完整视图规则：top是完整包口或开口俯视全景；bottom是完整包底平面或仰拍全景，"
+        "不要仅因主体横向扁平就判断为bottom；transparent只用于确有透明通道或透明底素材；"
+        "strap只用于整条肩带或链条本身是主要展示对象的图片。\n"
+        "局部细节规则：只有包身被裁切、局部被明显放大时才使用detail。"
+        "ELLE金属字标或铭牌近景添加logo和hardware；扣件、铆钉、链条连接件添加hardware；"
+        "肩带或链条近景添加strap_chain；拉链、包口近景添加zipper_opening；"
+        "出现包内空间或内衬添加interior，内袋或内标近景再添加inner_pocket_label；"
+        "面料、压纹、缝线近景添加material_texture；包脚、底部缝线等局部添加bottom_detail。"
+        "细节标签允许多选，例如ELLE金属Logo面料近景可同时使用logo、hardware、material_texture。"
+        "完整产品图即使可见Logo、五金或链条，主类别仍应是对应完整视图，不得改为detail。\n"
+        "本地初判已结合轻量图像特征和同批相对校正，只是参考。画面证据明确时可以纠正本地初判；"
+        "无法可靠判断时降低confidence，并在reason中写清不确定点。"
+        "仅返回JSON对象，不要Markdown，格式："
+        '{"items":[{"index":1,"role":"front","tags":["logo","hardware"],'
+        '"confidence":90,"reason":"简短但具体的中文理由"}]}。'
+    )
+
+
+def analyze_assets_with_api(session_id: str, product_image_ids: list[int], api_config_id: int) -> dict[str, Any]:
+    _validate_session_assets(session_id, {"product": product_image_ids})
+    rows = _uploaded_rows(product_image_ids)
+    if not rows:
+        raise ValueError("请至少上传一张商品原图")
+    config = _analysis_config(api_config_id)
     content: list[dict[str, Any]] = [{
         "type": "text",
-        "text": (
-            "你是ELLE女包电商素材分类员。请逐张判断图片用途，只能从固定角色中选择："
-            f"{role_text}。每张图只能有一个主类别；相似图片允许同类别。"
-            f"另外可从以下细节标签中选择零个或多个：{tag_text}。"
-            "完整产品图不能因为画面里有Logo或链条就标成局部细节。只有局部放大的照片才标为detail。"
-            "半侧面能同时看到包身正面和一侧厚度，标为semi_side；只看到窄侧廓时才标为side。"
-            "front必须是完整正面且包口、Logo或主要五金朝向镜头；back是完整背面，不要仅因没有明显Logo就草率判断。"
-            "不要把肩带横向铺开的正面图误判为半侧面；判断视角时以包身主体透视和侧边厚度为准。"
-            "底部平放或仰拍标为bottom；整条肩带或链条长度为主要展示内容时标为strap；"
-            "出现内衬、内袋或包内空间时添加interior，内袋或内标近景再添加inner_pocket_label；"
-            "包底完整视图主类别标为bottom；只有包脚、底部车线等局部放大图才标detail并添加bottom_detail；"
-            "俯拍完整包口但重点不是局部拉链时标为top。无法可靠判断正反面时降低confidence。"
-            "仅返回JSON对象，不要Markdown，格式："
-            '{"items":[{"index":1,"role":"front","tags":["logo","hardware"],"confidence":90,"reason":"简短中文理由"}]}。'
-        ),
+        "text": _api_analysis_prompt(),
     }]
-    local_hints: dict[int, tuple[str, int]] = {}
+    local_items: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
         metrics = _image_metrics(row)
-        local_role, _, local_confidence, _ = _classify_product_metrics(metrics)
-        local_hints[index] = (local_role, local_confidence)
+        local_role, local_tags, local_confidence, local_reason = _classify_product_metrics(metrics)
+        local_items.append({
+            **metrics,
+            "id": index,
+            "suggested_role": local_role,
+            "suggested_tags": local_tags,
+            "role_confidence": local_confidence,
+            "role_reason": local_reason,
+        })
+    _refine_product_classifications(local_items)
+    local_hints = {
+        int(item["id"]): (
+            str(item["suggested_role"]),
+            list(item["suggested_tags"]),
+            int(item["role_confidence"]),
+            str(item["role_reason"]),
+        )
+        for item in local_items
+    }
+    for index, row in enumerate(rows, start=1):
+        local_role, local_tags, local_confidence, local_reason = local_hints[index]
+        local_tag_text = "、".join(local_tags) if local_tags else "无"
         content.append({
             "type": "text",
             "text": (
                 f"图片 {index}，文件名：{row['file_name']}。"
-                f"轻量本地初判：{local_role}（{local_confidence}%），仅供参考，请以画面为准。"
+                f"同批本地校正参考：{local_role}（{local_confidence}%），"
+                f"细节标签：{local_tag_text}，理由：{local_reason}。请以画面证据作最终判断。"
             ),
         })
         content.append({"type": "image_url", "image_url": {"url": _analysis_data_url(Path(row["file_path"])), "detail": "low"}})
@@ -271,7 +311,7 @@ def analyze_assets_with_api(session_id: str, product_image_ids: list[int], api_c
             role, tags = "detail", list(dict.fromkeys([*tags, "logo", "hardware"]))
         elif role == "interior":
             role, tags = "detail", list(dict.fromkeys([*tags, "interior"]))
-        if local_hints.get(index, ("", 0))[0] == "transparent":
+        if local_hints.get(index, ("", [], 0, ""))[0] == "transparent":
             role = "transparent"
         if 1 <= index <= len(rows) and role in API_ANALYSIS_ROLES:
             image_id = int(rows[index - 1]["id"])

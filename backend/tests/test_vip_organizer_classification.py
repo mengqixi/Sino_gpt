@@ -8,6 +8,7 @@ from backend.services.vip_organizer_service import (
     _catalog_product_page,
     _classify_product_metrics,
     _detail_showcase_page,
+    _api_analysis_prompt,
     _font,
     _model_showcase_page,
     _paste_product,
@@ -171,6 +172,26 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(roles[2], "semi_side")
         self.assertEqual(roles[3], "front")
         self.assertEqual(roles[4], "back")
+
+    def test_api_analysis_prompt_matches_local_roles_and_detail_tags(self):
+        prompt = _api_analysis_prompt()
+
+        for role in ("front", "semi_side", "side", "back", "top", "bottom", "transparent", "strap", "detail"):
+            self.assertIn(role, prompt)
+        for tag in (
+            "logo",
+            "hardware",
+            "strap_chain",
+            "zipper_opening",
+            "interior",
+            "inner_pocket_label",
+            "material_texture",
+            "bottom_detail",
+        ):
+            self.assertIn(tag, prompt)
+        self.assertIn("同批相对校正", prompt)
+        self.assertIn("不得改为detail", prompt)
+        self.assertIn("ELLE金属Logo面料近景", prompt)
 
     def test_export_templates_have_bundled_chinese_font_and_fixed_white_frames(self):
         self.assertTrue(BUNDLED_FONT_PATH.exists())

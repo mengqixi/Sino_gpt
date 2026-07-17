@@ -90,7 +90,15 @@
 .organizer-analysis-item .role-confidence-low { border-color: #e4a49c; background: #fde8e5; color: #8a2e23; }
 .organizer-analysis-item .organizer-auto-reason { display: -webkit-box; overflow: hidden; color: #66716b; line-height: 1.35; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .organizer-analysis-item select { min-width: 0; width: 100%; padding: 7px; }
-.organizer-analysis-item .api-role-note { color: #1f5b4c; }
+.api-role-details { min-width: 0; border: 1px solid #b9d2c9; border-radius: 5px; background: #f1f7f4; color: #174f41; }
+.api-role-details summary { display: flex; min-width: 0; align-items: center; gap: 6px; padding: 7px 8px; cursor: pointer; list-style-position: inside; }
+.api-role-details summary span { flex: none; color: #4f6d63; font-size: 11px; font-weight: 600; }
+.api-role-details summary strong { min-width: 0; overflow: hidden; color: #174f41; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.api-role-details[open] summary { border-bottom: 1px solid #cbded7; }
+.api-role-details dl { display: grid; gap: 7px; margin: 0; padding: 9px; }
+.api-role-details dl div { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 7px; }
+.api-role-details dt { color: #68736d; font-size: 11px; font-weight: 600; }
+.api-role-details dd { min-width: 0; margin: 0; color: #273a33; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .organizer-tag-editor { display: grid; gap: 5px; padding-top: 2px; border-top: 1px solid #e1e5e2; }
 .organizer-tag-editor > span { color: #68736d; font-size: 11px; }
 .organizer-tag-editor > div { display: flex; flex-wrap: wrap; gap: 4px; }
