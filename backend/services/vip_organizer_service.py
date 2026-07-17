@@ -955,7 +955,9 @@ def _product_cutout(source: Image.Image) -> Image.Image:
     ys, xs = np.where(mask > 0)
     if not len(xs):
         return image
-    padding = max(3, int(max(width, height) * 0.008))
+    object_width = int(xs.max() - xs.min() + 1)
+    object_height = int(ys.max() - ys.min() + 1)
+    padding = max(3, int(max(object_width, object_height) * 0.015))
     left = max(0, int(xs.min()) - padding)
     top = max(0, int(ys.min()) - padding)
     right = min(width, int(xs.max()) + padding + 1)
@@ -985,9 +987,9 @@ def _paste_product(canvas: Image.Image, source: Image.Image, box: tuple[int, int
 
 
 def _catalog_product_page(source: Image.Image) -> Image.Image:
-    """Normalize catalog whitespace while retaining a consistent outer white border."""
+    """Match the catalog reference with a stable white border and a lower visual center."""
     canvas = Image.new("RGB", (800, 800), "white")
-    _paste_product(canvas, source, (64, 72, 736, 728))
+    _paste_product(canvas, source, (120, 170, 680, 710))
     return canvas
 
 
@@ -1033,7 +1035,7 @@ def _info_page(info: dict[str, str], product_image: Image.Image | None = None) -
         y += 96
 
     if product_image is not None:
-        _paste_product(image, product_image, (378, 270, 665, 470))
+        _paste_product(image, product_image, (346, 288, 633, 488))
 
     line_color = "#8a8a8a"
     draw.line((390, 486, 590, 486), fill=line_color, width=2)
@@ -1091,10 +1093,10 @@ def _multi_angle_page(image_ids: list[int]) -> Image.Image:
     title_box = draw.textbbox((0, 0), title, font=title_font)
     draw.text(((750 - (title_box[2] - title_box[0])) / 2, 62), title, font=title_font, fill="#111111")
     boxes = [
-        (62, 177, 307, 360),
-        (443, 177, 688, 360),
-        (62, 494, 307, 682),
-        (443, 494, 688, 682),
+        (78, 195, 323, 365),
+        (427, 195, 672, 365),
+        (78, 500, 323, 680),
+        (427, 500, 672, 680),
     ]
     for image_id, box in zip(image_ids[:4], boxes):
         _paste_product(canvas, _load_image(image_id), box)

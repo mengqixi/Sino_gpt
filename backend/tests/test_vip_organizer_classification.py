@@ -39,15 +39,38 @@ class VipOrganizerClassificationTests(unittest.TestCase):
                 image.putpixel((x, y), (190, 115, 140))
         return image
 
-    def test_catalog_product_is_cropped_upscaled_and_centered(self):
+    @staticmethod
+    def _large_catalog_product() -> Image.Image:
+        image = Image.new("RGB", (800, 800), "white")
+        for x in range(40, 760):
+            for y in range(184, 616):
+                image.putpixel((x, y), (190, 115, 140))
+        return image
+
+    def test_catalog_product_is_cropped_upscaled_and_visually_aligned(self):
         rendered = _catalog_product_page(self._small_catalog_product())
         foreground = ImageChops.difference(rendered, Image.new("RGB", rendered.size, "white")).getbbox()
 
         self.assertIsNotNone(foreground)
         assert foreground is not None
-        self.assertGreaterEqual(foreground[2] - foreground[0], 640)
+        self.assertGreaterEqual(foreground[2] - foreground[0], 530)
         self.assertAlmostEqual((foreground[0] + foreground[2]) / 2, 400, delta=2)
-        self.assertAlmostEqual((foreground[1] + foreground[3]) / 2, 400, delta=2)
+        self.assertAlmostEqual((foreground[1] + foreground[3]) / 2, 440, delta=2)
+
+    def test_catalog_product_normalizes_small_and_large_source_scale(self):
+        white = Image.new("RGB", (800, 800), "white")
+        small_bbox = ImageChops.difference(_catalog_product_page(self._small_catalog_product()), white).getbbox()
+        large_bbox = ImageChops.difference(_catalog_product_page(self._large_catalog_product()), white).getbbox()
+
+        self.assertIsNotNone(small_bbox)
+        self.assertIsNotNone(large_bbox)
+        assert small_bbox is not None and large_bbox is not None
+        for small_edge, large_edge in zip(small_bbox, large_bbox):
+            self.assertAlmostEqual(small_edge, large_edge, delta=3)
+        self.assertGreaterEqual(large_bbox[0], 120)
+        self.assertLessEqual(large_bbox[2], 680)
+        self.assertGreaterEqual(large_bbox[1], 170)
+        self.assertLessEqual(large_bbox[3], 710)
 
     def test_template_product_box_allows_upscaling(self):
         canvas = Image.new("RGB", (750, 665), "white")
