@@ -55,6 +55,16 @@ SLOT_DEFINITIONS = [
     ("606.jpg", "正面、半侧面或全侧、背面、开口顶视图", "750×750", "composite"),
     ("801.jpg", "吊牌信息", "750×750", "tag"),
 ]
+JD_SLOT_DEFINITIONS = [
+    ("0-无logo.jpg", "模特主图（无Logo）", "800×800", "model"),
+    ("1.jpg", "模特主图（含Logo）", "800×800 + 750×1000", "model"),
+    ("2.jpg", "半侧产品图（含Logo）", "800×800 + 750×1000", "product"),
+    ("3.jpg", "ELLE Logo细节（含Logo）", "800×800 + 750×1000", "product"),
+    ("4.jpg", "内里细节（含Logo）", "800×800 + 750×1000", "product"),
+    ("5.jpg", "尺寸与手机对比（含Logo）", "800×800 + 750×1000", "generated"),
+    ("透明.png", "正面透明底", "800×800", "product"),
+]
+ORGANIZER_PLATFORMS = {"vip", "jd"}
 INFO_PRODUCT_BOX = (346, 258, 633, 458)
 INFO_LENGTH_LINE_Y = 486
 
@@ -86,6 +96,12 @@ DETAIL_TAGS = {
     "bottom_detail",
 }
 API_ANALYSIS_ROLES = CANONICAL_PRODUCT_ROLES
+
+
+def _platform_slot_definitions(platform: str) -> list[tuple[str, str, str, str]]:
+    if platform not in ORGANIZER_PLATFORMS:
+        raise ValueError("不支持的输出平台")
+    return JD_SLOT_DEFINITIONS if platform == "jd" else SLOT_DEFINITIONS
 
 
 def _analysis_config(config_id: int | None = None) -> dict[str, Any]:
@@ -911,7 +927,9 @@ def analyze_assets(
     tag_image_ids: list[int],
     asset_roles: dict[int, str] | None = None,
     asset_tags: dict[int, list[str]] | None = None,
+    platform: str = "vip",
 ) -> dict[str, Any]:
+    slot_definitions = _platform_slot_definitions(platform)
     _validate_session_assets(session_id, {
         "product": product_image_ids,
         "model": model_image_ids,
@@ -1093,9 +1111,19 @@ def analyze_assets(
         ), "按正面、半侧面或全侧、背面、开口顶视图的固定顺序生成四角度模板"),
         "801.jpg": (tag_ids, 95 if tags else 0, "使用独立上传的吊牌图片" if tags else "尚未上传吊牌图片"),
     }
+    if platform == "jd":
+        slot_values = {
+            "0-无logo.jpg": (model_pick(0), 88 if models else 0, "京东800目录模特主图，不叠加ELLE角标"),
+            "1.jpg": (model_pick(0), 88 if models else 0, "与0-无logo.jpg使用同一张模特图，叠加京东ELLE角标"),
+            "2.jpg": ([angle_view["id"]], selection_confidence(angle_view, role=angle_role), "优先使用半侧面或三分之二角度产品图"),
+            "3.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "优先使用ELLE Logo清晰可见的局部细节"),
+            "4.jpg": ([interior_id], selection_confidence(interior_view, tag="interior"), "优先使用内里、开口或内袋细节"),
+            "5.jpg": ([front_view["id"]], selection_confidence(front_view, role="front"), "使用完整产品图生成尺寸与手机对比模板"),
+            "透明.png": ([front_id], 98 if has_transparent else 35, "检测到透明通道" if has_transparent else "未检测到透明图，暂用正面候选图"),
+        }
     slots = [
         _slot(file_name, title, size, kind, *slot_values[file_name])
-        for file_name, title, size, kind in SLOT_DEFINITIONS
+        for file_name, title, size, kind in slot_definitions
     ]
     for item in products:
         item["selected_role"] = role_overrides.get(item["id"], "auto")
@@ -1217,23 +1245,92 @@ def _product_cutout(source: Image.Image) -> Image.Image:
     return result
 
 
-def _paste_product(canvas: Image.Image, source: Image.Image, box: tuple[int, int, int, int]) -> None:
+def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, float]:
+    value = value or {}
+
+    def number(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value.get(name, default))
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(maximum, parsed))
+
+    crop_x = number("crop_x", 0.0, 0.0, 0.98)
+    crop_y = number("crop_y", 0.0, 0.0, 0.98)
+    crop_width = number("crop_width", 1.0, 0.02, 1.0 - crop_x)
+    crop_height = number("crop_height", 1.0, 0.02, 1.0 - crop_y)
+    return {
+        "zoom": number("zoom", 1.0, 0.5, 4.0),
+        "offset_x": number("offset_x", 0.0, -1.5, 1.5),
+        "offset_y": number("offset_y", 0.0, -1.5, 1.5),
+        "crop_x": crop_x,
+        "crop_y": crop_y,
+        "crop_width": crop_width,
+        "crop_height": crop_height,
+    }
+
+
+def _crop_source(source: Image.Image, adjustment: dict[str, Any] | None) -> Image.Image:
+    normalized = _normalize_adjustment(adjustment)
+    width, height = source.size
+    left = int(round(normalized["crop_x"] * width))
+    top = int(round(normalized["crop_y"] * height))
+    right = int(round((normalized["crop_x"] + normalized["crop_width"]) * width))
+    bottom = int(round((normalized["crop_y"] + normalized["crop_height"]) * height))
+    right = max(left + 1, min(width, right))
+    bottom = max(top + 1, min(height, bottom))
+    return source.crop((left, top, right, bottom))
+
+
+def _paste_layer(
+    canvas: Image.Image,
+    layer: Image.Image,
+    box: tuple[int, int, int, int],
+    adjustment: dict[str, Any] | None = None,
+    *,
+    mode: str = "contain",
+) -> None:
     left, top, right, bottom = box
-    cutout = _product_cutout(source)
     box_width = max(1, right - left)
     box_height = max(1, bottom - top)
-    scale = min(box_width / cutout.width, box_height / cutout.height)
-    rendered_size = (
-        max(1, int(round(cutout.width * scale))),
-        max(1, int(round(cutout.height * scale))),
-    )
-    rendered = cutout.resize(rendered_size, Image.Resampling.LANCZOS)
-    x = left + (box_width - rendered.width) // 2
-    y = top + (box_height - rendered.height) // 2
-    if canvas.mode == "RGBA":
-        canvas.alpha_composite(rendered, (x, y))
+    normalized = _normalize_adjustment(adjustment)
+    if mode == "cover":
+        base_scale = max(box_width / layer.width, box_height / layer.height)
     else:
-        canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
+        base_scale = min(box_width / layer.width, box_height / layer.height)
+    scale = base_scale * normalized["zoom"]
+    rendered_size = (
+        max(1, int(round(layer.width * scale))),
+        max(1, int(round(layer.height * scale))),
+    )
+    rendered = layer.resize(rendered_size, Image.Resampling.LANCZOS)
+    x = (box_width - rendered.width) // 2 + int(round(normalized["offset_x"] * box_width))
+    y = (box_height - rendered.height) // 2 + int(round(normalized["offset_y"] * box_height))
+    region_mode = "RGBA" if canvas.mode == "RGBA" or rendered.mode == "RGBA" else "RGB"
+    region_background = (255, 255, 255, 0) if region_mode == "RGBA" else "white"
+    region = Image.new(region_mode, (box_width, box_height), region_background)
+    if region_mode == "RGBA":
+        layer_rgba = rendered.convert("RGBA")
+        region.alpha_composite(layer_rgba, (x, y))
+    else:
+        region.paste(rendered.convert("RGB"), (x, y))
+    if canvas.mode == "RGBA":
+        canvas.alpha_composite(region.convert("RGBA"), (left, top))
+    elif region.mode == "RGBA":
+        canvas.paste(region.convert("RGB"), (left, top), region.getchannel("A"))
+    else:
+        canvas.paste(region, (left, top))
+
+
+def _paste_product(
+    canvas: Image.Image,
+    source: Image.Image,
+    box: tuple[int, int, int, int],
+    adjustment: dict[str, Any] | None = None,
+) -> None:
+    cropped = _crop_source(source, adjustment)
+    cutout = _product_cutout(cropped)
+    _paste_layer(canvas, cutout, box, adjustment)
 
 
 def _normalized_product_page(
@@ -1241,6 +1338,7 @@ def _normalized_product_page(
     size: tuple[int, int] = (800, 800),
     box: tuple[int, int, int, int] | None = None,
     transparent: bool = False,
+    adjustment: dict[str, Any] | None = None,
 ) -> Image.Image:
     """Normalize non-model assets into a stable safe area regardless of source whitespace."""
     width, height = size
@@ -1252,25 +1350,32 @@ def _normalized_product_page(
     )
     background = (255, 255, 255, 0) if transparent else "white"
     canvas = Image.new("RGBA" if transparent else "RGB", size, background)
-    _paste_product(canvas, source, safe_box)
+    _paste_product(canvas, source, safe_box, adjustment)
     return canvas
 
 
-def _catalog_product_page(source: Image.Image) -> Image.Image:
+def _catalog_product_page(source: Image.Image, adjustment: dict[str, Any] | None = None) -> Image.Image:
     """Match the catalog reference with a stable white border and a lower visual center."""
-    return _normalized_product_page(source)
+    return _normalized_product_page(source, adjustment=adjustment)
 
 
-def _dimension_mm(value: str) -> str:
-    normalized = value.strip().lower().replace("，", ".")
+def _dimension_value_mm(value: str | None) -> float | None:
+    normalized = str(value or "").strip().lower().replace("，", ".")
     if not normalized:
-        return "--mm"
+        return None
     match = re.search(r"\d+(?:\.\d+)?", normalized)
     if not match:
-        return value
+        return None
     number = float(match.group(0))
     if "mm" not in normalized:
         number *= 10
+    return number
+
+
+def _dimension_mm(value: str) -> str:
+    number = _dimension_value_mm(value)
+    if number is None:
+        return value or "--mm"
     rendered = str(int(round(number))) if abs(number - round(number)) < 0.01 else f"{number:.1f}".rstrip("0").rstrip(".")
     return f"{rendered}mm"
 
@@ -1283,7 +1388,11 @@ def _draw_rotated_text(canvas: Image.Image, text: str, xy: tuple[int, int], angl
     canvas.paste(rotated, xy, rotated)
 
 
-def _info_page(info: dict[str, str], product_image: Image.Image | None = None) -> Image.Image:
+def _info_page(
+    info: dict[str, str],
+    product_image: Image.Image | None = None,
+    adjustment: dict[str, Any] | None = None,
+) -> Image.Image:
     image = Image.new("RGB", (750, 665), "white")
     draw = ImageDraw.Draw(image)
     title = "产品信息"
@@ -1303,7 +1412,7 @@ def _info_page(info: dict[str, str], product_image: Image.Image | None = None) -
         y += 96
 
     if product_image is not None:
-        _paste_product(image, product_image, INFO_PRODUCT_BOX)
+        _paste_product(image, product_image, INFO_PRODUCT_BOX, adjustment)
 
     line_color = "#8a8a8a"
     draw.line((390, 486, 590, 486), fill=line_color, width=2)
@@ -1332,15 +1441,15 @@ def _info_page(info: dict[str, str], product_image: Image.Image | None = None) -
     return image
 
 
-def _model_showcase_page(source: Image.Image) -> Image.Image:
+def _model_showcase_page(source: Image.Image, adjustment: dict[str, Any] | None = None) -> Image.Image:
     """Match the 601-603 reference: cropped model photo with a fixed white frame."""
     canvas = Image.new("RGB", (750, 750), "white")
-    rendered = ImageOps.fit(source.convert("RGB"), (638, 634), Image.Resampling.LANCZOS, centering=(0.5, 0.46))
-    canvas.paste(rendered, (56, 65))
+    cropped = _crop_source(source.convert("RGB"), adjustment)
+    _paste_layer(canvas, cropped, (56, 65, 694, 699), adjustment, mode="cover")
     return canvas
 
 
-def _detail_showcase_page(source: Image.Image) -> Image.Image:
+def _detail_showcase_page(source: Image.Image, adjustment: dict[str, Any] | None = None) -> Image.Image:
     """Match the 604-605 reference without changing the uploaded detail image."""
     canvas = Image.new("RGB", (750, 750), "white")
     draw = ImageDraw.Draw(canvas)
@@ -1348,14 +1457,15 @@ def _detail_showcase_page(source: Image.Image) -> Image.Image:
     title_font = _font(34, True)
     title_box = draw.textbbox((0, 0), title, font=title_font)
     draw.text(((750 - (title_box[2] - title_box[0])) / 2, 70), title, font=title_font, fill="#aaaaaa")
-    detail = ImageOps.contain(source.convert("RGB"), (640, 522), Image.Resampling.LANCZOS)
-    detail_x = 55 + (640 - detail.width) // 2
-    detail_y = 181 + (522 - detail.height) // 2
-    canvas.paste(detail, (detail_x, detail_y))
+    cropped = _crop_source(source.convert("RGB"), adjustment)
+    _paste_layer(canvas, cropped, (55, 181, 695, 703), adjustment)
     return canvas
 
 
-def _multi_angle_page(image_ids: list[int]) -> Image.Image:
+def _multi_angle_page(
+    image_ids: list[int],
+    adjustments: list[dict[str, Any]] | None = None,
+) -> Image.Image:
     canvas = Image.new("RGB", (750, 750), "white")
     draw = ImageDraw.Draw(canvas)
     title = "多角度展示"
@@ -1368,8 +1478,10 @@ def _multi_angle_page(image_ids: list[int]) -> Image.Image:
         (78, 500, 323, 680),
         (427, 500, 672, 680),
     ]
-    for image_id, box in zip(image_ids[:4], boxes):
-        _paste_product(canvas, _load_image(image_id), box)
+    adjustments = adjustments or []
+    for index, (image_id, box) in enumerate(zip(image_ids[:4], boxes)):
+        adjustment = adjustments[index] if index < len(adjustments) else None
+        _paste_product(canvas, _load_image(image_id), box, adjustment)
     draw.line((346, 420, 404, 420), fill="#a8a8a8", width=2)
     draw.line((375, 391, 375, 449), fill="#a8a8a8", width=2)
     return canvas
@@ -1385,52 +1497,472 @@ def _save_png_30(image: Image.Image, path: Path) -> None:
         canvas.quantize(colors=256).save(path, optimize=True)
 
 
-def _slot_map(slots: list[dict[str, Any]]) -> dict[str, list[int]]:
-    slot_map = {item["file_name"]: [int(value) for value in item.get("image_ids", [])] for item in slots}
-    # 1.jpg and 50.jpg are two layouts of the same model photo.
-    slot_map["50.jpg"] = list(slot_map.get("1.jpg", []))
+@lru_cache(maxsize=8)
+def _jd_logo_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        Path("C:/Windows/Fonts/times.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"),
+        BUNDLED_FONT_PATH,
+    ]
+    for path in candidates:
+        if path.exists():
+            return ImageFont.truetype(str(path), size=size)
+    return ImageFont.load_default()
+
+
+def _draw_jd_elle_logo(canvas: Image.Image, size: tuple[int, int]) -> None:
+    scale = min(size[0] / 800, size[1] / 800)
+    draw = ImageDraw.Draw(canvas)
+    font = _jd_logo_font(max(22, int(round(36 * scale))))
+    text = "E L L E"
+    x = int(round(35 * size[0] / 800))
+    y = int(round(45 * size[1] / 800))
+    draw.text((x, y), text, font=font, fill="#111111")
+
+
+def _jd_model_page(
+    source: Image.Image,
+    size: tuple[int, int],
+    adjustment: dict[str, Any] | None,
+    *,
+    with_logo: bool,
+) -> Image.Image:
+    canvas = Image.new("RGB", size, "white")
+    _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, *size), adjustment, mode="cover")
+    if with_logo:
+        _draw_jd_elle_logo(canvas, size)
+    return canvas
+
+
+def _jd_product_page(
+    source: Image.Image,
+    size: tuple[int, int],
+    adjustment: dict[str, Any] | None,
+    *,
+    detail: bool = False,
+) -> Image.Image:
+    canvas = Image.new("RGB", size, "white")
+    if detail:
+        _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, *size), adjustment, mode="cover")
+    else:
+        if size == (800, 800):
+            box = (100, 135, 700, 700)
+        else:
+            box = (100, 145, 650, 900)
+        _paste_product(canvas, source, box, adjustment)
+    _draw_jd_elle_logo(canvas, size)
+    return canvas
+
+
+def _mask_longest_run(values: np.ndarray) -> tuple[int, int] | None:
+    indices = np.flatnonzero(values)
+    if not len(indices):
+        return None
+    best_start = current_start = int(indices[0])
+    best_end = current_end = int(indices[0])
+    for raw_index in indices[1:]:
+        index = int(raw_index)
+        if index == current_end + 1:
+            current_end = index
+        else:
+            if current_end - current_start > best_end - best_start:
+                best_start, best_end = current_start, current_end
+            current_start = current_end = index
+    if current_end - current_start > best_end - best_start:
+        best_start, best_end = current_start, current_end
+    return best_start, best_end + 1
+
+
+def _jd_product_body_bbox(cutout: Image.Image) -> tuple[int, int, int, int]:
+    """Estimate the solid bag body while excluding sparse handles and chains."""
+    alpha = np.asarray(cutout.getchannel("A"))
+    mask = alpha > 28
+    ys, xs = np.where(mask)
+    if not len(xs):
+        return 0, 0, cutout.width, cutout.height
+
+    full_left = int(xs.min())
+    full_top = int(ys.min())
+    full_right = int(xs.max()) + 1
+    full_bottom = int(ys.max()) + 1
+    row_counts = mask.sum(axis=1)
+    max_row_width = int(row_counts.max())
+    broad_rows = row_counts >= max(10, int(round(max_row_width * 0.38)))
+    row_run = _mask_longest_run(broad_rows)
+    if row_run is None:
+        return full_left, full_top, full_right, full_bottom
+
+    body_top, body_bottom = row_run
+    padding_y = max(1, int(round((body_bottom - body_top) * 0.04)))
+    body_top = max(full_top, body_top - padding_y)
+    body_bottom = min(full_bottom, body_bottom + padding_y)
+
+    body_mask = mask[body_top:body_bottom]
+    column_counts = body_mask.sum(axis=0)
+    solid_columns = column_counts >= max(2, int(round((body_bottom - body_top) * 0.14)))
+    column_run = _mask_longest_run(solid_columns)
+    if column_run is None:
+        body_xs = np.where(body_mask)[1]
+        body_left = int(body_xs.min())
+        body_right = int(body_xs.max()) + 1
+    else:
+        body_left, body_right = column_run
+
+    padding_x = max(1, int(round((body_right - body_left) * 0.025)))
+    body_left = max(full_left, body_left - padding_x)
+    body_right = min(full_right, body_right + padding_x)
+    if body_right - body_left < cutout.width * 0.18 or body_bottom - body_top < cutout.height * 0.12:
+        return full_left, full_top, full_right, full_bottom
+    return body_left, body_top, body_right, body_bottom
+
+
+def _draw_jd_dimension_bar(
+    canvas: Image.Image,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    label: str,
+    *,
+    vertical: bool = False,
+    vertical_label_side: str = "left",
+) -> None:
+    draw = ImageDraw.Draw(canvas)
+    color = "#777777"
+    stroke = max(2, round(min(canvas.size) / 400))
+    cap = max(8, round(min(canvas.size) * 0.014))
+    font = _font(max(14, round(min(canvas.size) * 0.022)))
+    draw.line((start, end), fill=color, width=stroke)
+    if vertical:
+        draw.line((start[0] - cap, start[1], start[0] + cap, start[1]), fill=color, width=stroke)
+        draw.line((end[0] - cap, end[1], end[0] + cap, end[1]), fill=color, width=stroke)
+        text_box = font.getbbox(label)
+        text_height = text_box[3] - text_box[1]
+        text_x = start[0] + cap + 9 if vertical_label_side == "right" else start[0] - cap - text_height - 16
+        _draw_rotated_text(
+            canvas,
+            label,
+            (text_x, round((start[1] + end[1]) / 2 - 30)),
+            90,
+            font,
+        )
+    else:
+        draw.line((start[0], start[1] - cap, start[0], start[1] + cap), fill=color, width=stroke)
+        draw.line((end[0], end[1] - cap, end[0], end[1] + cap), fill=color, width=stroke)
+        text_box = draw.textbbox((0, 0), label, font=font)
+        text_width = text_box[2] - text_box[0]
+        draw.text(
+            (round((start[0] + end[0] - text_width) / 2), start[1] + cap + 7),
+            label,
+            font=font,
+            fill=color,
+        )
+
+
+def _draw_jd_phone_reference(
+    canvas: Image.Image,
+    center_x: int,
+    top: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    """Draw a neutral front/back phone pair representing a 163mm device."""
+    draw = ImageDraw.Draw(canvas)
+    phone_height = max(90, height)
+    phone_width = max(42, round(phone_height * 0.48))
+    overlap = max(12, round(phone_height * 0.13))
+    pair_width = phone_width * 2 - overlap
+    left = round(center_x - pair_width / 2)
+    right = left + phone_width - overlap
+    radius = max(8, round(phone_width * 0.13))
+    outline = "#888888"
+
+    draw.rounded_rectangle(
+        (left, top, left + phone_width, top + phone_height),
+        radius=radius,
+        fill="#f2f2f0",
+        outline=outline,
+        width=2,
+    )
+    camera_panel = (
+        left + round(phone_width * 0.08),
+        top + round(phone_width * 0.08),
+        left + round(phone_width * 0.66),
+        top + round(phone_width * 0.66),
+    )
+    draw.rounded_rectangle(camera_panel, radius=max(5, radius // 2), fill="#dededc")
+    camera_r = max(4, round(phone_width * 0.09))
+    camera_centers = [
+        (left + round(phone_width * 0.24), top + round(phone_width * 0.24)),
+        (left + round(phone_width * 0.49), top + round(phone_width * 0.24)),
+        (left + round(phone_width * 0.24), top + round(phone_width * 0.49)),
+    ]
+    for cx, cy in camera_centers:
+        draw.ellipse((cx - camera_r, cy - camera_r, cx + camera_r, cy + camera_r), fill="#171717", outline="#777777")
+        highlight = max(1, camera_r // 3)
+        draw.ellipse((cx - highlight, cy - highlight, cx, cy), fill="#5f6872")
+    apple_center = (left + phone_width // 2, top + round(phone_height * 0.55))
+    apple_r = max(3, round(phone_width * 0.055))
+    draw.ellipse(
+        (apple_center[0] - apple_r, apple_center[1] - apple_r, apple_center[0] + apple_r, apple_center[1] + apple_r),
+        fill="#ddddda",
+    )
+    draw.rounded_rectangle(
+        (right, top, right + phone_width, top + phone_height),
+        radius=radius,
+        fill="#11171c",
+        outline=outline,
+        width=2,
+    )
+    screen_left = right + 3
+    screen_top = top + 3
+    screen_right = right + phone_width - 3
+    screen_bottom = top + phone_height - 3
+    for index in range(max(1, screen_bottom - screen_top)):
+        ratio = index / max(1, screen_bottom - screen_top - 1)
+        red = round(15 + 6 * ratio)
+        green = round(24 + 20 * ratio)
+        blue = round(31 + 28 * ratio)
+        draw.line((screen_left, screen_top + index, screen_right, screen_top + index), fill=(red, green, blue))
+    arc_width = max(1, round(phone_width * 0.025))
+    draw.arc(
+        (right - round(phone_width * 0.34), top + round(phone_height * 0.05), right + round(phone_width * 1.28), top + round(phone_height * 0.75)),
+        15,
+        145,
+        fill="#8aa6ac",
+        width=arc_width,
+    )
+    draw.arc(
+        (right - round(phone_width * 0.1), top + round(phone_height * 0.4), right + round(phone_width * 1.2), top + round(phone_height * 1.05)),
+        195,
+        330,
+        fill="#4b8e9b",
+        width=arc_width,
+    )
+    island_width = round(phone_width * 0.34)
+    draw.rounded_rectangle(
+        (
+            right + round((phone_width - island_width) / 2),
+            top + max(5, round(phone_width * 0.08)),
+            right + round((phone_width + island_width) / 2),
+            top + max(9, round(phone_width * 0.16)),
+        ),
+        radius=4,
+        fill="#050505",
+    )
+    return left, top, right + phone_width, top + phone_height
+
+
+def _jd_size_comparison_page(
+    source: Image.Image,
+    size: tuple[int, int],
+    product_info: dict[str, str],
+    adjustment: dict[str, Any] | None,
+) -> Image.Image:
+    canvas = Image.new("RGB", size, "#f3f3f3")
+    _draw_jd_elle_logo(canvas, size)
+    width, height = size
+    normalized = _normalize_adjustment(adjustment)
+    cutout = _product_cutout(_crop_source(source, adjustment))
+    body_left, body_top, body_right, body_bottom = _jd_product_body_bbox(cutout)
+    body_width = max(1, body_right - body_left)
+    body_height = max(1, body_bottom - body_top)
+
+    length_mm = _dimension_value_mm(product_info.get("product_length", "")) or 200.0
+    height_mm = _dimension_value_mm(product_info.get("product_height", ""))
+    if height_mm is None:
+        height_mm = max(60.0, length_mm * body_height / body_width)
+
+    portrait = height > width
+    product_max_width = width * (0.39 if portrait else 0.37)
+    product_max_height = height * (0.36 if portrait else 0.37)
+    preferred_product_width = width * 0.35 * max(0.82, min(1.08, length_mm / 205.0))
+    target_body_width = min(product_max_width, preferred_product_width)
+    product_scale = min(target_body_width / body_width, product_max_height / body_height)
+    product_scale *= normalized["zoom"]
+    resized_width = max(1, round(cutout.width * product_scale))
+    resized_height = max(1, round(cutout.height * product_scale))
+    cutout = cutout.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    scaled_body = (
+        round(body_left * product_scale),
+        round(body_top * product_scale),
+        round(body_right * product_scale),
+        round(body_bottom * product_scale),
+    )
+
+    desired_body_center_x = width * (0.34 if portrait else 0.34)
+    desired_body_bottom = height * (0.70 if portrait else 0.73)
+    desired_body_center_x += normalized["offset_x"] * width * 0.18
+    desired_body_bottom += normalized["offset_y"] * height * 0.18
+    paste_x = round(desired_body_center_x - (scaled_body[0] + scaled_body[2]) / 2)
+    paste_y = round(desired_body_bottom - scaled_body[3])
+    paste_x = min(max(8, paste_x), max(8, width - resized_width - 8))
+    paste_y = min(max(round(height * 0.16), paste_y), max(round(height * 0.16), height - resized_height - 35))
+    canvas.paste(cutout, (paste_x, paste_y), cutout)
+
+    rendered_body = (
+        paste_x + scaled_body[0],
+        paste_y + scaled_body[1],
+        paste_x + scaled_body[2],
+        paste_y + scaled_body[3],
+    )
+    draw = ImageDraw.Draw(canvas)
+    rendered_body_width = max(1, rendered_body[2] - rendered_body[0])
+    rendered_pixels_per_mm = rendered_body_width / max(1.0, length_mm)
+    phone_height = round(163.0 * rendered_pixels_per_mm * 0.7)
+    phone_height = max(round(height * 0.095), min(round(height * 0.205), phone_height))
+    phone_top = round(height * (0.47 if portrait else 0.45))
+    phone_box = _draw_jd_phone_reference(
+        canvas,
+        round(width * (0.75 if portrait else 0.75)),
+        phone_top,
+        phone_height,
+    )
+
+    ruler_gap = max(28, round(width * 0.045))
+    horizontal_y = min(height - 70, rendered_body[3] + ruler_gap)
+    _draw_jd_dimension_bar(
+        canvas,
+        (rendered_body[0], horizontal_y),
+        (rendered_body[2], horizontal_y),
+        _dimension_mm(product_info.get("product_length", "")),
+    )
+    vertical_x = max(30, rendered_body[0] - ruler_gap)
+    _draw_jd_dimension_bar(
+        canvas,
+        (vertical_x, rendered_body[1]),
+        (vertical_x, rendered_body[3]),
+        _dimension_mm(product_info.get("product_height", "")),
+        vertical=True,
+    )
+
+    phone_ruler_x = min(width - round(width * 0.10), phone_box[2] + max(28, round(width * 0.055)))
+    _draw_jd_dimension_bar(
+        canvas,
+        (phone_ruler_x, phone_box[1]),
+        (phone_ruler_x, phone_box[3]),
+        "163mm",
+        vertical=True,
+        vertical_label_side="right",
+    )
+    label_font = _font(max(13, round(min(size) * 0.02)))
+    phone_label = "iPhone 16 Pro Max"
+    label_box = draw.textbbox((0, 0), phone_label, font=label_font)
+    draw.text(
+        (round((phone_box[0] + phone_box[2] - (label_box[2] - label_box[0])) / 2), phone_box[3] + 12),
+        phone_label,
+        font=label_font,
+        fill="#555555",
+    )
+    return canvas
+
+
+def _render_jd_slot_image(
+    file_name: str,
+    image_ids: list[int],
+    product_info: dict[str, str],
+    adjustments: list[dict[str, Any]],
+    target_folder: str = "800",
+) -> Image.Image | None:
+    if not image_ids:
+        return None
+    size = (800, 800) if target_folder == "800" else (750, 1000)
+    source = _load_image(image_ids[0])
+    adjustment = adjustments[0] if adjustments else None
+    if file_name == "0-无logo.jpg":
+        return _jd_model_page(source, size, adjustment, with_logo=False)
+    if file_name == "1.jpg":
+        return _jd_model_page(source, size, adjustment, with_logo=True)
+    if file_name == "2.jpg":
+        return _jd_product_page(source, size, adjustment)
+    if file_name in {"3.jpg", "4.jpg"}:
+        return _jd_product_page(source, size, adjustment, detail=True)
+    if file_name == "5.jpg":
+        return _jd_size_comparison_page(source, size, product_info, adjustment)
+    if file_name == "透明.png":
+        return _normalized_product_page(source, transparent=True, adjustment=adjustment)
+    return None
+
+
+def _slot_map(slots: list[dict[str, Any]], platform: str = "vip") -> dict[str, dict[str, Any]]:
+    slot_map = {
+        item["file_name"]: {
+            "image_ids": [int(value) for value in item.get("image_ids", [])],
+            "adjustments": [
+                _normalize_adjustment(value if isinstance(value, dict) else None)
+                for value in item.get("adjustments", [])
+            ],
+        }
+        for item in slots
+    }
+    # Linked model layouts always use one source image.
+    if platform == "jd" and "0-无logo.jpg" in slot_map:
+        slot_map.setdefault("1.jpg", {"image_ids": [], "adjustments": []})
+        slot_map["1.jpg"]["image_ids"] = list(slot_map["0-无logo.jpg"]["image_ids"])
+    elif "1.jpg" in slot_map:
+        slot_map.setdefault("50.jpg", {"image_ids": [], "adjustments": []})
+        slot_map["50.jpg"]["image_ids"] = list(slot_map["1.jpg"]["image_ids"])
     return slot_map
 
 
-def _validate_slot_map(session_id: str, slot_map: dict[str, list[int]]) -> None:
-    model_slots = {"1.jpg", "50.jpg", "601.jpg", "602.jpg", "603.jpg"}
+def _validate_slot_map(session_id: str, slot_map: dict[str, dict[str, Any]], platform: str = "vip") -> None:
+    model_slots = {"0-无logo.jpg", "1.jpg"} if platform == "jd" else {"1.jpg", "50.jpg", "601.jpg", "602.jpg", "603.jpg"}
+    tag_name = None if platform == "jd" else "801.jpg"
     _validate_session_assets(session_id, {
-        "model": [image_id for name in model_slots for image_id in slot_map.get(name, [])],
-        "tag": slot_map.get("801.jpg", []),
+        "model": [
+            image_id
+            for name in model_slots
+            for image_id in slot_map.get(name, {}).get("image_ids", [])
+        ],
+        "tag": slot_map.get(tag_name, {}).get("image_ids", []) if tag_name else [],
         "product": [
             image_id
-            for name, image_ids in slot_map.items()
-            if name not in model_slots and name != "801.jpg"
-            for image_id in image_ids
+            for name, slot in slot_map.items()
+            if name not in model_slots and name != tag_name
+            for image_id in slot.get("image_ids", [])
         ],
     })
 
 
-def _render_slot_image(file_name: str, image_ids: list[int], product_info: dict[str, str]) -> Image.Image | None:
+def _render_slot_image(
+    file_name: str,
+    image_ids: list[int],
+    product_info: dict[str, str],
+    adjustments: list[dict[str, Any]] | None = None,
+    platform: str = "vip",
+    target_folder: str = "800",
+) -> Image.Image | None:
+    adjustments = adjustments or []
+    if platform == "jd":
+        return _render_jd_slot_image(file_name, image_ids, product_info, adjustments, target_folder)
+    adjustment = adjustments[0] if adjustments else None
     if file_name == "401.jpg":
         source = _load_image(image_ids[0]) if image_ids else None
-        return _info_page(product_info, source)
+        return _info_page(product_info, source, adjustment)
     if file_name == "606.jpg":
-        return _multi_angle_page(image_ids) if len(image_ids) >= 4 else None
+        return _multi_angle_page(image_ids, adjustments) if len(image_ids) >= 4 else None
     if not image_ids:
         return None
 
     source = _load_image(image_ids[0])
     if file_name == "1.jpg":
-        return _fit(source, (800, 800))
+        canvas = Image.new("RGB", (800, 800), "white")
+        _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, 800, 800), adjustment, mode="cover")
+        return canvas
     if file_name == "30.png":
-        return _normalized_product_page(source, transparent=True)
+        return _normalized_product_page(source, transparent=True, adjustment=adjustment)
     if file_name == "50.jpg":
-        return _fit(source, (950, 1200))
+        canvas = Image.new("RGB", (950, 1200), "white")
+        _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, 950, 1200), adjustment, mode="cover")
+        return canvas
     if file_name in {"4.jpg", "15.jpg"}:
-        return _fit(source, (800, 800), contain=True)
+        canvas = Image.new("RGB", (800, 800), "white")
+        _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, 800, 800), adjustment)
+        return canvas
     if file_name in {"601.jpg", "602.jpg", "603.jpg"}:
-        return _model_showcase_page(source)
+        return _model_showcase_page(source, adjustment)
     if file_name in {"604.jpg", "605.jpg"}:
-        return _detail_showcase_page(source)
+        return _detail_showcase_page(source, adjustment)
     if file_name == "801.jpg":
-        return _normalized_product_page(source, size=(750, 750), box=(90, 105, 660, 665))
-    return _catalog_product_page(source)
+        return _normalized_product_page(source, size=(750, 750), box=(90, 105, 660, 665), adjustment=adjustment)
+    return _catalog_product_page(source, adjustment)
 
 
 def _save_slot_image(image: Image.Image, file_name: str, output: Path) -> None:
@@ -1456,14 +1988,54 @@ def _preview_lock(session_id: str) -> Lock:
         return _PREVIEW_LOCKS.setdefault(session_id, Lock())
 
 
-def render_previews(session_id: str, slots: list[dict[str, Any]], product_info: dict[str, str]) -> dict[str, Any]:
+def render_previews(
+    session_id: str,
+    slots: list[dict[str, Any]],
+    product_info: dict[str, str],
+    platform: str = "vip",
+) -> dict[str, Any]:
     with _preview_lock(session_id):
-        return _render_previews(session_id, slots, product_info)
+        return _render_previews(session_id, slots, product_info, platform)
 
 
-def _render_previews(session_id: str, slots: list[dict[str, Any]], product_info: dict[str, str]) -> dict[str, Any]:
-    slot_map = _slot_map(slots)
-    _validate_slot_map(session_id, slot_map)
+def render_slot_preview(
+    session_id: str,
+    slots: list[dict[str, Any]],
+    product_info: dict[str, str],
+    file_name: str,
+    platform: str = "vip",
+) -> dict[str, str]:
+    slot_definitions = _platform_slot_definitions(platform)
+    valid_names = {name for name, _, _, _ in slot_definitions}
+    if file_name not in valid_names:
+        raise ValueError("输出位置不存在")
+    with _preview_lock(session_id):
+        slot_map = _slot_map(slots, platform)
+        _validate_slot_map(session_id, slot_map, platform)
+        slot = slot_map.get(file_name, {"image_ids": [], "adjustments": []})
+        image = _render_slot_image(file_name, slot["image_ids"], product_info, slot["adjustments"], platform)
+        if image is None:
+            raise ValueError("当前输出位置缺少素材")
+        preview_id = uuid.uuid4().hex[:12]
+        folder = _session_result_dir(session_id) / "previews" / preview_id
+        folder.mkdir(parents=True, exist_ok=True)
+        output = folder / file_name
+        _save_slot_image(image, file_name, output)
+        return {
+            "file_name": file_name,
+            "preview_url": f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}",
+        }
+
+
+def _render_previews(
+    session_id: str,
+    slots: list[dict[str, Any]],
+    product_info: dict[str, str],
+    platform: str = "vip",
+) -> dict[str, Any]:
+    slot_definitions = _platform_slot_definitions(platform)
+    slot_map = _slot_map(slots, platform)
+    _validate_slot_map(session_id, slot_map, platform)
     preview_id = uuid.uuid4().hex[:12]
     preview_root = _session_result_dir(session_id) / "previews"
     folder = preview_root / preview_id
@@ -1471,8 +2043,9 @@ def _render_previews(session_id: str, slots: list[dict[str, Any]], product_info:
     previews: dict[str, str] = {}
     missing: list[str] = []
 
-    for file_name, _, _, _ in SLOT_DEFINITIONS:
-        image = _render_slot_image(file_name, slot_map.get(file_name, []), product_info)
+    for file_name, _, _, _ in slot_definitions:
+        slot = slot_map.get(file_name, {"image_ids": [], "adjustments": []})
+        image = _render_slot_image(file_name, slot["image_ids"], product_info, slot["adjustments"], platform)
         if image is None:
             missing.append(file_name)
             continue
@@ -1490,32 +2063,65 @@ def _render_previews(session_id: str, slots: list[dict[str, Any]], product_info:
     return {"previews": previews, "missing": missing}
 
 
-def export_package(session_id: str, slots: list[dict[str, Any]], product_info: dict[str, str]) -> dict[str, Any]:
-    slot_map = _slot_map(slots)
-    _validate_slot_map(session_id, slot_map)
+def export_package(
+    session_id: str,
+    slots: list[dict[str, Any]],
+    product_info: dict[str, str],
+    platform: str = "vip",
+) -> dict[str, Any]:
+    slot_definitions = _platform_slot_definitions(platform)
+    slot_map = _slot_map(slots, platform)
+    _validate_slot_map(session_id, slot_map, platform)
     export_id = uuid.uuid4().hex[:12]
     session_result_dir = _session_result_dir(session_id)
     folder = session_result_dir / export_id
     folder.mkdir(parents=True, exist_ok=True)
     missing: list[str] = []
 
-    for file_name, _, _, _ in SLOT_DEFINITIONS:
-        output = folder / file_name
-        image = _render_slot_image(file_name, slot_map.get(file_name, []), product_info)
-        if image is None:
-            missing.append(file_name)
-            continue
-        _save_slot_image(image, file_name, output)
+    if platform == "jd":
+        output_folders = {"800": folder / "800", "750": folder / "750"}
+        for output_folder in output_folders.values():
+            output_folder.mkdir(parents=True, exist_ok=True)
+        for file_name, _, _, _ in slot_definitions:
+            targets = ["800"] if file_name in {"0-无logo.jpg", "透明.png"} else ["800", "750"]
+            slot = slot_map.get(file_name, {"image_ids": [], "adjustments": []})
+            for target in targets:
+                image = _render_slot_image(
+                    file_name,
+                    slot["image_ids"],
+                    product_info,
+                    slot["adjustments"],
+                    platform,
+                    target,
+                )
+                if image is None:
+                    missing.append(f"{target}/{file_name}")
+                    continue
+                _save_slot_image(image, file_name, output_folders[target] / file_name)
+    else:
+        for file_name, _, _, _ in slot_definitions:
+            output = folder / file_name
+            slot = slot_map.get(file_name, {"image_ids": [], "adjustments": []})
+            image = _render_slot_image(file_name, slot["image_ids"], product_info, slot["adjustments"])
+            if image is None:
+                missing.append(file_name)
+                continue
+            _save_slot_image(image, file_name, output)
 
-    zip_path = session_result_dir / f"唯品会套图_{export_id}.zip"
+    platform_label = "京东" if platform == "jd" else "唯品会"
+    zip_path = session_result_dir / f"{platform_label}套图_{export_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(folder.iterdir()):
-            archive.write(path, arcname=path.name)
-    previews = [
-        f"/api/vip-organizer/exports/{session_id}/{export_id}/files/{path.name}"
-        for path in sorted(folder.iterdir())
-        if path.suffix.lower() in {".jpg", ".png"}
-    ]
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                archive.write(path, arcname=path.relative_to(folder).as_posix())
+    preview_paths = [path for path in sorted(folder.rglob("*")) if path.suffix.lower() in {".jpg", ".png"}]
+    previews = []
+    for path in preview_paths:
+        relative = path.relative_to(folder)
+        if len(relative.parts) == 2:
+            previews.append(f"/api/vip-organizer/exports/{session_id}/{export_id}/files/{relative.parts[0]}/{relative.parts[1]}")
+        else:
+            previews.append(f"/api/vip-organizer/exports/{session_id}/{export_id}/files/{path.name}")
     return {
         "download_url": f"/api/vip-organizer/exports/{session_id}/{export_id}/download",
         "previews": previews,
@@ -1524,17 +2130,34 @@ def export_package(session_id: str, slots: list[dict[str, Any]], product_info: d
     }
 
 
-def export_file(session_id: str, export_id: str, file_name: str) -> Path:
-    if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", export_id) or not re.fullmatch(r"[0-9]+\.(?:jpg|png)", file_name):
+def _valid_output_file_name(file_name: str) -> bool:
+    allowed = {
+        name
+        for definitions in (SLOT_DEFINITIONS, JD_SLOT_DEFINITIONS)
+        for name, _, _, _ in definitions
+    }
+    return file_name in allowed
+
+
+def export_file(session_id: str, export_id: str, file_name: str, folder_name: str | None = None) -> Path:
+    if (
+        not _valid_session_id(session_id)
+        or not re.fullmatch(r"[0-9a-f]{12}", export_id)
+        or not _valid_output_file_name(file_name)
+        or (folder_name is not None and folder_name not in {"800", "750"})
+    ):
         raise ValueError("导出文件不存在")
-    path = _session_result_dir(session_id) / export_id / file_name
+    path = _session_result_dir(session_id) / export_id
+    if folder_name:
+        path /= folder_name
+    path /= file_name
     if not path.is_file():
         raise ValueError("导出文件不存在")
     return path
 
 
 def preview_file(session_id: str, preview_id: str, file_name: str) -> Path:
-    if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", preview_id) or not re.fullmatch(r"[0-9]+\.(?:jpg|png)", file_name):
+    if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", preview_id) or not _valid_output_file_name(file_name):
         raise ValueError("预览文件不存在")
     path = _session_result_dir(session_id) / "previews" / preview_id / file_name
     if not path.is_file():
@@ -1545,7 +2168,7 @@ def preview_file(session_id: str, preview_id: str, file_name: str) -> Path:
 def export_zip(session_id: str, export_id: str) -> Path:
     if not _valid_session_id(session_id) or not re.fullmatch(r"[0-9a-f]{12}", export_id):
         raise ValueError("导出文件不存在")
-    path = _session_result_dir(session_id) / f"唯品会套图_{export_id}.zip"
-    if not path.is_file():
+    matches = list(_session_result_dir(session_id).glob(f"*套图_{export_id}.zip"))
+    if len(matches) != 1 or not matches[0].is_file():
         raise ValueError("导出文件不存在")
-    return path
+    return matches[0]

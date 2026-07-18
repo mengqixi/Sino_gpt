@@ -306,14 +306,53 @@ class VipOrganizerClassificationTests(unittest.TestCase):
 
     def test_slot_map_links_the_two_model_output_sizes(self):
         mapped = _slot_map([
-            {"file_name": "1.jpg", "image_ids": [7]},
-            {"file_name": "50.jpg", "image_ids": [9]},
+            {
+                "file_name": "1.jpg",
+                "image_ids": [7],
+                "adjustments": [{"zoom": 1.2, "offset_x": 0.1}],
+            },
+            {
+                "file_name": "50.jpg",
+                "image_ids": [9],
+                "adjustments": [{"zoom": 0.8, "offset_y": -0.1}],
+            },
             {"file_name": "2.jpg", "image_ids": [3]},
         ])
 
-        self.assertEqual(mapped["1.jpg"], [7])
-        self.assertEqual(mapped["50.jpg"], [7])
-        self.assertEqual(mapped["2.jpg"], [3])
+        self.assertEqual(mapped["1.jpg"]["image_ids"], [7])
+        self.assertEqual(mapped["50.jpg"]["image_ids"], [7])
+        self.assertEqual(mapped["2.jpg"]["image_ids"], [3])
+        self.assertEqual(mapped["1.jpg"]["adjustments"][0]["zoom"], 1.2)
+        self.assertEqual(mapped["50.jpg"]["adjustments"][0]["zoom"], 0.8)
+
+    def test_manual_adjustment_moves_and_scales_without_changing_source_color(self):
+        source = Image.new("RGB", (320, 480), "#b52226")
+        adjustment = {
+            "zoom": 1.35,
+            "offset_x": 0.16,
+            "offset_y": -0.08,
+            "crop_x": 0,
+            "crop_y": 0,
+            "crop_width": 1,
+            "crop_height": 1,
+        }
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=source):
+            automatic = _render_slot_image("4.jpg", [11], {})
+            adjusted = _render_slot_image("4.jpg", [11], {}, [adjustment])
+
+        self.assertIsNotNone(automatic)
+        self.assertIsNotNone(adjusted)
+        assert automatic is not None and adjusted is not None
+        white = Image.new("RGB", adjusted.size, "white")
+        automatic_bbox = ImageChops.difference(automatic, white).getbbox()
+        adjusted_bbox = ImageChops.difference(adjusted, white).getbbox()
+        self.assertIsNotNone(automatic_bbox)
+        self.assertIsNotNone(adjusted_bbox)
+        assert automatic_bbox is not None and adjusted_bbox is not None
+        self.assertGreater(adjusted_bbox[2] - adjusted_bbox[0], automatic_bbox[2] - automatic_bbox[0])
+        self.assertGreater((adjusted_bbox[0] + adjusted_bbox[2]) / 2, (automatic_bbox[0] + automatic_bbox[2]) / 2)
+        self.assertEqual(adjusted.getpixel((400, 400)), (181, 34, 38))
 
     def test_slot_selection_keeps_semi_side_separate_from_front(self):
         samples = [

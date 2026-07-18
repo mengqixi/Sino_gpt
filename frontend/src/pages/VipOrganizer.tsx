@@ -1,4 +1,4 @@
-import { CheckCircle2, Download, FileImage, LoaderCircle, RefreshCw, UploadCloud, X } from "lucide-react";
+import { CheckCircle2, Crop, Download, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
 import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
@@ -20,6 +20,17 @@ type Slot = {
   image_ids: number[];
   confidence: number;
   reason: string;
+  adjustments?: ImageAdjustment[];
+};
+
+type ImageAdjustment = {
+  zoom: number;
+  offset_x: number;
+  offset_y: number;
+  crop_x: number;
+  crop_y: number;
+  crop_width: number;
+  crop_height: number;
 };
 
 type ApiRoleNote = {
@@ -58,8 +69,23 @@ const TAG_LABELS = Object.fromEntries(DETAIL_TAG_OPTIONS) as Record<string, stri
 const SUPPORTED_IMAGE_NAME = /\.(jpe?g|png|webp)$/i;
 const ORGANIZER_PLATFORMS = [
   { id: "vip", label: "唯品会", available: true },
-  { id: "jd", label: "京东", available: false }
+  { id: "jd", label: "京东", available: true }
 ] as const;
+type OrganizerPlatform = "vip" | "jd";
+
+const DEFAULT_ADJUSTMENT: ImageAdjustment = {
+  zoom: 1,
+  offset_x: 0,
+  offset_y: 0,
+  crop_x: 0,
+  crop_y: 0,
+  crop_width: 1,
+  crop_height: 1
+};
+
+function normalizeAdjustment(value?: Partial<ImageAdjustment>): ImageAdjustment {
+  return { ...DEFAULT_ADJUSTMENT, ...(value || {}) };
+}
 
 function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onPreview }: {
   title: string;
@@ -123,6 +149,237 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
   );
 }
 
+function SlotAdjustmentEditor({
+  sessionId,
+  slot,
+  sourceIndex,
+  sourceUrl,
+  initialPreview,
+  slots,
+  productInfo,
+  platform,
+  onClose,
+  onSave
+}: {
+  sessionId: string;
+  slot: Slot;
+  sourceIndex: number;
+  sourceUrl: string;
+  initialPreview?: string;
+  slots: Slot[];
+  productInfo: Record<string, string>;
+  platform: OrganizerPlatform;
+  onClose: () => void;
+  onSave: (adjustment: ImageAdjustment, previewUrl?: string) => void;
+}) {
+  const initial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
+  const [draft, setDraft] = useState<ImageAdjustment>(initial);
+  const [renderedPreview, setRenderedPreview] = useState(initialPreview || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [cropMode, setCropMode] = useState(false);
+  const [cropSelection, setCropSelection] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const sourceStageRef = useRef<HTMLDivElement>(null);
+  const sourceImageRef = useRef<HTMLImageElement>(null);
+  const cropStartRef = useRef<{ x: number; y: number } | null>(null);
+  const cropSelectionRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
+  const moveStartRef = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(null);
+  const previewRequestRef = useRef(0);
+
+  function slotsWithDraft() {
+    return slots.map((item) => {
+      if (item.file_name !== slot.file_name) return item;
+      const adjustments = [...(item.adjustments || [])];
+      while (adjustments.length <= sourceIndex) adjustments.push({ ...DEFAULT_ADJUSTMENT });
+      adjustments[sourceIndex] = draft;
+      return { ...item, adjustments };
+    });
+  }
+
+  async function refreshPreview() {
+    const requestId = ++previewRequestRef.current;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.previewVipOrganizerSlot({
+        session_id: sessionId,
+        slots: slotsWithDraft(),
+        product_info: productInfo,
+        file_name: slot.file_name,
+        platform
+      });
+      if (requestId === previewRequestRef.current) setRenderedPreview(result.preview_url);
+    } catch (requestError: any) {
+      if (requestId === previewRequestRef.current) setError(requestError.message || "当前输出预览生成失败");
+    } finally {
+      if (requestId === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    const timer = window.setTimeout(refreshPreview, 260);
+    return () => window.clearTimeout(timer);
+  }, [draft]);
+
+  function displayedImageRect() {
+    const stage = sourceStageRef.current;
+    const image = sourceImageRef.current;
+    if (!stage || !image?.naturalWidth || !image.naturalHeight) return null;
+    const stageWidth = stage.clientWidth;
+    const stageHeight = stage.clientHeight;
+    const scale = Math.min(stageWidth / image.naturalWidth, stageHeight / image.naturalHeight);
+    const width = image.naturalWidth * scale;
+    const height = image.naturalHeight * scale;
+    return { left: (stageWidth - width) / 2, top: (stageHeight - height) / 2, width, height };
+  }
+
+  function sourcePoint(clientX: number, clientY: number) {
+    const stage = sourceStageRef.current;
+    const imageRect = displayedImageRect();
+    if (!stage || !imageRect) return null;
+    const bounds = stage.getBoundingClientRect();
+    const x = Math.max(imageRect.left, Math.min(imageRect.left + imageRect.width, clientX - bounds.left));
+    const y = Math.max(imageRect.top, Math.min(imageRect.top + imageRect.height, clientY - bounds.top));
+    return { x, y, imageRect };
+  }
+
+  function finishCrop() {
+    const selection = cropSelectionRef.current;
+    const imageRect = displayedImageRect();
+    cropStartRef.current = null;
+    if (!selection || !imageRect || selection.width < 8 || selection.height < 8) return;
+    setDraft((current) => ({
+      ...current,
+      crop_x: (selection.left - imageRect.left) / imageRect.width,
+      crop_y: (selection.top - imageRect.top) / imageRect.height,
+      crop_width: selection.width / imageRect.width,
+      crop_height: selection.height / imageRect.height,
+      zoom: 1,
+      offset_x: 0,
+      offset_y: 0
+    }));
+    setCropMode(false);
+    cropSelectionRef.current = null;
+    setCropSelection(null);
+  }
+
+  function changeZoom(delta: number) {
+    setDraft((current) => ({ ...current, zoom: Math.max(0.5, Math.min(4, Math.round((current.zoom + delta) * 20) / 20)) }));
+  }
+
+  function reset() {
+    setDraft({ ...DEFAULT_ADJUSTMENT });
+    cropSelectionRef.current = null;
+    setCropSelection(null);
+    setCropMode(false);
+  }
+
+  return (
+    <div className="slot-adjustment-modal" role="dialog" aria-modal="true" aria-label={`调整 ${slot.file_name}`} onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="slot-adjustment-dialog">
+        <header>
+          <div>
+            <strong>{slot.file_name} · {slot.title}</strong>
+            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : "当前输出位置独立调整"}</span>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} title="关闭"><X size={21} /></button>
+        </header>
+
+        <div className="slot-adjustment-workspace">
+          <div className="slot-adjustment-source">
+            <div className="slot-adjustment-heading">
+              <strong>原始图片</strong>
+              <span>{cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
+            </div>
+            <div
+              ref={sourceStageRef}
+              className={`slot-source-stage${cropMode ? " is-cropping" : ""}`}
+              onPointerDown={(event) => {
+                if (!cropMode) return;
+                const point = sourcePoint(event.clientX, event.clientY);
+                if (!point) return;
+                event.currentTarget.setPointerCapture(event.pointerId);
+                cropStartRef.current = { x: point.x, y: point.y };
+                const nextSelection = { left: point.x, top: point.y, width: 0, height: 0 };
+                cropSelectionRef.current = nextSelection;
+                setCropSelection(nextSelection);
+              }}
+              onPointerMove={(event) => {
+                if (!cropMode || !cropStartRef.current) return;
+                const point = sourcePoint(event.clientX, event.clientY);
+                if (!point) return;
+                const start = cropStartRef.current;
+                const nextSelection = {
+                  left: Math.min(start.x, point.x),
+                  top: Math.min(start.y, point.y),
+                  width: Math.abs(point.x - start.x),
+                  height: Math.abs(point.y - start.y)
+                };
+                cropSelectionRef.current = nextSelection;
+                setCropSelection(nextSelection);
+              }}
+              onPointerUp={finishCrop}
+            >
+              <img ref={sourceImageRef} src={sourceUrl} alt="原始素材" draggable={false} />
+              {cropSelection && <div className="slot-crop-selection" style={cropSelection} />}
+            </div>
+          </div>
+
+          <div className="slot-adjustment-result">
+            <div className="slot-adjustment-heading">
+              <strong>模板成品预览</strong>
+              <span>拖动图片定位，滚轮缩放</span>
+            </div>
+            <div
+              className={`slot-result-stage${busy ? " is-loading" : ""}`}
+              onWheel={(event) => {
+                event.preventDefault();
+                changeZoom(event.deltaY < 0 ? 0.05 : -0.05);
+              }}
+              onPointerDown={(event) => {
+                event.currentTarget.setPointerCapture(event.pointerId);
+                moveStartRef.current = { x: event.clientX, y: event.clientY, offsetX: draft.offset_x, offsetY: draft.offset_y };
+              }}
+              onPointerMove={(event) => {
+                const start = moveStartRef.current;
+                if (!start) return;
+                const bounds = event.currentTarget.getBoundingClientRect();
+                setDraft((current) => ({
+                  ...current,
+                  offset_x: Math.max(-1.5, Math.min(1.5, start.offsetX + (event.clientX - start.x) / bounds.width)),
+                  offset_y: Math.max(-1.5, Math.min(1.5, start.offsetY + (event.clientY - start.y) / bounds.height))
+                }));
+              }}
+              onPointerUp={() => { moveStartRef.current = null; }}
+            >
+              {renderedPreview ? <img src={renderedPreview} alt={`${slot.file_name} 模板预览`} draggable={false} /> : <FileImage size={38} />}
+              {busy && <span className="slot-preview-loading"><LoaderCircle className="spin" size={20} />更新中</span>}
+            </div>
+          </div>
+        </div>
+
+        <div className="slot-adjustment-controls">
+          <button type="button" className={cropMode ? "active-tool" : ""} onClick={() => {
+            setCropMode((current) => !current);
+            cropSelectionRef.current = null;
+            setCropSelection(null);
+          }}><Crop size={18} />裁剪</button>
+          <button type="button" onClick={() => changeZoom(-0.1)}><ZoomOut size={18} />缩小</button>
+          <span className="slot-zoom-value">{Math.round(draft.zoom * 100)}%</span>
+          <button type="button" onClick={() => changeZoom(0.1)}><ZoomIn size={18} />放大</button>
+          <button type="button" onClick={reset}><RotateCcw size={18} />恢复自动</button>
+          <button type="button" disabled={busy} onClick={refreshPreview}><RefreshCw size={18} />重试预览</button>
+          <span className="slot-drag-hint"><Move size={16} />位置 {Math.round(draft.offset_x * 100)} / {Math.round(draft.offset_y * 100)}</span>
+          <button type="button" className="primary" disabled={busy || !renderedPreview} onClick={() => onSave(draft, renderedPreview)}><Save size={18} />保存调整</button>
+        </div>
+        {error && <div className="alert warning">{error}</div>}
+      </section>
+    </div>
+  );
+}
+
 export default function VipOrganizer() {
   const sessionStorageKey = "vip-organizer-session-id";
   const [sessionId, setSessionId] = useState("");
@@ -133,6 +390,7 @@ export default function VipOrganizer() {
   const [models, setModels] = useState<UploadItem[]>([]);
   const [tags, setTags] = useState<UploadItem[]>([]);
   const [slots, setSlots] = useState<Slot[]>([]);
+  const [platform, setPlatform] = useState<OrganizerPlatform>("vip");
   const [assets, setAssets] = useState<Record<string, any[]>>({ product: [], model: [], tag: [] });
   const [assetRoles, setAssetRoles] = useState<Record<number, string>>({});
   const [assetTags, setAssetTags] = useState<Record<number, string[]>>({});
@@ -143,6 +401,7 @@ export default function VipOrganizer() {
   const [message, setMessage] = useState("");
   const [slotPreviews, setSlotPreviews] = useState<Record<string, string>>({});
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [adjustmentEditor, setAdjustmentEditor] = useState<{ fileName: string; sourceIndex: number } | null>(null);
   const previewRequestRef = useRef(0);
   const previewQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [preview, setPreview] = useState<string | null>(null);
@@ -177,7 +436,8 @@ export default function VipOrganizer() {
       const payload = {
         session_id: sessionId,
         slots,
-        product_info: organizerProductInfo()
+        product_info: organizerProductInfo(),
+        platform
       };
       const queued = previewQueueRef.current.catch(() => undefined).then(async () => {
         if (requestId !== previewRequestRef.current) return;
@@ -207,7 +467,7 @@ export default function VipOrganizer() {
       previewQueueRef.current = queued;
     }, 520);
     return () => window.clearTimeout(timer);
-  }, [sessionId, slots, info]);
+  }, [sessionId, slots, info, platform]);
 
   useEffect(() => {
     api.getApiConfigs("text_analysis")
@@ -275,6 +535,7 @@ export default function VipOrganizer() {
     setAssetTags({});
     setApiRoleNotes({});
     setSlotPreviews({});
+    setAdjustmentEditor(null);
   }
 
   async function ensureSession() {
@@ -331,7 +592,7 @@ export default function VipOrganizer() {
     }
   }
 
-  async function analyze(rolesOverride?: Record<number, string>) {
+  async function analyze(rolesOverride?: Record<number, string>, platformOverride: OrganizerPlatform = platform) {
     if (!products.length) return setMessage("请先上传商品原图");
     setBusy(true);
     setMessage("");
@@ -343,10 +604,12 @@ export default function VipOrganizer() {
         model_image_ids: models.map((item) => item.image_id),
         tag_image_ids: tags.map((item) => item.image_id),
         asset_roles: rolesOverride || assetRoles,
-        asset_tags: assetTags
+        asset_tags: assetTags,
+        platform: platformOverride
       });
       setSlots(result.slots);
       setAssets(result.assets);
+      setAdjustmentEditor(null);
       setMessage("已生成自动整理初稿。黄色或红色可信度项目需要重点确认。");
     } catch (error: any) {
       setMessage(error.message);
@@ -385,11 +648,13 @@ export default function VipOrganizer() {
         model_image_ids: models.map((item) => item.image_id),
         tag_image_ids: tags.map((item) => item.image_id),
         asset_roles: nextRoles,
-        asset_tags: nextTags
+        asset_tags: nextTags,
+        platform
       });
       setSlots(result.slots);
       setAssets(result.assets);
       setSlotPreviews({});
+      setAdjustmentEditor(null);
       setMessage("API 已完成一次素材分类，并按固定标签重新整理。请检查低可信度位置。");
     } catch (error: any) {
       setMessage(error.message);
@@ -437,18 +702,45 @@ export default function VipOrganizer() {
 
   function updateSlot(fileName: string, index: number, value: number) {
     setSlots((current) => current.map((slot) => {
-      const linkedModelSlot = fileName === "1.jpg" || fileName === "50.jpg";
-      const shouldUpdate = slot.file_name === fileName || (linkedModelSlot && (slot.file_name === "1.jpg" || slot.file_name === "50.jpg"));
+      const linkedNames = platform === "jd" ? ["0-无logo.jpg", "1.jpg"] : ["1.jpg", "50.jpg"];
+      const linkedModelSlot = linkedNames.includes(fileName);
+      const shouldUpdate = slot.file_name === fileName || (linkedModelSlot && linkedNames.includes(slot.file_name));
       if (!shouldUpdate) return slot;
       const next = [...slot.image_ids];
       next[index] = value;
+      const adjustments = [...(slot.adjustments || [])];
+      while (adjustments.length <= index) adjustments.push({ ...DEFAULT_ADJUSTMENT });
+      adjustments[index] = { ...DEFAULT_ADJUSTMENT };
       return {
         ...slot,
         image_ids: next.filter(Boolean),
+        adjustments,
         confidence: 100,
-        reason: linkedModelSlot ? "1.jpg与50.jpg已同步使用同一张模特图" : "已由设计师人工确认",
+        reason: linkedModelSlot ? `${linkedNames.join("与")}已同步使用同一张模特图` : "已由设计师人工确认",
       };
     }));
+  }
+
+  function openAdjustmentEditor(fileName: string, sourceIndex = 0) {
+    const slot = slots.find((item) => item.file_name === fileName);
+    if (!slot?.image_ids[sourceIndex]) {
+      setMessage("当前输出位置还没有可调整的来源图片");
+      return;
+    }
+    setAdjustmentEditor({ fileName, sourceIndex });
+  }
+
+  function saveSlotAdjustment(fileName: string, sourceIndex: number, adjustment: ImageAdjustment, previewUrl?: string) {
+    setSlots((current) => current.map((slot) => {
+      if (slot.file_name !== fileName) return slot;
+      const adjustments = [...(slot.adjustments || [])];
+      while (adjustments.length <= sourceIndex) adjustments.push({ ...DEFAULT_ADJUSTMENT });
+      adjustments[sourceIndex] = normalizeAdjustment(adjustment);
+      return { ...slot, adjustments };
+    }));
+    if (previewUrl) setSlotPreviews((current) => ({ ...current, [fileName]: previewUrl }));
+    setAdjustmentEditor(null);
+    setMessage(`${fileName} 的裁剪、缩放和位置已保存`);
   }
 
   function selectedAsset(id?: number) {
@@ -472,7 +764,8 @@ export default function VipOrganizer() {
       const result = await api.exportVipOrganizer({
         session_id: sessionId,
         slots,
-        product_info: organizerProductInfo()
+        product_info: organizerProductInfo(),
+        platform
       });
       const anchor = document.createElement("a");
       anchor.href = result.download_url;
@@ -480,13 +773,31 @@ export default function VipOrganizer() {
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
-      setMessage(result.missing.length ? `ZIP 已下载，共 ${result.generated_count} 张，缺少：${result.missing.join("、")}` : "15 张唯品会套图 ZIP 已开始下载。");
+      const platformName = platform === "jd" ? "京东" : "唯品会";
+      setMessage(result.missing.length ? `ZIP 已下载，共 ${result.generated_count} 张，缺少：${result.missing.join("、")}` : `${platformName}套图 ZIP 已开始下载。`);
     } catch (error: any) {
       setMessage(error.message);
     } finally {
       setBusy(false);
     }
   }
+
+  async function changePlatform(nextPlatform: OrganizerPlatform) {
+    if (nextPlatform === platform) return;
+    setPlatform(nextPlatform);
+    setSlotPreviews({});
+    setAdjustmentEditor(null);
+    if (products.length && slots.length) {
+      await analyze(undefined, nextPlatform);
+    }
+  }
+
+  const activeEditorSlot = adjustmentEditor
+    ? slots.find((slot) => slot.file_name === adjustmentEditor.fileName)
+    : undefined;
+  const activeEditorAsset = activeEditorSlot && adjustmentEditor
+    ? selectedAsset(activeEditorSlot.image_ids[adjustmentEditor.sourceIndex])
+    : undefined;
 
   return (
     <section className="page organizer-page">
@@ -509,6 +820,30 @@ export default function VipOrganizer() {
           <UploadSection title="商品原图" hint="一次可多选；正面、侧面、背面、Logo、内里、透明图等" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onPreview={setPreview} />
           <UploadSection title="模特图" hint="一次可多选；建议至少3张，系统分别用于主图和详情页" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onPreview={setPreview} />
           <UploadSection title="吊牌图" hint="可选；用于801.jpg" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onPreview={setPreview} />
+        </div>
+      </section>
+
+      <section className="panel organizer-platform-panel">
+        <div className="organizer-platform-switcher" aria-label="输出平台">
+          <div>
+            <strong>输出平台</strong>
+            <span>不同平台使用独立的尺寸、模板、文件命名和ZIP目录</span>
+          </div>
+          <div className="organizer-platform-tabs" role="tablist" aria-label="选择输出平台">
+            {ORGANIZER_PLATFORMS.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                aria-selected={item.id === platform}
+                className={item.id === platform ? "active" : ""}
+                disabled={busy}
+                onClick={() => changePlatform(item.id)}
+              >
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -587,41 +922,28 @@ export default function VipOrganizer() {
         </section>
 
         <section className="panel organizer-slots-panel">
-          <div className="organizer-platform-switcher" aria-label="输出平台">
-            <div>
-              <strong>输出平台</strong>
-              <span>不同平台使用独立的尺寸、模板与文件命名</span>
-            </div>
-            <div className="organizer-platform-tabs" role="tablist" aria-label="选择输出平台">
-              {ORGANIZER_PLATFORMS.map((platform) => (
-                <button
-                  key={platform.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={platform.id === "vip"}
-                  className={platform.id === "vip" ? "active" : ""}
-                  disabled={!platform.available}
-                >
-                  <span>{platform.label}</span>
-                  {!platform.available && <small>待接入</small>}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="section-title-row"><div><h2>4. 检查15个输出位置</h2><p>左侧为最终模板成品预览；换图或修改商品信息后会自动更新，点击图片可放大。</p></div>{previewBusy && <span className="organizer-preview-status"><LoaderCircle className="spin" size={16} />正在更新成品预览</span>}</div>
+          <div className="section-title-row"><div><h2>4. 检查{platform === "jd" ? "京东7个输出位置" : "15个输出位置"}</h2><p>点击成品图或“调整”，可独立裁剪、缩放和移动来源图；模板、文字与原图曝光不会改变。</p></div>{previewBusy && <span className="organizer-preview-status"><LoaderCircle className="spin" size={16} />正在更新成品预览</span>}</div>
           <div className="organizer-slot-grid">
             {slots.map((slot) => {
               const count = slot.file_name === "606.jpg" ? 4 : 1;
-              const editableSource = slot.kind !== "generated" || slot.file_name === "401.jpg";
+              const editableSource = slot.kind !== "generated" || ["401.jpg", "5.jpg"].includes(slot.file_name);
               const renderedPreview = slotPreviews[slot.file_name];
               return <article className={`organizer-slot${slot.file_name === "606.jpg" ? " is-composite" : ""}`} key={slot.file_name}>
                 <div className="organizer-slot-preview">
                   {renderedPreview
-                    ? <button type="button" onClick={() => setPreview(renderedPreview)} aria-label={`预览 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} /></button>
+                    ? <button type="button" onClick={() => openAdjustmentEditor(slot.file_name, 0)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} /></button>
                     : <div className="generated-placeholder"><FileImage size={30} /><span>{previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                 </div>
                 <div className="organizer-slot-body">
                   <div className="organizer-slot-title"><strong>{slot.file_name}</strong><span>{slot.title}</span><small>{slot.size}</small></div>
+                  {count === 1 && <button
+                      type="button"
+                      className="organizer-adjust-output"
+                      disabled={!slot.image_ids[0]}
+                      onClick={() => openAdjustmentEditor(slot.file_name, 0)}
+                    >
+                      <Crop size={16} />调整成品
+                    </button>}
                   {editableSource && Array.from({ length: count }).map((_, index) => {
                     return <label key={index}>{count > 1 ? `来源 ${index + 1}` : "来源图片"}
                       <span className="organizer-source-picker">
@@ -629,6 +951,9 @@ export default function VipOrganizer() {
                           <option value="">请选择</option>
                           {optionsFor(slot).map((asset: any) => <option value={asset.id} key={asset.id}>{assetOptionLabel(asset, slot.kind)}</option>)}
                         </select>
+                        {count > 1 && <button type="button" disabled={!slot.image_ids[index]} onClick={() => openAdjustmentEditor(slot.file_name, index)} title={`调整来源 ${index + 1}`}>
+                            <Crop size={16} />调整
+                          </button>}
                       </span>
                     </label>;
                   })}
@@ -651,6 +976,18 @@ export default function VipOrganizer() {
         <button className="image-modal-close" type="button" onClick={() => setPreview(null)} aria-label="关闭预览"><X size={22} /></button>
         <img src={preview} alt="图片预览" onClick={(event) => event.stopPropagation()} />
       </div>}
+      {adjustmentEditor && activeEditorSlot && activeEditorAsset && <SlotAdjustmentEditor
+        sessionId={sessionId}
+        slot={activeEditorSlot}
+        sourceIndex={adjustmentEditor.sourceIndex}
+        sourceUrl={activeEditorAsset.original_url || activeEditorAsset.preview_url}
+        initialPreview={slotPreviews[activeEditorSlot.file_name]}
+        slots={slots}
+        productInfo={organizerProductInfo()}
+        platform={platform}
+        onClose={() => setAdjustmentEditor(null)}
+        onSave={(adjustment, previewUrl) => saveSlotAdjustment(activeEditorSlot.file_name, adjustmentEditor.sourceIndex, adjustment, previewUrl)}
+      />}
     </section>
   );
 }

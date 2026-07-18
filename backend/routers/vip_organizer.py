@@ -17,6 +17,7 @@ from ..services.vip_organizer_service import (
     export_zip,
     preview_file,
     render_previews,
+    render_slot_preview,
     save_analysis_config,
     save_assets,
     start_session,
@@ -32,12 +33,18 @@ class AnalyzePayload(BaseModel):
     tag_image_ids: list[int] = Field(default_factory=list)
     asset_roles: dict[int, str] = Field(default_factory=dict)
     asset_tags: dict[int, list[str]] = Field(default_factory=dict)
+    platform: str = "vip"
 
 
 class ExportPayload(BaseModel):
     session_id: str
     slots: list[dict[str, Any]] = Field(default_factory=list)
     product_info: dict[str, str] = Field(default_factory=dict)
+    platform: str = "vip"
+
+
+class SlotPreviewPayload(ExportPayload):
+    file_name: str
 
 
 class ApiAnalyzePayload(BaseModel):
@@ -109,6 +116,15 @@ def get_export_file(session_id: str, export_id: str, file_name: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/exports/{session_id}/{export_id}/files/{folder_name}/{file_name}")
+def get_nested_export_file(session_id: str, export_id: str, folder_name: str, file_name: str):
+    try:
+        path = export_file(session_id, export_id, file_name, folder_name)
+        return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/exports/{session_id}/{export_id}/download")
 def download_export(session_id: str, export_id: str):
     try:
@@ -137,6 +153,7 @@ def analyze(payload: AnalyzePayload):
             payload.tag_image_ids,
             payload.asset_roles,
             payload.asset_tags,
+            payload.platform,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -166,7 +183,7 @@ def analyze_with_api(payload: ApiAnalyzePayload):
 @router.post("/export")
 def export(payload: ExportPayload):
     try:
-        return export_package(payload.session_id, payload.slots, payload.product_info)
+        return export_package(payload.session_id, payload.slots, payload.product_info, payload.platform)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -174,6 +191,14 @@ def export(payload: ExportPayload):
 @router.post("/preview")
 def preview(payload: ExportPayload):
     try:
-        return render_previews(payload.session_id, payload.slots, payload.product_info)
+        return render_previews(payload.session_id, payload.slots, payload.product_info, payload.platform)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/preview-slot")
+def preview_slot(payload: SlotPreviewPayload):
+    try:
+        return render_slot_preview(payload.session_id, payload.slots, payload.product_info, payload.file_name, payload.platform)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
