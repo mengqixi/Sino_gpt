@@ -53,6 +53,7 @@ const PRODUCT_ROLE_OPTIONS = [
   ["bottom", "底部"],
   ["transparent", "透明正面"],
   ["strap", "肩带完整展示"],
+  ["logo", "Logo细节"],
   ["detail", "局部细节"],
   ["ignore", "忽略此图"]
 ] as const;
@@ -127,8 +128,9 @@ function slotSafeArea(slot: Slot, platform: OrganizerPlatform, sourceIndex: numb
   return { x: 0.07, y: 0.07, width: 0.86, height: 0.86 };
 }
 
-function LiveSlotPreview({ sourceUrl, slot, draft, platform, sourceIndex, targetFolder }: {
+function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder }: {
   sourceUrl: string;
+  templateUrl?: string;
   slot: Slot;
   draft: ImageAdjustment;
   platform: OrganizerPlatform;
@@ -146,11 +148,16 @@ function LiveSlotPreview({ sourceUrl, slot, draft, platform, sourceIndex, target
     canvas.width = output.width;
     canvas.height = output.height;
     const image = new Image();
+    const template = templateUrl ? new Image() : null;
     image.decoding = "async";
-    image.onload = () => {
+    if (template) template.decoding = "async";
+    const draw = () => {
+      if (!image.complete || !image.naturalWidth) return;
+      if (template && (!template.complete || !template.naturalWidth)) return;
       context.clearRect(0, 0, output.width, output.height);
       context.fillStyle = "#fff";
       context.fillRect(0, 0, output.width, output.height);
+      if (template) context.drawImage(template, 0, 0, output.width, output.height);
 
       const area = slotSafeArea(slot, platform, sourceIndex);
       const areaX = area.x * output.width;
@@ -167,6 +174,8 @@ function LiveSlotPreview({ sourceUrl, slot, draft, platform, sourceIndex, target
       const drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth * 0.2;
       const drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight * 0.2;
 
+      context.fillStyle = "#fff";
+      context.fillRect(areaX, areaY, areaWidth, areaHeight);
       context.save();
       context.beginPath();
       context.rect(areaX, areaY, areaWidth, areaHeight);
@@ -189,14 +198,22 @@ function LiveSlotPreview({ sourceUrl, slot, draft, platform, sourceIndex, target
       context.lineWidth = Math.max(2, output.width * 0.002);
       context.strokeStyle = "rgba(27, 91, 73, .78)";
       context.strokeRect(areaX, areaY, areaWidth, areaHeight);
+      context.fillStyle = "rgba(27, 91, 73, .08)";
+      context.fillRect(areaX, areaY, areaWidth, areaHeight);
       context.fillStyle = "rgba(27, 91, 73, .82)";
       context.font = `600 ${Math.max(13, Math.round(output.width * 0.018))}px sans-serif`;
-      context.fillText("模板安全区（仅编辑提示，不写入成品）", areaX + 8, Math.max(18, areaY - 8));
+      context.fillText("模板安全区（确认预览后不会写入成品）", areaX + 8, Math.max(18, areaY - 8));
       context.restore();
     };
+    image.onload = draw;
+    if (template) template.onload = draw;
     image.src = sourceUrl;
-    return () => { image.onload = null; };
-  }, [draft, platform, slot.file_name, slot.size, sourceIndex, sourceUrl, targetFolder]);
+    if (template) template.src = templateUrl || "";
+    return () => {
+      image.onload = null;
+      if (template) template.onload = null;
+    };
+  }, [draft, platform, slot.file_name, slot.size, sourceIndex, sourceUrl, targetFolder, templateUrl]);
 
   return <canvas ref={canvasRef} aria-label={`${slot.file_name} 前端即时预览`} />;
 }
@@ -584,6 +601,7 @@ function SlotAdjustmentEditor({
                 ? <img src={renderedPreview} alt={`${slot.file_name} 模板预览`} draggable={false} />
                 : <LiveSlotPreview
                     sourceUrl={sourceUrl}
+                    templateUrl={renderedPreview || initialPreview}
                     slot={slot}
                     draft={draft}
                     platform={platform}
@@ -617,9 +635,15 @@ function SlotAdjustmentEditor({
             </button>
           </div>}
           <button type="button" onClick={reset}><RotateCcw size={18} />恢复自动</button>
-          <button type="button" disabled={busy} onClick={() => void refreshPreview(draftRef.current, draftVersionRef.current)}><RefreshCw size={18} />重新生成该输出预览</button>
+          <button
+            type="button"
+            className={!previewSynced ? "confirm-preview" : ""}
+            disabled={busy || previewSynced}
+            onClick={() => void refreshPreview(draftRef.current, draftVersionRef.current)}
+          ><CheckCircle2 size={18} />{previewSynced ? "预览已确认" : "确认预览"}</button>
           <span className="slot-drag-hint"><Move size={16} />位置 {Math.round(draft.offset_x * 100)} / {Math.round(draft.offset_y * 100)}</span>
-          <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={18} />保存调整</button>
+          {!previewSynced && <span className="slot-preview-pending">调整后请先确认预览</span>}
+          <button type="button" className="primary" disabled={busy || !previewSynced} onClick={() => void saveAdjustment()}><Save size={18} />保存调整</button>
         </div>
         {error && <div className="alert warning">{error}</div>}
       </section>
@@ -636,6 +660,9 @@ export default function VipOrganizer() {
   const [products, setProducts] = useState<UploadItem[]>([]);
   const [models, setModels] = useState<UploadItem[]>([]);
   const [tags, setTags] = useState<UploadItem[]>([]);
+  const productsRef = useRef<UploadItem[]>([]);
+  const modelsRef = useRef<UploadItem[]>([]);
+  const tagsRef = useRef<UploadItem[]>([]);
   const [slots, setSlots] = useState<Slot[]>([]);
   const [platform, setPlatform] = useState<OrganizerPlatform>("vip");
   const [assets, setAssets] = useState<Record<string, any[]>>({ product: [], model: [], tag: [] });
@@ -840,6 +867,9 @@ export default function VipOrganizer() {
     setProducts([]);
     setModels([]);
     setTags([]);
+    productsRef.current = [];
+    modelsRef.current = [];
+    tagsRef.current = [];
     setSlots([]);
     setAssets({ product: [], model: [], tag: [] });
     setAssetRoles({});
@@ -896,13 +926,37 @@ export default function VipOrganizer() {
     try {
       const currentSession = await ensureSession();
       const uploaded = await api.uploadVipOrganizerAssets(currentSession, kind, fileItems);
-      if (kind === "product") setProducts((current) => [...current, ...uploaded]);
-      if (kind === "model") setModels((current) => [...current, ...uploaded]);
-      if (kind === "tag") setTags(uploaded.slice(-1));
-      setSlots([]);
-      setSlotPreviews({});
+      if (kind === "product") {
+        productsRef.current = [...productsRef.current, ...uploaded];
+        setProducts(productsRef.current);
+      }
+      if (kind === "model") {
+        modelsRef.current = [...modelsRef.current, ...uploaded];
+        setModels(modelsRef.current);
+      }
+      if (kind === "tag") {
+        tagsRef.current = uploaded.slice(-1);
+        setTags(tagsRef.current);
+      }
       const skipped = preSkipped + fileItems.length - uploaded.length;
-      setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件。` : `已上传 ${uploaded.length} 张图片。`);
+      const canAutoAnalyze = productsRef.current.length > 0 && modelsRef.current.length > 0;
+      if (canAutoAnalyze) {
+        setMessage(kind === "tag" ? "吊牌已上传，正在增量刷新吊牌相关输出……" : "商品图和模特图已到齐，正在自动整理初稿……");
+        await analyze(
+          undefined,
+          platform,
+          undefined,
+          {
+            products: productsRef.current,
+            models: modelsRef.current,
+            tags: tagsRef.current
+          },
+          kind === "tag" && slots.length > 0 ? "tag" : undefined,
+          false
+        );
+      } else {
+        setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件。` : `已上传 ${uploaded.length} 张图片。`);
+      }
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -914,29 +968,42 @@ export default function VipOrganizer() {
   async function analyze(
     rolesOverride?: Record<number, string>,
     platformOverride: OrganizerPlatform = platform,
-    tagsOverride?: Record<number, string[]>
+    tagsOverride?: Record<number, string[]>,
+    collections?: { products: UploadItem[]; models: UploadItem[]; tags: UploadItem[] },
+    incrementalKind?: "tag",
+    manageBusy = true
   ) {
-    if (!products.length) return setMessage("请先上传商品原图");
-    setBusy(true);
+    const productItems = collections?.products || productsRef.current;
+    const modelItems = collections?.models || modelsRef.current;
+    const tagItems = collections?.tags || tagsRef.current;
+    if (!productItems.length) return setMessage("请先上传商品原图");
+    if (manageBusy) setBusy(true);
     setMessage("");
     try {
       const result = await api.analyzeVipOrganizer({
-        session_id: sessionId,
-        product_image_ids: products.map((item) => item.image_id),
-        model_image_ids: models.map((item) => item.image_id),
-        tag_image_ids: tags.map((item) => item.image_id),
+        session_id: sessionIdRef.current || sessionId,
+        product_image_ids: productItems.map((item) => item.image_id),
+        model_image_ids: modelItems.map((item) => item.image_id),
+        tag_image_ids: tagItems.map((item) => item.image_id),
         asset_roles: rolesOverride || assetRolesRef.current,
         asset_tags: tagsOverride || assetTagsRef.current,
         platform: platformOverride
       });
-      setSlots(result.slots);
+      if (incrementalKind === "tag") {
+        setSlots((current) => current.map((slot) => {
+          if (slot.kind !== "tag") return slot;
+          return result.slots.find((nextSlot: Slot) => nextSlot.file_name === slot.file_name) || slot;
+        }));
+      } else {
+        setSlots(result.slots);
+      }
       setAssets(result.assets);
       setAdjustmentEditor(null);
-      setMessage("已生成自动整理初稿。黄色或红色可信度项目需要重点确认。");
+      setMessage(incrementalKind === "tag" ? "吊牌相关输出已增量更新，其他预览保持不变。" : "已生成自动整理初稿。黄色或红色可信度项目需要重点确认。");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
-      setBusy(false);
+      if (manageBusy) setBusy(false);
     }
   }
 
@@ -1002,6 +1069,12 @@ export default function VipOrganizer() {
     const next = { ...assetRolesRef.current };
     if (role === "auto") delete next[imageId];
     else next[imageId] = role;
+    if (role === "logo") {
+      const currentTags = assetTagsRef.current[imageId] || [];
+      const nextTags = Array.from(new Set([...currentTags, "logo"]));
+      assetTagsRef.current = { ...assetTagsRef.current, [imageId]: nextTags };
+      setAssetTags(assetTagsRef.current);
+    }
     assetRolesRef.current = next;
     setAssetRoles(next);
     scheduleReanalyze(next, assetTagsRef.current);
@@ -1037,8 +1110,24 @@ export default function VipOrganizer() {
   }
 
   function updateSlot(fileName: string, index: number, value: number) {
+    const linkedNames = platform === "jd" ? ["0-无logo.jpg", "1.jpg"] : ["1.jpg", "50.jpg"];
+    const affectedNames = linkedNames.includes(fileName) ? linkedNames : [fileName];
+    previewAbortRef.current?.abort();
+    previewRequestRef.current += 1;
+    setSlotPreviews((current) => {
+      const next = { ...current };
+      affectedNames.forEach((affectedFileName) => {
+        delete next[slotPreviewKey(platform, affectedFileName, "800")];
+        delete next[slotPreviewKey(platform, affectedFileName, "750")];
+      });
+      return next;
+    });
+    affectedNames.forEach((affectedFileName) => {
+      delete slotPreviewSignaturesRef.current[slotPreviewKey(platform, affectedFileName, "800")];
+      delete slotPreviewSignaturesRef.current[slotPreviewKey(platform, affectedFileName, "750")];
+    });
+    if (adjustmentEditor && affectedNames.includes(adjustmentEditor.fileName)) setAdjustmentEditor(null);
     setSlots((current) => current.map((slot) => {
-      const linkedNames = platform === "jd" ? ["0-无logo.jpg", "1.jpg"] : ["1.jpg", "50.jpg"];
       const linkedModelSlot = linkedNames.includes(fileName);
       const shouldUpdate = slot.file_name === fileName || (linkedModelSlot && linkedNames.includes(slot.file_name));
       if (!shouldUpdate) return slot;
@@ -1375,6 +1464,7 @@ export default function VipOrganizer() {
         <img src={preview} alt="图片预览" onClick={(event) => event.stopPropagation()} />
       </div>}
       {adjustmentEditor && activeEditorSlot && activeEditorAsset && <SlotAdjustmentEditor
+        key={`${platform}:${adjustmentEditor.targetFolder}:${activeEditorSlot.file_name}:${adjustmentEditor.sourceIndex}:${activeEditorAsset.id}`}
         sessionId={sessionId}
         slot={activeEditorSlot}
         sourceIndex={adjustmentEditor.sourceIndex}

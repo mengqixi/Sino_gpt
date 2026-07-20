@@ -177,6 +177,8 @@
 .slot-result-stage { cursor: grab; background: #e7ebe9; }
 .slot-result-stage:active { cursor: grabbing; }
 .slot-result-stage.is-loading > img { opacity: .84; }
+.slot-adjustment-controls .confirm-preview { border-color: #1e5c4b; color: #fff; background: #1e5c4b; }
+.slot-preview-pending { color: #9a6416; font-size: 13px; font-weight: 600; }
 .slot-crop-selection { position: absolute; border: 2px solid #fff; outline: 2px solid #1f6856; background: rgba(31, 104, 86, .12); box-shadow: 0 0 0 9999px rgba(10, 18, 15, .48); pointer-events: none; }
 .slot-preview-loading { position: absolute; right: 12px; bottom: 12px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 7px 10px; border: 1px solid rgba(31, 93, 77, .25); border-radius: 5px; color: #164b3e; font-size: 12px; font-weight: 700; background: rgba(255, 255, 255, .92); box-shadow: 0 4px 16px rgba(19, 54, 44, .12); pointer-events: none; }
 .slot-adjustment-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 13px 16px; border-top: 1px solid #dfe5e2; background: #f7f9f8; }
