@@ -39,7 +39,7 @@ JD_LOGO_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 PREVIEW_RENDER_VERSION = 2
-MAX_PREVIEW_CACHE_ENTRIES = 45
+MAX_PREVIEW_CACHE_ENTRIES = 96
 
 
 SLOT_DEFINITIONS = [
@@ -1439,7 +1439,7 @@ def _product_cutout(source: Image.Image) -> Image.Image:
     return result
 
 
-def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, float]:
+def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
     value = value or {}
 
     def number(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -1461,6 +1461,10 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, float]:
         "crop_y": crop_y,
         "crop_width": crop_width,
         "crop_height": crop_height,
+        "phone_scale": number("phone_scale", 1.0, 0.5, 1.8),
+        "phone_offset_x": number("phone_offset_x", 0.0, -1.5, 1.5),
+        "phone_offset_y": number("phone_offset_y", 0.0, -1.5, 1.5),
+        "phone_alignment": "bottom" if value.get("phone_alignment") == "bottom" else "center",
     }
 
 
@@ -2054,13 +2058,19 @@ def _jd_size_comparison_page(
     )
     draw = ImageDraw.Draw(canvas)
     rendered_body_width = max(1, rendered_body[2] - rendered_body[0])
-    rendered_pixels_per_mm = rendered_body_width / max(1.0, length_mm)
-    phone_height = round(163.0 * rendered_pixels_per_mm * 0.7)
-    phone_height = max(round(height * 0.095), min(round(height * 0.205), phone_height))
-    phone_top = round(height * (0.47 if portrait else 0.45))
+    rendered_body_height = max(1, rendered_body[3] - rendered_body[1])
+    rendered_pixels_per_mm = rendered_body_height / max(1.0, height_mm)
+    phone_height = round(163.0 * rendered_pixels_per_mm * 0.7 * normalized["phone_scale"])
+    phone_height = max(round(height * 0.095), min(round(height * 0.34), phone_height))
+    phone_center_x = width * 0.75 + normalized["phone_offset_x"] * width * 0.18
+    if normalized["phone_alignment"] == "bottom":
+        phone_top = rendered_body[3] - phone_height
+    else:
+        phone_top = round((rendered_body[1] + rendered_body[3] - phone_height) / 2)
+    phone_top += round(normalized["phone_offset_y"] * height * 0.18)
     phone_box = _draw_jd_phone_reference(
         canvas,
-        round(width * (0.75 if portrait else 0.75)),
+        round(phone_center_x),
         phone_top,
         phone_height,
     )

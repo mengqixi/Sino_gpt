@@ -189,6 +189,9 @@
 .slot-logo-color { display: inline-flex; align-items: center; gap: 5px; padding-left: 9px; border-left: 1px solid #d8e0dc; }
 .slot-logo-color > span { margin-right: 2px; color: #617069; font-size: 13px; }
 .slot-logo-color button { min-height: 34px; padding: 5px 8px; }
+.slot-phone-controls { display: inline-flex; align-items: center; gap: 5px; padding-right: 9px; border-right: 1px solid #d8e0dc; }
+.slot-phone-controls > span { color: #617069; font-size: 12px; }
+.slot-phone-controls button { min-height: 34px; padding: 5px 8px; }
 .logo-color-swatch { display: inline-block; width: 14px; height: 14px; border: 1px solid #9ea9a4; border-radius: 50%; }
 .logo-color-swatch.black { background: #111; }
 .logo-color-swatch.white { background: #fff; }

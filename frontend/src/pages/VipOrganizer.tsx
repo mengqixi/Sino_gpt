@@ -34,6 +34,10 @@ type ImageAdjustment = {
   crop_y: number;
   crop_width: number;
   crop_height: number;
+  phone_scale?: number;
+  phone_offset_x?: number;
+  phone_offset_y?: number;
+  phone_alignment?: "center" | "bottom";
 };
 
 type ApiRoleNote = {
@@ -86,7 +90,11 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   crop_x: 0,
   crop_y: 0,
   crop_width: 1,
-  crop_height: 1
+  crop_height: 1,
+  phone_scale: 1,
+  phone_offset_x: 0,
+  phone_offset_y: 0,
+  phone_alignment: "center"
 };
 
 function normalizeAdjustment(value?: Partial<ImageAdjustment>): ImageAdjustment {
@@ -119,6 +127,11 @@ function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex:
       return targetFolder === "750"
         ? { x: 100 / 750, y: 145 / 1000, width: 550 / 750, height: 755 / 1000, mode: "contain" as const }
         : { x: 100 / 800, y: 135 / 800, width: 600 / 800, height: 565 / 800, mode: "contain" as const };
+    }
+    if (slot.file_name === "5.jpg") {
+      return targetFolder === "750"
+        ? { x: 0.08, y: 0.16, width: 0.43, height: 0.58, mode: "contain" as const }
+        : { x: 0.08, y: 0.16, width: 0.43, height: 0.58, mode: "contain" as const };
     }
     return { x: 0.15, y: 0.2125, width: 0.7, height: 0.675, mode: "contain" as const };
   }
@@ -153,6 +166,7 @@ function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex:
 }
 
 const livePreviewImageCache = new Map<string, HTMLImageElement>();
+const livePreviewBoundsCache = new Map<string, { left: number; top: number; right: number; bottom: number }>();
 
 function livePreviewImage(url: string) {
   const cached = livePreviewImageCache.get(url);
@@ -164,7 +178,41 @@ function livePreviewImage(url: string) {
   return image;
 }
 
-function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder }: {
+function livePreviewContentBounds(url: string, image: HTMLImageElement) {
+  const cached = livePreviewBoundsCache.get(url);
+  if (cached) return cached;
+  const scratch = document.createElement("canvas");
+  scratch.width = image.naturalWidth;
+  scratch.height = image.naturalHeight;
+  const context = scratch.getContext("2d", { willReadFrequently: true });
+  if (!context) return { left: 0, top: 0, right: image.naturalWidth, bottom: image.naturalHeight };
+  context.drawImage(image, 0, 0);
+  const pixels = context.getImageData(0, 0, scratch.width, scratch.height).data;
+  let left = scratch.width;
+  let top = scratch.height;
+  let right = 0;
+  let bottom = 0;
+  for (let y = 0; y < scratch.height; y += 2) {
+    for (let x = 0; x < scratch.width; x += 2) {
+      const index = (y * scratch.width + x) * 4;
+      const alpha = pixels[index + 3];
+      const darkest = Math.min(pixels[index], pixels[index + 1], pixels[index + 2]);
+      if (alpha > 18 && darkest < 242) {
+        left = Math.min(left, x);
+        top = Math.min(top, y);
+        right = Math.max(right, x + 2);
+        bottom = Math.max(bottom, y + 2);
+      }
+    }
+  }
+  const bounds = right > left && bottom > top
+    ? { left, top, right: Math.min(scratch.width, right), bottom: Math.min(scratch.height, bottom) }
+    : { left: 0, top: 0, right: image.naturalWidth, bottom: image.naturalHeight };
+  livePreviewBoundsCache.set(url, bounds);
+  return bounds;
+}
+
+function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo }: {
   sourceUrl: string;
   templateUrl?: string;
   slot: Slot;
@@ -172,6 +220,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
   platform: OrganizerPlatform;
   sourceIndex: number;
   targetFolder: PreviewFolder;
+  productInfo: Record<string, string>;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -184,12 +233,12 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
     canvas.width = output.width;
     canvas.height = output.height;
     const image = livePreviewImage(sourceUrl);
-    const template = templateUrl ? livePreviewImage(templateUrl) : null;
+    const template = templateUrl && slot.file_name !== "5.jpg" ? livePreviewImage(templateUrl) : null;
     const draw = () => {
       if (!image.complete || !image.naturalWidth) return;
       if (template && (!template.complete || !template.naturalWidth)) return;
       context.clearRect(0, 0, output.width, output.height);
-      context.fillStyle = "#fff";
+      context.fillStyle = slot.file_name === "5.jpg" && platform === "jd" ? "#f3f3f3" : "#fff";
       context.fillRect(0, 0, output.width, output.height);
       if (template) context.drawImage(template, 0, 0, output.width, output.height);
 
@@ -198,10 +247,19 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       const areaY = area.y * output.height;
       const areaWidth = area.width * output.width;
       const areaHeight = area.height * output.height;
-      const sourceX = Math.max(0, Math.min(image.naturalWidth - 1, draft.crop_x * image.naturalWidth));
-      const sourceY = Math.max(0, Math.min(image.naturalHeight - 1, draft.crop_y * image.naturalHeight));
-      const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, draft.crop_width * image.naturalWidth));
-      const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, draft.crop_height * image.naturalHeight));
+      const useContentBounds = ["401.jpg", "5.jpg", "1.jpg", "2.jpg", "3.jpg", "30.png", "801.jpg"].includes(slot.file_name);
+      const bounds = useContentBounds ? livePreviewContentBounds(sourceUrl, image) : {
+        left: 0,
+        top: 0,
+        right: image.naturalWidth,
+        bottom: image.naturalHeight
+      };
+      const contentWidth = bounds.right - bounds.left;
+      const contentHeight = bounds.bottom - bounds.top;
+      const sourceX = Math.max(0, Math.min(image.naturalWidth - 1, bounds.left + draft.crop_x * contentWidth));
+      const sourceY = Math.max(0, Math.min(image.naturalHeight - 1, bounds.top + draft.crop_y * contentHeight));
+      const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, draft.crop_width * contentWidth));
+      const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, draft.crop_height * contentHeight));
       const fitScale = area.mode === "cover"
         ? Math.max(areaWidth / sourceWidth, areaHeight / sourceHeight)
         : Math.min(areaWidth / sourceWidth, areaHeight / sourceHeight);
@@ -228,6 +286,51 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         drawHeight
       );
       context.restore();
+
+      if (platform === "jd" && slot.file_name === "5.jpg") {
+        const heightValue = Number.parseFloat(productInfo.product_height || "") || 75;
+        const bodyHeight = Math.max(40, drawHeight * 0.68);
+        const phoneHeight = Math.max(output.height * 0.095, Math.min(output.height * 0.34, bodyHeight * (163 / heightValue) * 0.7 * (draft.phone_scale || 1)));
+        const phoneWidth = phoneHeight * 0.48;
+        const overlap = phoneHeight * 0.13;
+        const pairWidth = phoneWidth * 2 - overlap;
+        const phoneCenterX = output.width * 0.75 + (draft.phone_offset_x || 0) * output.width * 0.18;
+        const phoneLeft = phoneCenterX - pairWidth / 2;
+        const phoneTop = (draft.phone_alignment || "center") === "bottom"
+          ? drawY + drawHeight - phoneHeight
+          : drawY + (drawHeight - phoneHeight) / 2;
+        const adjustedPhoneTop = phoneTop + (draft.phone_offset_y || 0) * output.height * 0.18;
+        const radius = Math.max(8, phoneWidth * 0.13);
+        context.save();
+        context.fillStyle = "#f2f2f0";
+        context.strokeStyle = "#888";
+        context.lineWidth = Math.max(2, output.width * 0.002);
+        context.roundRect(phoneLeft, adjustedPhoneTop, phoneWidth, phoneHeight, radius);
+        context.fill();
+        context.stroke();
+        context.fillStyle = "#222";
+        context.strokeStyle = "#777";
+        context.roundRect(phoneLeft + phoneWidth - overlap, adjustedPhoneTop, phoneWidth, phoneHeight, radius);
+        context.fill();
+        context.stroke();
+        context.fillStyle = "#ddd";
+        context.beginPath();
+        context.arc(phoneLeft + phoneWidth / 2, adjustedPhoneTop + phoneHeight * 0.55, Math.max(3, phoneWidth * 0.055), 0, Math.PI * 2);
+        context.fill();
+        const phoneRight = phoneLeft + pairWidth;
+        const phoneRulerX = Math.min(output.width * 0.94, phoneRight + output.width * 0.055);
+        context.strokeStyle = "#777";
+        context.lineWidth = Math.max(1, output.width * 0.002);
+        context.beginPath();
+        context.moveTo(phoneRulerX, adjustedPhoneTop);
+        context.lineTo(phoneRulerX, adjustedPhoneTop + phoneHeight);
+        context.moveTo(phoneRulerX - 7, adjustedPhoneTop);
+        context.lineTo(phoneRulerX + 7, adjustedPhoneTop);
+        context.moveTo(phoneRulerX - 7, adjustedPhoneTop + phoneHeight);
+        context.lineTo(phoneRulerX + 7, adjustedPhoneTop + phoneHeight);
+        context.stroke();
+        context.restore();
+      }
 
       context.save();
       context.setLineDash([Math.max(5, output.width * 0.008), Math.max(4, output.width * 0.006)]);
@@ -363,12 +466,14 @@ function SlotAdjustmentEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [cropMode, setCropMode] = useState(false);
+  const isPhoneComparison = platform === "jd" && slot.file_name === "5.jpg";
+  const [moveTarget, setMoveTarget] = useState<"product" | "phone">("product");
   const [cropSelection, setCropSelection] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const sourceStageRef = useRef<HTMLDivElement>(null);
   const sourceImageRef = useRef<HTMLImageElement>(null);
   const cropStartRef = useRef<{ x: number; y: number } | null>(null);
   const cropSelectionRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
-  const moveStartRef = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(null);
+  const moveStartRef = useRef<{ x: number; y: number; offsetX: number; offsetY: number; target: "product" | "phone" } | null>(null);
   const pendingMoveRef = useRef<ImageAdjustment | null>(null);
   const moveFrameRef = useRef<number | null>(null);
   const draftRef = useRef<ImageAdjustment>(initial);
@@ -503,6 +608,13 @@ function SlotAdjustmentEditor({
 
   function changeZoom(delta: number) {
     const current = draftRef.current;
+    if (isPhoneComparison && moveTarget === "phone") {
+      applyDraft({
+        ...current,
+        phone_scale: Math.max(0.5, Math.min(1.8, Math.round(((current.phone_scale || 1) + delta) * 100) / 100))
+      });
+      return;
+    }
     applyDraft({
       ...current,
       zoom: Math.max(0.5, Math.min(4, Math.round((current.zoom + delta) * 100) / 100))
@@ -609,17 +721,23 @@ function SlotAdjustmentEditor({
               }}
               onPointerDown={(event) => {
                 event.currentTarget.setPointerCapture(event.pointerId);
-                moveStartRef.current = { x: event.clientX, y: event.clientY, offsetX: draft.offset_x, offsetY: draft.offset_y };
+                moveStartRef.current = {
+                  x: event.clientX,
+                  y: event.clientY,
+                  offsetX: moveTarget === "phone" ? draft.phone_offset_x || 0 : draft.offset_x,
+                  offsetY: moveTarget === "phone" ? draft.phone_offset_y || 0 : draft.offset_y,
+                  target: moveTarget
+                };
               }}
               onPointerMove={(event) => {
                 const start = moveStartRef.current;
                 if (!start) return;
                 const bounds = event.currentTarget.getBoundingClientRect();
-                pendingMoveRef.current = {
-                  ...draftRef.current,
-                  offset_x: Math.max(-1.5, Math.min(1.5, start.offsetX + (event.clientX - start.x) / bounds.width)),
-                  offset_y: Math.max(-1.5, Math.min(1.5, start.offsetY + (event.clientY - start.y) / bounds.height))
-                };
+                const nextOffsetX = Math.max(-1.5, Math.min(1.5, start.offsetX + (event.clientX - start.x) / bounds.width));
+                const nextOffsetY = Math.max(-1.5, Math.min(1.5, start.offsetY + (event.clientY - start.y) / bounds.height));
+                pendingMoveRef.current = start.target === "phone"
+                  ? { ...draftRef.current, phone_offset_x: nextOffsetX, phone_offset_y: nextOffsetY }
+                  : { ...draftRef.current, offset_x: nextOffsetX, offset_y: nextOffsetY };
                 if (moveFrameRef.current === null) {
                   moveFrameRef.current = window.requestAnimationFrame(() => {
                     moveFrameRef.current = null;
@@ -642,6 +760,7 @@ function SlotAdjustmentEditor({
                     platform={platform}
                     sourceIndex={sourceIndex}
                     targetFolder={targetFolder}
+                    productInfo={productInfo}
                   />}
               <span className="slot-preview-loading">
                 {busy ? <LoaderCircle className="spin" size={17} /> : <Move size={16} />}
@@ -652,13 +771,21 @@ function SlotAdjustmentEditor({
         </div>
 
         <div className="slot-adjustment-controls">
+          {isPhoneComparison && <div className="slot-phone-controls" role="group" aria-label="手机对比调整">
+            <span>调整对象</span>
+            <button type="button" className={moveTarget === "product" ? "active-tool" : ""} onClick={() => setMoveTarget("product")}>包</button>
+            <button type="button" className={moveTarget === "phone" ? "active-tool" : ""} onClick={() => setMoveTarget("phone")}>手机和标线</button>
+            <span>对齐</span>
+            <button type="button" className={(draft.phone_alignment || "center") === "center" ? "active-tool" : ""} onClick={() => applyDraft({ ...draftRef.current, phone_alignment: "center" })}>中心同高</button>
+            <button type="button" className={draft.phone_alignment === "bottom" ? "active-tool" : ""} onClick={() => applyDraft({ ...draftRef.current, phone_alignment: "bottom" })}>底部齐平</button>
+          </div>}
           <button type="button" className={cropMode ? "active-tool" : ""} onClick={() => {
             setCropMode((current) => !current);
             cropSelectionRef.current = null;
             setCropSelection(null);
           }}><Crop size={18} />裁剪</button>
           <button type="button" onClick={() => changeZoom(-0.05)}><ZoomOut size={18} />缩小</button>
-          <span className="slot-zoom-value">{Math.round(draft.zoom * 100)}%</span>
+          <span className="slot-zoom-value">{Math.round((isPhoneComparison && moveTarget === "phone" ? draft.phone_scale || 1 : draft.zoom) * 100)}%</span>
           <button type="button" onClick={() => changeZoom(0.05)}><ZoomIn size={18} />放大</button>
           {supportsLogoColor && <div className="slot-logo-color" role="group" aria-label="左上角 Logo 颜色">
             <span>Logo</span>
@@ -724,6 +851,7 @@ export default function VipOrganizer() {
     previews: Record<string, string>;
     signatures: Record<string, string>;
   }>>>({});
+  const jdBackgroundPreparedRef = useRef(false);
   const reanalyzeTimerRef = useRef<number | null>(null);
   const assetRolesRef = useRef<Record<number, string>>({});
   const assetTagsRef = useRef<Record<number, string[]>>({});
@@ -803,10 +931,17 @@ export default function VipOrganizer() {
               .filter((result): result is PromiseFulfilledResult<(readonly [string, string])[]> => result.status === "fulfilled")
               .flatMap((result) => result.value);
             const successfulKeys = new Set(successfulGroups.map(([key]) => key));
+            const previewEntries = Object.fromEntries(successfulGroups);
             setSlotPreviews((current) => ({
               ...current,
-              ...Object.fromEntries(successfulGroups)
+              ...previewEntries
             }));
+            const workspace = platformWorkspaceRef.current[platform];
+            platformWorkspaceRef.current[platform] = {
+              slots,
+              previews: { ...(workspace?.previews || {}), ...previewEntries },
+              signatures: { ...(workspace?.signatures || {}), ...Object.fromEntries([...successfulKeys].filter((key) => signatures[key]).map((key) => [key, signatures[key]])) }
+            };
             slotPreviewSignaturesRef.current = {
               ...slotPreviewSignaturesRef.current,
               ...Object.fromEntries(
@@ -838,7 +973,14 @@ export default function VipOrganizer() {
               .filter((result): result is PromiseFulfilledResult<readonly [string, string]> => result.status === "fulfilled" && typeof result.value[1] === "string")
               .map((result) => result.value);
             const successfulKeys = new Set(successfulResults.map(([key]) => key));
-            setSlotPreviews((current) => ({ ...current, ...Object.fromEntries(successfulResults) }));
+            const previewEntries = Object.fromEntries(successfulResults);
+            setSlotPreviews((current) => ({ ...current, ...previewEntries }));
+            const workspace = platformWorkspaceRef.current[platform];
+            platformWorkspaceRef.current[platform] = {
+              slots,
+              previews: { ...(workspace?.previews || {}), ...previewEntries },
+              signatures: { ...(workspace?.signatures || {}), ...Object.fromEntries([...successfulKeys].filter((key) => signatures[key]).map((key) => [key, signatures[key]])) }
+            };
             slotPreviewSignaturesRef.current = {
               ...slotPreviewSignaturesRef.current,
               ...Object.fromEntries(
@@ -869,6 +1011,65 @@ export default function VipOrganizer() {
       controller.abort();
     };
   }, [sessionId, slots, info, platform]);
+
+  useEffect(() => {
+    if (
+      platform !== "vip"
+      || previewBusy
+      || !sessionId
+      || !slots.length
+      || !Object.keys(slotPreviews).length
+      || !productsRef.current.length
+      || jdBackgroundPreparedRef.current
+      || platformWorkspaceRef.current.jd
+    ) return;
+    jdBackgroundPreparedRef.current = true;
+    const timer = window.setTimeout(async () => {
+      try {
+        const productInfo = organizerProductInfo();
+        const result = await api.analyzeVipOrganizer({
+          session_id: sessionId,
+          product_image_ids: productsRef.current.map((item) => item.image_id),
+          model_image_ids: modelsRef.current.map((item) => item.image_id),
+          tag_image_ids: tagsRef.current.map((item) => item.image_id),
+          asset_roles: assetRolesRef.current,
+          asset_tags: assetTagsRef.current,
+          platform: "jd"
+        });
+        const folderResults = await Promise.allSettled((["800", "750"] as PreviewFolder[]).map(async (targetFolder) => {
+          const previews = await api.previewVipOrganizer({
+            session_id: sessionId,
+            slots: result.slots,
+            product_info: productInfo,
+            platform: "jd",
+            target_folder: targetFolder
+          });
+          return Object.entries(previews.previews || {}).flatMap(([fileName, previewUrl]) => (
+            typeof previewUrl === "string"
+              ? [[slotPreviewKey("jd", fileName, targetFolder), previewUrl] as const]
+              : []
+          ));
+        }));
+        const entries = folderResults
+          .filter((item): item is PromiseFulfilledResult<(readonly [string, string])[]> => item.status === "fulfilled")
+          .flatMap((item) => item.value);
+        const signatures = Object.fromEntries(result.slots.flatMap((slot: Slot) =>
+          previewFoldersForSlot(slot, "jd").map((targetFolder) => [
+            slotPreviewKey("jd", slot.file_name, targetFolder),
+            slotPreviewSignature(slot, productInfo, "jd", targetFolder)
+          ])
+        ));
+        platformWorkspaceRef.current.jd = {
+          slots: result.slots,
+          previews: Object.fromEntries(entries),
+          signatures
+        };
+      } catch {
+        jdBackgroundPreparedRef.current = false;
+      }
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [platform, previewBusy, sessionId, slots, slotPreviews, info]);
 
   useEffect(() => {
     api.getApiConfigs("text_analysis")
@@ -944,6 +1145,7 @@ export default function VipOrganizer() {
     setSlotPreviews({});
     slotPreviewSignaturesRef.current = {};
     platformWorkspaceRef.current = {};
+    jdBackgroundPreparedRef.current = false;
     if (reanalyzeTimerRef.current !== null) {
       window.clearTimeout(reanalyzeTimerRef.current);
       reanalyzeTimerRef.current = null;
@@ -1060,6 +1262,10 @@ export default function VipOrganizer() {
         }));
       } else {
         setSlots(result.slots);
+      }
+      if (platformOverride === "vip") {
+        delete platformWorkspaceRef.current.jd;
+        jdBackgroundPreparedRef.current = false;
       }
       setAssets(result.assets);
       setAdjustmentEditor(null);
@@ -1316,7 +1522,7 @@ export default function VipOrganizer() {
     const cached = platformWorkspaceRef.current[nextPlatform];
     if (cached) {
       setSlots(cached.slots);
-      setSlotPreviews(cached.previews);
+      setSlotPreviews({ ...cached.previews });
       slotPreviewSignaturesRef.current = { ...cached.signatures };
       setMessage(`已切换到${nextPlatform === "jd" ? "京东" : "唯品会"}，直接恢复该平台上次预览。`);
       return;
@@ -1499,7 +1705,14 @@ export default function VipOrganizer() {
                       style={{ aspectRatio: `${outputSize.width} / ${outputSize.height}` }}
                     >
                       {renderedPreview
-                        ? <button type="button" onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} /></button>
+                        ? <button type="button" onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} onError={() => {
+                            setSlotPreviews((current) => {
+                              const next = { ...current };
+                              delete next[previewKey];
+                              return next;
+                            });
+                            delete slotPreviewSignaturesRef.current[previewKey];
+                          }} /></button>
                         : <div className="generated-placeholder"><FileImage size={30} /><span>{previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                     </div>
                     <div className="organizer-slot-body">
