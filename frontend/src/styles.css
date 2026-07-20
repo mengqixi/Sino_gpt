@@ -140,6 +140,7 @@
 .organizer-slot-body label { display: grid; gap: 4px; margin-top: 6px; color: #66716b; font-size: 12px; }
 .organizer-slot-body select { padding: 7px 8px; }
 .organizer-source-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; min-width: 0; gap: 6px; }
+.organizer-source-picker select.is-manual-source, .organizer-source-picker option.manual-option { color: #bf2f2f; font-weight: 700; }
 .organizer-source-picker select { width: 100%; min-width: 0; }
 .organizer-source-picker button, .organizer-adjust-output { display: inline-flex; min-height: 36px; align-items: center; justify-content: center; gap: 5px; padding: 6px 9px; border: 1px solid #b9cbc4; border-radius: 5px; background: #fff; color: #24584a; white-space: nowrap; }
 .organizer-source-picker button:disabled { cursor: not-allowed; opacity: .45; }

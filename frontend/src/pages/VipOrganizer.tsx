@@ -1186,14 +1186,18 @@ export default function VipOrganizer() {
     return allAssets.find((item) => item.id === id);
   }
 
+  function isManualAsset(imageId: number) {
+    return Boolean(assetRoles[imageId] || assetTags[imageId] !== undefined);
+  }
+
   function assetOptionLabel(asset: any, kind: string) {
-    if (kind === "model") return `【模特图】${asset.file_name}`;
-    if (kind === "tag") return `【吊牌图】${asset.file_name}`;
+    if (kind === "model" || kind === "tag") return asset.file_name;
     const fixedRole = assetRoles[asset.id];
     const role = fixedRole || asset.suggested_role || "detail";
-    const source = fixedRole ? "固定" : "自动";
-    const tagText = effectiveAssetTags(asset).slice(0, 2).map((tag: string) => TAG_LABELS[tag] || tag).join("+");
-    return `【${source}·${ROLE_LABELS[role] || "局部细节"}${tagText ? `·${tagText}` : ""}】${asset.file_name}`;
+    const tags = effectiveAssetTags(asset);
+    const tagText = tags.length ? `·${TAG_LABELS[tags[0]] || tags[0]}` : "";
+    if (!isManualAsset(asset.id)) return `【${ROLE_LABELS[role] || "局部细节"}${tagText}】${asset.file_name}`;
+    return `【人工·${ROLE_LABELS[fixedRole || role] || "局部细节"}${fixedRole ? "" : tagText}】${asset.file_name}`;
   }
 
   async function exportZip() {
@@ -1430,11 +1434,16 @@ export default function VipOrganizer() {
                           <Crop size={16} />调整成品
                         </button>}
                       {editableSource && Array.from({ length: count }).map((_, index) => {
+                        const currentAsset = selectedAsset(slot.image_ids[index]);
                         return <label key={index}>{count > 1 ? `来源 ${index + 1}` : "来源图片"}
                           <span className="organizer-source-picker">
-                            <select value={slot.image_ids[index] || ""} onChange={(event) => updateSlot(slot.file_name, index, Number(event.target.value))}>
+                            <select
+                              className={currentAsset && isManualAsset(currentAsset.id) ? "is-manual-source" : ""}
+                              value={slot.image_ids[index] || ""}
+                              onChange={(event) => updateSlot(slot.file_name, index, Number(event.target.value))}
+                            >
                               <option value="">请选择</option>
-                              {optionsFor(slot).map((asset: any) => <option value={asset.id} key={asset.id}>{assetOptionLabel(asset, slot.kind)}</option>)}
+                              {optionsFor(slot).map((asset: any) => <option className={isManualAsset(asset.id) ? "manual-option" : ""} value={asset.id} key={asset.id}>{assetOptionLabel(asset, slot.kind)}</option>)}
                             </select>
                             {count > 1 && <button type="button" disabled={!slot.image_ids[index]} onClick={() => openAdjustmentEditor(slot.file_name, index, group.folder)} title={`调整来源 ${index + 1}`}>
                                 <Crop size={16} />调整
