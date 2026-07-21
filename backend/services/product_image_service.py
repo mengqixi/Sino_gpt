@@ -66,10 +66,10 @@ MAX_BROWSER_FRAME_BYTES = 5 * 1024 * 1024
 MAX_BROWSER_FRAMES = 12
 MAX_TRANSPARENT_UPLOAD_BYTES = 40 * 1024 * 1024
 MIN_FREE_DISK_BYTES = 3 * 1024 * 1024 * 1024
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 
-# Pillow, HEIC and OpenCV can briefly allocate several copies of a full-size
+# Pillow and OpenCV can briefly allocate several copies of a full-size
 # image. The production deployment uses one worker; this gate also protects
 # that worker when several users upload at the same time.
 MEDIA_DECODE_SEMAPHORE = Semaphore(1)
@@ -203,7 +203,7 @@ def _save_image_upload(task_id: str, role: str, file: UploadFile) -> dict[str, A
     original_name = file.filename or "image.jpg"
     suffix = Path(original_name).suffix.lower()
     if suffix not in IMAGE_SUFFIXES:
-        raise ProductImageError("图片格式不支持，请上传 JPG、PNG、WebP 或 HEIC")
+        raise ProductImageError("图片格式不支持，请上传 JPG、PNG 或 WebP")
     folder = PRODUCT_IMAGE_INPUT_DIR / task_id / "images" / role
     _ensure_disk_reserve(
         folder,

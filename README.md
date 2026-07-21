@@ -62,7 +62,7 @@ Docker 会挂载以下目录，升级镜像时不会丢数据：
 
 - 使用 Python 3.12、单个 Uvicorn worker，不能开启 `--reload`，也不要同时运行多个应用副本处理同一 SQLite 数据库。
 - 前端在开发电脑执行 `npm run build`，服务器只运行构建后的 `frontend/dist`。
-- 安装 `ffmpeg` 作为 MOV/特殊编码视频的服务端兜底；HEIC/HEIF 由 `pillow-heif` 处理。
+- 安装 `ffmpeg` 作为 MOV/特殊编码视频的服务端兜底。
 - 为进程设置 `MALLOC_ARENA_MAX=2`、`OMP_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1`，Dockerfile 已内置这些限制。
 - `data/` 必须放在持久化磁盘，不要放到内存盘。商品图上传会保留至少 3GB 空闲；源素材开始下一轮即删除，遗留素材最多保留 24 小时。
 - 若 Nginx 允许 500MB 原视频兜底，请对商品图接口关闭请求缓冲或把临时目录放到磁盘；不要让 `client_body_temp_path` 或 systemd `TMPDIR` 指向 tmpfs。

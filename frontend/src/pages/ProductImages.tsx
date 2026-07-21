@@ -102,7 +102,7 @@ const OUTPUT_DEFINITIONS: Array<{
   { role: "logo_detail", title: "Logo 细节", fileName: "06_Logo细节.jpg", ai: false }
 ];
 
-const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp|heic|heif)$/i;
+const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp)$/i;
 const BROWSER_DECODABLE_IMAGE_PATTERN = /\.(jpe?g|png|webp)$/i;
 const VIDEO_NAME_PATTERN = /\.(mp4|mov)$/i;
 
@@ -253,12 +253,14 @@ async function prepareLargePhotoInBrowser(file: File): Promise<{ file: File; opt
       context.imageSmoothingQuality = "high";
       context.fillStyle = "#ffffff";
       context.fillRect(0, 0, nextWidth, nextHeight);
-      context.drawImage(workingCanvas || bitmap, 0, 0, nextWidth, nextHeight);
+      const source: CanvasImageSource | null = workingCanvas || bitmap;
+      if (!source) return { file, optimized: false };
+      context.drawImage(source, 0, 0, nextWidth, nextHeight);
       if (workingCanvas) {
         workingCanvas.width = 1;
         workingCanvas.height = 1;
       } else {
-        bitmap.close();
+        bitmap?.close();
         bitmap = null;
       }
       workingCanvas = nextCanvas;
@@ -277,7 +279,7 @@ async function prepareLargePhotoInBrowser(file: File): Promise<{ file: File; opt
       optimized: true
     };
   } catch {
-    // HEIC and browser-specific decode failures intentionally fall back to the original upload.
+    // Browser-specific decode failures intentionally fall back to the original upload.
     return { file, optimized: false };
   } finally {
     bitmap?.close();
@@ -640,7 +642,7 @@ function SourceUploadCard({
         ref={inputRef}
         className="pi-hidden-input"
         type="file"
-        accept=".jpg,.jpeg,.png,.webp,.heic,.heif,image/jpeg,image/png,image/webp,image/heic,image/heif"
+        accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
         multiple
         disabled={disabled || busy}
         onChange={(event) => {
@@ -1168,7 +1170,7 @@ export default function ProductImages() {
     const accepted = withinSize.slice(0, Math.max(0, MAX_IMAGES_PER_ROLE - currentCount));
     const skipped = files.length - accepted.length;
     if (!accepted.length) {
-      setError(oversized.length ? "单张照片不能超过 30MB。" : "每个入口最多 5 张，仅支持 JPG、PNG、WebP、HEIC/HEIF。" );
+      setError(oversized.length ? "单张照片不能超过 30MB。" : "每个入口最多 5 张，仅支持 JPG、PNG、WebP。" );
       return;
     }
     setGenerationConfirmed(false);
@@ -1478,7 +1480,7 @@ export default function ProductImages() {
         <section className="panel pi-sources-panel">
           <div className="pi-section-heading">
             <div><span>02</span><div><h2>上传实拍素材</h2><p>每个入口可传 1–5 张；系统分析后会自动选择最佳参考，你也可以手动更换。</p></div></div>
-            <small>JPG / PNG / WebP / HEIC · 单张不超过 30MB</small>
+            <small>JPG / PNG / WebP · 单张不超过 30MB</small>
           </div>
           <div className="pi-source-grid">
             {SOURCE_DEFINITIONS.map((definition) => {

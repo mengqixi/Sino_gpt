@@ -4,6 +4,5 @@ pydantic==2.10.4
 python-multipart==0.0.20
 requests==2.32.3
 Pillow==11.1.0
-pillow-heif==1.4.0
 numpy==2.2.1
 opencv-python-headless==4.10.0.84
