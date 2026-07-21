@@ -219,6 +219,31 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(roles[3], "front")
         self.assertEqual(roles[4], "back")
 
+    def test_batch_refinement_uses_lowest_confidence_as_back_fallback(self):
+        samples = [
+            {
+                "id": image_id,
+                "suggested_role": "front",
+                "suggested_tags": [],
+                "role_confidence": confidence,
+                "main_component_ratio": ratio,
+                "main_component_fill_ratio": 0.61,
+                "main_body_side_edge_ratio": 1.0 + image_id,
+                "main_symmetry_error": 0.01 * image_id,
+                "strict_center_gold_ratio": 0.001,
+                "bbox_ratio": 0.40,
+                "sharpness": 1000 + image_id,
+            }
+            for image_id, confidence, ratio in [(1, 76, 1.20), (2, 58, 1.18), (3, 70, 1.12)]
+        ]
+
+        _refine_product_classifications(samples)
+
+        fallback = next(item for item in samples if item["suggested_role"] == "back")
+        self.assertEqual(fallback["id"], 2)
+        self.assertEqual(fallback["role_confidence"], 58)
+        self.assertIn("置信度最低", fallback["role_reason"])
+
     def test_api_analysis_prompt_matches_local_roles_and_detail_tags(self):
         prompt = _api_analysis_prompt()
 

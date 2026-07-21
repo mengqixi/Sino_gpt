@@ -32,6 +32,69 @@ export const api = {
     request<any[]>(`/api/api-configs${apiType ? `?api_type=${apiType}` : ""}`),
   getEcommerceTemplates: () => request<any[]>("/api/ecommerce/templates"),
   planEcommerceCampaign: (payload: any) => request<any>("/api/ecommerce/plan", { method: "POST", body: JSON.stringify(payload) }),
+  createProductImageTask: (payload: { product_code: string; color: string; previous_task_id?: string | null }) =>
+    request<any>("/api/product-images/tasks", { method: "POST", body: JSON.stringify(payload) }),
+  getProductImageTask: (taskId: string) => request<any>(`/api/product-images/tasks/${taskId}`),
+  getProductImageHistory: () => request<any[]>("/api/product-images/history"),
+  deleteProductImageTask: (taskId: string) => request<any>(`/api/product-images/tasks/${taskId}`, { method: "DELETE" }),
+  uploadProductImages: (taskId: string, role: string, files: File[]) => {
+    const form = new FormData();
+    form.append("role", role);
+    files.forEach((file) => form.append("files", file));
+    return request<any>(`/api/product-images/tasks/${taskId}/images`, { method: "POST", body: form });
+  },
+  uploadProductVideos: (taskId: string, files: File[]) => {
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file));
+    return request<any>(`/api/product-images/tasks/${taskId}/videos`, { method: "POST", body: form });
+  },
+  uploadProductVideoFrames: (taskId: string, payload: { files: File[]; video_name: string; duration_seconds: number }) => {
+    const form = new FormData();
+    payload.files.forEach((file) => form.append("files", file));
+    form.append("video_name", payload.video_name);
+    form.append("original_video_name", payload.video_name);
+    form.append("duration_seconds", String(payload.duration_seconds));
+    return request<any>(`/api/product-images/tasks/${taskId}/browser-video-frames`, { method: "POST", body: form });
+  },
+  deleteProductAsset: (taskId: string, assetId: number) =>
+    request<any>(`/api/product-images/tasks/${taskId}/assets/${assetId}`, { method: "DELETE" }),
+  analyzeProductImages: (taskId: string, payload: { api_config_id: number; confirmed_call_count: number }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/analyze`, { method: "POST", body: JSON.stringify(payload) }),
+  selectProductReference: (taskId: string, payload: { role: string; asset_id: number }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/references/${payload.role}`, {
+      method: "PATCH",
+      body: JSON.stringify({ asset_id: payload.asset_id })
+    }),
+  getProductImageCallPlan: (taskId: string) => request<any>(`/api/product-images/tasks/${taskId}/call-plan`),
+  generateProductImages: (taskId: string, payload: { api_config_id: number; confirmed_call_count: number }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/generate`, { method: "POST", body: JSON.stringify(payload) }),
+  resumeProductImages: (taskId: string, payload: { api_config_id: number; confirmed_call_count: number; acknowledge_possible_charge?: boolean }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/resume`, { method: "POST", body: JSON.stringify(payload) }),
+  regenerateProductImage: (taskId: string, outputRole: string, payload: { api_config_id: number; confirmed_call_count: number; acknowledge_possible_charge?: boolean }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/outputs/${outputRole}/regenerate`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  saveProductTransparent: (taskId: string, payload: { image_data_url: string }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/outputs/front_transparent`, {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    }),
+  uploadProductTransparent: (taskId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<any>(`/api/product-images/tasks/${taskId}/outputs/front_transparent/file`, {
+      method: "POST",
+      body: form
+    });
+  },
+  cropProductLogo: (taskId: string, payload: { left: number; top: number; right: number; bottom: number }) =>
+    request<any>(`/api/product-images/tasks/${taskId}/outputs/logo_detail/crop`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    }),
+  deleteProductSources: (taskId: string) =>
+    request<any>(`/api/product-images/tasks/${taskId}/sources/cleanup`, { method: "POST" }),
   analyzeVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/analyze", { method: "POST", body: JSON.stringify(payload) }),
   analyzeVipOrganizerWithApi: (payload: any) => request<any>("/api/vip-organizer/analyze-with-api", { method: "POST", body: JSON.stringify(payload) }),
   getVipAnalysisConfig: () => request<any>("/api/vip-organizer/analysis-config"),

@@ -36,9 +36,10 @@ UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
 ORGANIZER_SESSION_TTL_HOURS = 24
 BUNDLED_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "NotoSansSC-VF-GB2312.ttf"
 JD_LOGO_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "LibreBodoni-VariableFont_wght.ttf"
+JD_PHONE_REFERENCE_PATH = Path(__file__).resolve().parents[1] / "assets" / "iphone_reference.png"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-PREVIEW_RENDER_VERSION = 2
+PREVIEW_RENDER_VERSION = 3
 MAX_PREVIEW_CACHE_ENTRIES = 96
 
 
@@ -700,8 +701,19 @@ def _assign_required_batch_views(products: list[dict[str, Any]]) -> None:
     if not side_candidates:
         return
 
+    protected_back_ids = {
+        int(item.get("id", id(item)))
+        for item in complete
+        if item.get("suggested_role") == "back"
+    }
+    if protected_back_ids and len([
+        item for item in complete
+        if int(item.get("id", id(item))) not in protected_back_ids
+    ]) < 4:
+        return
+
     selected: dict[str, dict[str, Any]] = {}
-    selected_ids: set[int] = set()
+    selected_ids: set[int] = set(protected_back_ids)
 
     def item_id(item: dict[str, Any]) -> int:
         return int(item.get("id", id(item)))
@@ -847,6 +859,25 @@ def _refine_product_classifications(products: list[dict[str, Any]]) -> None:
                 "role_confidence": 82,
                 "role_reason": "同批完整视图中未检测到正面中央Logo/五金，校正为背面",
             })
+
+    if not any(item.get("suggested_role") == "back" for item in face_candidates):
+        fallback_back = min(
+            face_candidates,
+            key=lambda item: (
+                int(item.get("role_confidence", 0)),
+                float(item.get("strict_center_gold_ratio", 0)),
+                -float(item.get("sharpness", 0)),
+            ),
+        )
+        fallback_back.update({
+            "suggested_role": "back",
+            "suggested_tags": [
+                tag for tag in fallback_back.get("suggested_tags", [])
+                if tag not in {"logo", "hardware"}
+            ],
+            "role_confidence": int(fallback_back.get("role_confidence", 0)),
+            "role_reason": "同批完整包体图中未识别到明确背面，暂将自动判断置信度最低的一张作为背面候选，建议人工确认",
+        })
 
     remaining = [item for item in face_candidates if item.get("suggested_role") != "back"]
     selected_semi_side: dict[str, Any] | None = None
@@ -1909,13 +1940,30 @@ def _draw_jd_dimension_bar(
         )
 
 
+@lru_cache(maxsize=1)
+def _jd_phone_reference_layer() -> Image.Image | None:
+    if not JD_PHONE_REFERENCE_PATH.is_file():
+        return None
+    with Image.open(JD_PHONE_REFERENCE_PATH) as source:
+        return source.convert("RGBA")
+
+
 def _draw_jd_phone_reference(
     canvas: Image.Image,
     center_x: int,
     top: int,
     height: int,
 ) -> tuple[int, int, int, int]:
-    """Draw a neutral front/back phone pair representing a 163mm device."""
+    """Draw the supplied iPhone reference as one movable, scalable layer."""
+    reference = _jd_phone_reference_layer()
+    if reference is not None:
+        phone_height = max(90, height)
+        phone_width = max(42, round(phone_height * reference.width / reference.height))
+        left = round(center_x - phone_width / 2)
+        rendered = reference.resize((phone_width, phone_height), Image.Resampling.LANCZOS)
+        canvas.paste(rendered, (left, top), rendered)
+        return left, top, left + phone_width, top + phone_height
+
     draw = ImageDraw.Draw(canvas)
     phone_height = max(90, height)
     phone_width = max(42, round(phone_height * 0.48))

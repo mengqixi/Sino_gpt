@@ -6,11 +6,11 @@ import RecolorPage from "./pages/Recolor";
 import PromptTemplates from "./pages/PromptTemplates";
 import ApiConfigs from "./pages/ApiConfigs";
 import HistoryPage from "./pages/History";
-import Ecommerce from "./pages/Ecommerce";
+import ProductImages from "./pages/ProductImages";
 import VipOrganizer from "./pages/VipOrganizer";
 import "./styles.css";
 
-type Page = "recolor" | "ecommerce" | "organizer" | "generate" | "prompts" | "api" | "history";
+type Page = "recolor" | "product_images" | "organizer" | "generate" | "prompts" | "api" | "history";
 
 type GenerateIntent = {
   images: any[];
@@ -25,7 +25,7 @@ function App() {
   const nav = [
     { key: "recolor" as Page, label: "智能调色", icon: Palette },
     { key: "generate" as Page, label: "AI 生成", icon: Wand2 },
-    { key: "ecommerce" as Page, label: "电商生图", icon: ShoppingBag },
+    { key: "product_images" as Page, label: "生成商品图", icon: ShoppingBag },
     { key: "organizer" as Page, label: "自动化整理", icon: FolderKanban },
     { key: "prompts" as Page, label: "提示词管理", icon: LayoutDashboard },
     { key: "api" as Page, label: "API 设置", icon: KeyRound },
@@ -75,7 +75,9 @@ function App() {
         <div style={{ display: page === "generate" ? "block" : "none" }}>
           <Generate initialIntent={generateIntent} onIntentConsumed={() => setGenerateIntent(null)} />
         </div>
-        {page === "ecommerce" && <Ecommerce />}
+        <div style={{ display: page === "product_images" ? "block" : "none" }}>
+          <ProductImages />
+        </div>
         <div style={{ display: page === "organizer" ? "block" : "none" }}>
           <VipOrganizer />
         </div>

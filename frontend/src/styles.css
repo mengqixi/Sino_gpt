@@ -141,6 +141,8 @@
 .organizer-slot-body select { padding: 7px 8px; }
 .organizer-source-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; min-width: 0; gap: 6px; }
 .organizer-source-picker select.is-manual-source, .organizer-source-picker option.manual-option { color: #bf2f2f; font-weight: 700; }
+.organizer-source-picker option { color: #273a33 !important; font-weight: 400 !important; }
+.organizer-source-picker option.manual-option { color: #bf2f2f !important; font-weight: 700 !important; }
 .organizer-source-picker select { width: 100%; min-width: 0; }
 .organizer-source-picker button, .organizer-adjust-output { display: inline-flex; min-height: 36px; align-items: center; justify-content: center; gap: 5px; padding: 6px 9px; border: 1px solid #b9cbc4; border-radius: 5px; background: #fff; color: #24584a; white-space: nowrap; }
 .organizer-source-picker button:disabled { cursor: not-allowed; opacity: .45; }
@@ -174,6 +176,13 @@
 .slot-adjustment-heading span { color: #6d7772; font-size: 12px; }
 .slot-source-stage, .slot-result-stage { position: relative; display: grid; min-height: 480px; max-height: calc(94vh - 190px); place-items: center; overflow: hidden; border: 1px solid #dce3df; background: #eef1ef; touch-action: none; user-select: none; }
 .slot-source-stage img, .slot-result-stage > img, .slot-result-stage > canvas { display: block; width: 100%; height: 100%; max-height: calc(94vh - 190px); object-fit: contain; pointer-events: none; }
+.slot-result-stage > img, .slot-result-stage > canvas { position: absolute; inset: 0; }
+.slot-result-stage > canvas { z-index: 0; }
+.slot-result-stage > .slot-exact-preview { z-index: 1; visibility: hidden; opacity: 0; }
+.slot-result-stage > .slot-exact-preview.is-visible { visibility: visible; opacity: 1; }
+.slot-safe-area-overlay { position: absolute; inset: 0; z-index: 2; width: 100%; height: 100%; pointer-events: none; }
+.slot-safe-area-overlay rect { fill: rgba(31, 104, 86, .07); stroke: rgba(27, 91, 73, .8); stroke-width: 2; stroke-dasharray: 8 6; }
+.slot-safe-area-overlay text { fill: rgba(27, 91, 73, .88); font: 600 15px sans-serif; letter-spacing: 0; }
 .slot-source-stage.is-cropping { cursor: crosshair; }
 .slot-result-stage { cursor: grab; background: #e7ebe9; }
 .slot-result-stage:active { cursor: grabbing; }
@@ -181,7 +190,7 @@
 .slot-adjustment-controls .confirm-preview { border-color: #1e5c4b; color: #fff; background: #1e5c4b; }
 .slot-preview-pending { color: #9a6416; font-size: 13px; font-weight: 600; }
 .slot-crop-selection { position: absolute; border: 2px solid #fff; outline: 2px solid #1f6856; background: rgba(31, 104, 86, .12); box-shadow: 0 0 0 9999px rgba(10, 18, 15, .48); pointer-events: none; }
-.slot-preview-loading { position: absolute; right: 12px; bottom: 12px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 7px 10px; border: 1px solid rgba(31, 93, 77, .25); border-radius: 5px; color: #164b3e; font-size: 12px; font-weight: 700; background: rgba(255, 255, 255, .92); box-shadow: 0 4px 16px rgba(19, 54, 44, .12); pointer-events: none; }
+.slot-preview-loading { position: absolute; right: 12px; bottom: 12px; z-index: 3; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 7px 10px; border: 1px solid rgba(31, 93, 77, .25); border-radius: 5px; color: #164b3e; font-size: 12px; font-weight: 700; background: rgba(255, 255, 255, .92); box-shadow: 0 4px 16px rgba(19, 54, 44, .12); pointer-events: none; }
 .slot-adjustment-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 13px 16px; border-top: 1px solid #dfe5e2; background: #f7f9f8; }
 .slot-adjustment-controls button { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 6px; padding: 7px 10px; border: 1px solid #ced8d3; border-radius: 5px; background: #fff; color: #273d35; }
 .slot-adjustment-controls button.active-tool { border-color: #1f5d4d; color: #174a3d; background: #e8f1ed; }

@@ -1,4 +1,5 @@
 import base64
+import io
 import mimetypes
 import re
 import shutil
@@ -204,18 +205,41 @@ def crop_generated_image(source_path: str, job_id: int, left: float, top: float,
     return str(output)
 
 
-def decode_base64_image(value: str) -> bytes:
+def decode_base64_image(value: str, max_bytes: int | None = None) -> bytes:
+    encoded = strip_data_url_prefix(value)
+    if max_bytes is not None and len(encoded) > ((int(max_bytes) + 2) // 3) * 4 + 8:
+        raise ValueError("返回图片超过服务器允许的大小")
     try:
-        return base64.b64decode(strip_data_url_prefix(value), validate=False)
+        decoded = base64.b64decode(encoded, validate=False)
     except Exception as exc:
         raise ValueError("base64 图片解码失败") from exc
+    if max_bytes is not None and len(decoded) > int(max_bytes):
+        raise ValueError("返回图片超过服务器允许的大小")
+    return decoded
 
 
-def download_image(url: str, timeout: int) -> bytes:
+def download_image(url: str, timeout: int, max_bytes: int | None = None) -> bytes:
     try:
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        return response.content
+        with requests.get(url, timeout=timeout, stream=True) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length")
+            if max_bytes is not None and content_length:
+                try:
+                    if int(content_length) > int(max_bytes):
+                        raise ValueError("返回图片超过服务器允许的大小")
+                except ValueError as exc:
+                    if "超过服务器" in str(exc):
+                        raise
+            output = io.BytesIO()
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                if max_bytes is not None and output.tell() + len(chunk) > int(max_bytes):
+                    raise ValueError("返回图片超过服务器允许的大小")
+                output.write(chunk)
+            return output.getvalue()
+    except ValueError:
+        raise
     except Exception as exc:
         raise ValueError("图片 URL 下载失败") from exc
 

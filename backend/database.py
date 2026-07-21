@@ -2,7 +2,14 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-from .config import DATA_DIR, DB_PATH, RESULT_DIR, UPLOAD_DIR
+from .config import (
+    DATA_DIR,
+    DB_PATH,
+    PRODUCT_IMAGE_INPUT_DIR,
+    PRODUCT_IMAGE_OUTPUT_DIR,
+    RESULT_DIR,
+    UPLOAD_DIR,
+)
 
 
 def now_iso() -> str:
@@ -36,6 +43,8 @@ def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    PRODUCT_IMAGE_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PRODUCT_IMAGE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with db_session() as conn:
         conn.executescript(
             """
@@ -152,7 +161,137 @@ def init_db() -> None:
                 model_name TEXT NOT NULL,
                 updated_at DATETIME
             );
+
+            CREATE TABLE IF NOT EXISTS product_image_tasks (
+                id TEXT PRIMARY KEY,
+                product_code TEXT NOT NULL,
+                color TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'draft',
+                analysis_config_id INTEGER,
+                image_config_id INTEGER,
+                analysis_used INTEGER NOT NULL DEFAULT 0,
+                analysis_status TEXT,
+                missing_roles_json TEXT NOT NULL DEFAULT '["front","back","semi_side","top","logo"]',
+                selected_assets_json TEXT NOT NULL DEFAULT '{}',
+                analysis_notes_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT,
+                generation_active INTEGER NOT NULL DEFAULT 0,
+                inputs_deleted INTEGER NOT NULL DEFAULT 0,
+                inputs_deleted_at DATETIME,
+                last_activity_at DATETIME NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS product_image_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                file_name TEXT,
+                file_path TEXT NOT NULL,
+                file_size INTEGER,
+                mime_type TEXT,
+                width INTEGER,
+                height INTEGER,
+                duration_seconds REAL,
+                sharpness REAL,
+                parent_asset_id INTEGER,
+                frame_time_seconds REAL,
+                analysis_role TEXT,
+                analysis_valid INTEGER,
+                analysis_confidence INTEGER,
+                analysis_reason TEXT,
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES product_image_tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(parent_asset_id) REFERENCES product_image_assets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS product_image_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                file_path TEXT,
+                mime_type TEXT,
+                width INTEGER,
+                height INTEGER,
+                source_asset_id INTEGER,
+                api_config_id INTEGER,
+                prompt TEXT,
+                error_message TEXT,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                UNIQUE(task_id, slot, variant),
+                FOREIGN KEY(task_id) REFERENCES product_image_tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES product_image_assets(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS product_image_references (
+                task_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                selected_asset_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'missing',
+                selection_source TEXT,
+                confidence INTEGER,
+                reason TEXT,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY(task_id, role),
+                FOREIGN KEY(task_id) REFERENCES product_image_tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(selected_asset_id) REFERENCES product_image_assets(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS product_image_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                call_type TEXT NOT NULL,
+                slot TEXT,
+                attempt_no INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL,
+                api_config_id INTEGER,
+                config_name TEXT,
+                model_name TEXT,
+                endpoint_path TEXT,
+                prompt TEXT,
+                response_preview_json TEXT,
+                error_message TEXT,
+                started_at DATETIME,
+                unknown_at DATETIME,
+                finished_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                UNIQUE(task_id, call_type, slot, attempt_no),
+                FOREIGN KEY(task_id) REFERENCES product_image_tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_product_image_tasks_updated_at
+            ON product_image_tasks(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_product_image_assets_task
+            ON product_image_assets(task_id);
+            CREATE INDEX IF NOT EXISTS idx_product_image_outputs_task
+            ON product_image_outputs(task_id);
+            CREATE INDEX IF NOT EXISTS idx_product_image_calls_task
+            ON product_image_calls(task_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_product_image_one_analysis_call
+            ON product_image_calls(task_id) WHERE call_type = 'analysis';
             """
+        )
+        product_task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(product_image_tasks)").fetchall()
+        }
+        product_task_migrations = {
+            "version": "INTEGER NOT NULL DEFAULT 1",
+            "generation_active": "INTEGER NOT NULL DEFAULT 0",
+            "inputs_deleted_at": "DATETIME",
+            "last_activity_at": "DATETIME",
+        }
+        for column_name, column_sql in product_task_migrations.items():
+            if column_name not in product_task_columns:
+                conn.execute(f"ALTER TABLE product_image_tasks ADD COLUMN {column_name} {column_sql}")
+        conn.execute(
+            "UPDATE product_image_tasks SET last_activity_at = updated_at WHERE last_activity_at IS NULL"
         )
         api_config_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(api_configs)").fetchall()
