@@ -15,6 +15,7 @@ from backend.services.vip_organizer_service import (
     _font,
     _model_showcase_page,
     _normalized_product_page,
+    _paste_layer,
     _paste_product,
     _refine_product_classifications,
     _render_slot_image,
@@ -455,6 +456,19 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(hardware_showcase.size, (750, 750))
         self.assertEqual(detail_showcase.getpixel((375, 400)), (181, 34, 38))
         self.assertEqual(hardware_showcase.getpixel((375, 400)), (181, 34, 38))
+
+    def test_interior_slot_preserves_the_full_uploaded_frame(self):
+        source = Image.new("RGB", (400, 600), "white")
+        ImageDraw.Draw(source).rectangle((120, 85, 365, 540), fill="#252525")
+        expected = Image.new("RGB", (800, 800), "white")
+        _paste_layer(expected, source, (0, 0, 800, 800))
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=source):
+            rendered = _render_slot_image("15.jpg", [12], {})
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIsNone(ImageChops.difference(rendered, expected).getbbox())
 
     def test_slot_map_links_the_two_model_output_sizes(self):
         mapped = _slot_map([

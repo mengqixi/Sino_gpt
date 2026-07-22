@@ -521,7 +521,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         || Math.abs(draft.offset_y) > 0.0001;
       const automaticDetailCandidate = platform === "jd"
         ? ["3.jpg", "4.jpg"].includes(slot.file_name)
-        : ["4.jpg", "15.jpg", "604.jpg", "605.jpg"].includes(slot.file_name);
+        : ["4.jpg", "604.jpg", "605.jpg"].includes(slot.file_name);
       const usesAutomaticDetailCutout = automaticDetailCandidate
         && !hasManualLayout
         && livePreviewHasLightStudioBorder(sourceUrl, image);

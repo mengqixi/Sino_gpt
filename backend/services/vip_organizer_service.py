@@ -39,7 +39,7 @@ JD_LOGO_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "
 JD_PHONE_REFERENCE_PATH = Path(__file__).resolve().parents[1] / "assets" / "iphone_reference.png"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-PREVIEW_RENDER_VERSION = 9
+PREVIEW_RENDER_VERSION = 10
 MAX_PREVIEW_CACHE_ENTRIES = 96
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -2476,7 +2476,7 @@ def _render_slot_image(
         canvas = Image.new("RGB", (950, 1200), "white")
         _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, 950, 1200), adjustment, mode=_crop_aware_mode(adjustment, "cover"))
         return canvas
-    if file_name in {"4.jpg", "15.jpg"}:
+    if file_name == "4.jpg":
         canvas = Image.new("RGB", (800, 800), "white")
         _paste_detail_layer(
             canvas,
@@ -2487,6 +2487,10 @@ def _render_slot_image(
             auto_offset_y=-0.08,
             default_mode="contain",
         )
+        return canvas
+    if file_name == "15.jpg":
+        canvas = Image.new("RGB", (800, 800), "white")
+        _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, 800, 800), adjustment)
         return canvas
     if file_name in {"601.jpg", "602.jpg", "603.jpg"}:
         return _model_showcase_page(source, adjustment)
