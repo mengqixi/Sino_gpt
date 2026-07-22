@@ -676,7 +676,6 @@ function jdProductGeometry(
     },
     heightMm,
     baseBodyHeight: bodyHeight * baseScale,
-    referenceBodyBottom: output.height * (output.height > output.width ? 0.70 : 0.73),
     safe
   };
 }
@@ -790,13 +789,13 @@ function drawJdComparisonPreview(
     ? phoneHeight * phoneReference.naturalWidth / phoneReference.naturalHeight
     : phoneHeight * 0.78;
   const phoneRulerGap = Math.max(38, output.width * 0.075);
-  const phoneRightAllowance = draft.phone_show_ruler === false ? 0 : phoneRulerGap + Math.max(18, output.width * 0.025);
+  const phoneLabelClearance = Math.max(40, output.width * 0.05);
+  const phoneRightAllowance = draft.phone_show_ruler === false ? 0 : phoneRulerGap + phoneLabelClearance;
   const phoneBottomAllowance = draft.phone_show_ruler === false ? 0 : Math.max(28, output.height * 0.055);
   let phoneLeft = output.width * 0.75 + (draft.phone_offset_x || 0) * output.width * 0.18 - phoneWidth / 2;
-  const referenceBodyTop = geometry.referenceBodyBottom - geometry.baseBodyHeight;
   let phoneTop = (draft.phone_alignment || "center") === "bottom"
-    ? geometry.referenceBodyBottom - phoneHeight
-    : (referenceBodyTop + geometry.referenceBodyBottom - phoneHeight) / 2;
+    ? geometry.body.bottom - phoneHeight
+    : (geometry.body.top + geometry.body.bottom - phoneHeight) / 2;
   phoneTop += (draft.phone_offset_y || 0) * output.height * 0.18;
   phoneLeft = Math.max(geometry.safe.left, Math.min(phoneLeft, geometry.safe.right - phoneWidth - phoneRightAllowance));
   phoneTop = Math.max(geometry.safe.top, Math.min(phoneTop, geometry.safe.bottom - phoneHeight - phoneBottomAllowance));
@@ -804,7 +803,7 @@ function drawJdComparisonPreview(
     context.drawImage(phoneReference, phoneLeft, phoneTop, phoneWidth, phoneHeight);
   }
   if (draft.phone_show_ruler !== false) {
-    const phoneRulerX = Math.min(geometry.safe.right - Math.max(12, output.width * 0.02), phoneLeft + phoneWidth + phoneRulerGap);
+    const phoneRulerX = Math.min(geometry.safe.right - phoneLabelClearance, phoneLeft + phoneWidth + phoneRulerGap);
     drawCanvasRuler(
       context,
       { x: phoneRulerX, y: phoneTop },

@@ -2197,7 +2197,6 @@ def _jd_size_product_layout(
         "shape": shape,
         "base_scale": base_scale,
         "base_body_height": body_height * base_scale,
-        "reference_body_bottom": height * (0.70 if height > width else 0.73),
         "scale": scale,
         "paste_x": paste_x,
         "paste_y": paste_y,
@@ -2265,6 +2264,9 @@ def _draw_jd_phone_reference(
     height: int,
 ) -> tuple[int, int, int, int]:
     """Draw the supplied iPhone reference as one movable, scalable layer."""
+    center_x = round(center_x)
+    top = round(top)
+    height = round(height)
     reference = _jd_phone_reference_layer()
     if reference is not None:
         phone_height = max(90, height)
@@ -2360,6 +2362,19 @@ def _draw_jd_phone_reference(
     return left, top, right + phone_width, top + phone_height
 
 
+def _jd_aligned_phone_top(
+    body_box: tuple[int, int, int, int],
+    phone_height: int,
+    alignment: str,
+) -> int:
+    """Align the phone against the currently rendered physical bag body."""
+    body_top = body_box[1]
+    body_bottom = body_box[3]
+    if alignment == "bottom":
+        return round(body_bottom - phone_height)
+    return round((body_top + body_bottom - phone_height) / 2)
+
+
 def _jd_size_comparison_page(
     source: Image.Image,
     size: tuple[int, int],
@@ -2386,12 +2401,7 @@ def _jd_size_comparison_page(
     phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm * normalized["phone_scale"])
     phone_height = max(round(height * 0.095), min(round(height * 0.46), phone_height))
     phone_center_x = width * 0.75 + normalized["phone_offset_x"] * width * 0.18
-    reference_body_bottom = layout["reference_body_bottom"]
-    reference_body_top = reference_body_bottom - layout["base_body_height"]
-    if normalized["phone_alignment"] == "bottom":
-        phone_top = reference_body_bottom - phone_height
-    else:
-        phone_top = round((reference_body_top + reference_body_bottom - phone_height) / 2)
+    phone_top = _jd_aligned_phone_top(rendered_body, phone_height, normalized["phone_alignment"])
     phone_top += round(normalized["phone_offset_y"] * height * 0.18)
     reference = _jd_phone_reference_layer()
     phone_width = max(
@@ -2400,7 +2410,8 @@ def _jd_size_comparison_page(
     )
     phone_left = round(phone_center_x - phone_width / 2)
     phone_ruler_gap = max(38, round(width * 0.075))
-    phone_right_allowance = phone_ruler_gap + max(18, round(width * 0.025)) if normalized["phone_show_ruler"] else 0
+    phone_label_clearance = max(40, round(width * 0.05))
+    phone_right_allowance = phone_ruler_gap + phone_label_clearance if normalized["phone_show_ruler"] else 0
     phone_left = min(max(safe_left, phone_left), max(safe_left, safe_right - phone_width - phone_right_allowance))
     phone_center_x = phone_left + phone_width / 2
     phone_bottom_allowance = 0 if not normalized["phone_show_ruler"] else max(28, round(height * 0.055))
@@ -2431,7 +2442,7 @@ def _jd_size_comparison_page(
         )
 
     if normalized["phone_show_ruler"]:
-        phone_ruler_x = min(safe_right - max(12, round(width * 0.02)), phone_box[2] + phone_ruler_gap)
+        phone_ruler_x = min(safe_right - phone_label_clearance, phone_box[2] + phone_ruler_gap)
         _draw_jd_dimension_bar(
             canvas,
             (phone_ruler_x, phone_box[1]),

@@ -161,9 +161,20 @@ def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
 
         assert abs(zoomed["scale"] / base["scale"] - 1.1) < 0.001
         assert zoomed["base_body_height"] == base["base_body_height"]
-        assert zoomed["reference_body_bottom"] == base["reference_body_bottom"]
         assert zoomed["body_box"][2] - zoomed["body_box"][0] > base["body_box"][2] - base["body_box"][0]
         assert zoomed["body_box"][3] - zoomed["body_box"][1] > base["body_box"][3] - base["body_box"][1]
+
+
+def test_jd_phone_alignment_uses_current_rendered_body():
+    body_box = (120, 210, 360, 410)
+    assert service._jd_aligned_phone_top(body_box, 100, "center") == 260
+    assert service._jd_aligned_phone_top(body_box, 100, "bottom") == 310
+
+
+def test_jd_phone_renderer_accepts_fractional_position():
+    canvas = Image.new("RGB", (800, 800), "white")
+    box = service._draw_jd_phone_reference(canvas, 600.4, 212.6, 163.2)
+    assert all(isinstance(value, int) for value in box)
 
 
 def test_product_cutout_removes_connected_light_gradient_without_losing_white_bag():
@@ -241,6 +252,12 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_zoom_uses_one_baseline_transform(self):
         test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape()
+
+    def test_phone_alignment_tracks_rendered_body(self):
+        test_jd_phone_alignment_uses_current_rendered_body()
+
+    def test_phone_renderer_rounds_coordinates(self):
+        test_jd_phone_renderer_accepts_fractional_position()
 
     def test_phone_comparison_dimension_gate(self):
         test_jd_phone_comparison_waits_for_length_and_height()
