@@ -98,7 +98,7 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_scale: 1,
   phone_offset_x: 0,
   phone_offset_y: 0,
-  phone_alignment: "center",
+  phone_alignment: "bottom",
   product_show_ruler: true,
   phone_show_ruler: true
 };
@@ -607,6 +607,39 @@ function infoRulerGeometry(body: PixelBounds) {
   };
 }
 
+function infoWidthRulerGeometry(baseBody: PixelBounds, currentBody: PixelBounds, linked: boolean) {
+  const segments = [
+    [{ x: 631, y: 480 }, { x: 682, y: 453 }],
+    [{ x: 625, y: 472 }, { x: 636, y: 487 }],
+    [{ x: 677, y: 446 }, { x: 688, y: 461 }]
+  ];
+  // Canvas text rotates around its baseline anchor; this is the visual
+  // equivalent of Pillow's rotated text layer at (631, 468).
+  const text = { x: 659, y: 495 };
+  if (!linked) return { segments, text };
+
+  const baseWidth = Math.max(1, baseBody.right - baseBody.left);
+  const baseHeight = Math.max(1, baseBody.bottom - baseBody.top);
+  const scale = ((currentBody.right - currentBody.left) / baseWidth
+    + (currentBody.bottom - currentBody.top) / baseHeight) / 2;
+  const baseCenter = {
+    x: (baseBody.left + baseBody.right) / 2,
+    y: (baseBody.top + baseBody.bottom) / 2
+  };
+  const currentCenter = {
+    x: (currentBody.left + currentBody.right) / 2,
+    y: (currentBody.top + currentBody.bottom) / 2
+  };
+  const transform = (point: { x: number; y: number }) => ({
+    x: currentCenter.x + (point.x - baseCenter.x) * scale,
+    y: currentCenter.y + (point.y - baseCenter.y) * scale
+  });
+  return {
+    segments: segments.map(([start, end]) => [transform(start), transform(end)]),
+    text: transform(text)
+  };
+}
+
 function liveJdProductLayer(url: string, image: HTMLImageElement, draft: ImageAdjustment): LiveProductLayer {
   const cropKey = [draft.crop_x, draft.crop_y, draft.crop_width, draft.crop_height]
     .map((value) => value.toFixed(5))
@@ -850,7 +883,7 @@ function drawJdComparisonPreview(
   const phoneRightAllowance = draft.phone_show_ruler === false ? 0 : phoneRulerGap + phoneLabelClearance;
   const phoneBottomAllowance = draft.phone_show_ruler === false ? 0 : Math.max(28, output.height * 0.055);
   let phoneLeft = output.width * 0.75 + (draft.phone_offset_x || 0) * output.width * 0.18 - phoneWidth / 2;
-  let phoneTop = (draft.phone_alignment || "center") === "bottom"
+  let phoneTop = (draft.phone_alignment || "bottom") === "bottom"
     ? geometry.body.bottom - phoneHeight
     : (geometry.body.top + geometry.body.bottom - phoneHeight) / 2;
   phoneTop += (draft.phone_offset_y || 0) * output.height * 0.18;
@@ -1005,7 +1038,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       );
       context.restore();
 
-      if (platform === "vip" && slot.file_name === "401.jpg" && draft.product_show_ruler !== false) {
+      if (platform === "vip" && slot.file_name === "401.jpg") {
         const scaleX = output.width / 750;
         const scaleY = output.height / 665;
         const lineColor = "#777";
@@ -1025,12 +1058,34 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         const measuredBottom = Math.min(cropBottom, layerBounds.bottom);
         const sourcePixelWidth = Math.max(1, cropRight - cropLeft);
         const sourcePixelHeight = Math.max(1, cropBottom - cropTop);
-        const ruler = infoRulerGeometry(measuredRight > measuredLeft && measuredBottom > measuredTop ? {
+        const adjustedBody = measuredRight > measuredLeft && measuredBottom > measuredTop ? {
           left: drawX + (measuredLeft - cropLeft) / sourcePixelWidth * drawWidth,
           top: drawY + (measuredTop - cropTop) / sourcePixelHeight * drawHeight,
           right: drawX + (measuredRight - cropLeft) / sourcePixelWidth * drawWidth,
           bottom: drawY + (measuredBottom - cropTop) / sourcePixelHeight * drawHeight
-        } : { left: drawX, top: drawY, right: drawX + drawWidth, bottom: drawY + drawHeight });
+        } : { left: drawX, top: drawY, right: drawX + drawWidth, bottom: drawY + drawHeight };
+        const baseCropLeft = bounds.left * drawSourceScaleX;
+        const baseCropTop = bounds.top * drawSourceScaleY;
+        const baseCropRight = bounds.right * drawSourceScaleX;
+        const baseCropBottom = bounds.bottom * drawSourceScaleY;
+        const baseFitScale = Math.min(areaWidth / Math.max(1, contentWidth), areaHeight / Math.max(1, contentHeight));
+        const baseDrawWidth = contentWidth * baseFitScale;
+        const baseDrawHeight = contentHeight * baseFitScale;
+        const baseDrawX = areaX + (areaWidth - baseDrawWidth) / 2;
+        const baseDrawY = areaY + (areaHeight - baseDrawHeight) / 2;
+        const baseMeasuredLeft = Math.max(baseCropLeft, layerBounds.left);
+        const baseMeasuredTop = Math.max(baseCropTop, layerBounds.top);
+        const baseMeasuredRight = Math.min(baseCropRight, layerBounds.right);
+        const baseMeasuredBottom = Math.min(baseCropBottom, layerBounds.bottom);
+        const baseBody = baseMeasuredRight > baseMeasuredLeft && baseMeasuredBottom > baseMeasuredTop ? {
+          left: baseDrawX + (baseMeasuredLeft - baseCropLeft) / Math.max(1, baseCropRight - baseCropLeft) * baseDrawWidth,
+          top: baseDrawY + (baseMeasuredTop - baseCropTop) / Math.max(1, baseCropBottom - baseCropTop) * baseDrawHeight,
+          right: baseDrawX + (baseMeasuredRight - baseCropLeft) / Math.max(1, baseCropRight - baseCropLeft) * baseDrawWidth,
+          bottom: baseDrawY + (baseMeasuredBottom - baseCropTop) / Math.max(1, baseCropBottom - baseCropTop) * baseDrawHeight
+        } : { left: baseDrawX, top: baseDrawY, right: baseDrawX + baseDrawWidth, bottom: baseDrawY + baseDrawHeight };
+        const linkedRulers = draft.product_show_ruler !== false;
+        const ruler = infoRulerGeometry(linkedRulers ? adjustedBody : baseBody);
+        const widthRuler = infoWidthRulerGeometry(baseBody, adjustedBody, linkedRulers);
         const lengthValue = Number.parseFloat(productInfo.product_length || "");
         const widthValue = Number.parseFloat(productInfo.product_width || "");
         const heightValue = Number.parseFloat(productInfo.product_height || "");
@@ -1054,12 +1109,10 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         context.lineTo(ruler.verticalX + 9 * scaleX, ruler.top);
         context.moveTo(ruler.verticalX - 9 * scaleX, ruler.bottom);
         context.lineTo(ruler.verticalX + 9 * scaleX, ruler.bottom);
-        context.moveTo(631 * scaleX, 480 * scaleY);
-        context.lineTo(682 * scaleX, 453 * scaleY);
-        context.moveTo(625 * scaleX, 472 * scaleY);
-        context.lineTo(636 * scaleX, 487 * scaleY);
-        context.moveTo(677 * scaleX, 446 * scaleY);
-        context.lineTo(688 * scaleX, 461 * scaleY);
+        widthRuler.segments.forEach(([start, end]) => {
+          context.moveTo(start.x * scaleX, start.y * scaleY);
+          context.lineTo(end.x * scaleX, end.y * scaleY);
+        });
         context.stroke();
         context.fillText(dimensionLabel(lengthValue), (ruler.left + ruler.right) / 2, ruler.horizontalY + 36 * scaleY);
         context.save();
@@ -1068,7 +1121,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         context.fillText(dimensionLabel(heightValue), 0, 0);
         context.restore();
         context.save();
-        context.translate(659 * scaleX, 495 * scaleY);
+        context.translate(widthRuler.text.x * scaleX, widthRuler.text.y * scaleY);
         context.rotate(-26 * Math.PI / 180);
         context.fillText(dimensionLabel(widthValue), 0, 0);
         context.restore();

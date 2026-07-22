@@ -183,10 +183,10 @@
 .slot-result-stage > .slot-exact-preview { z-index: 1; visibility: hidden; opacity: 0; }
 .slot-result-stage > .slot-exact-preview.is-visible { visibility: visible; opacity: 1; }
 .slot-safe-area-overlay { position: absolute; inset: 0; z-index: 2; width: 100%; height: 100%; pointer-events: none; }
-.slot-safe-area-overlay rect.adjustment-area { fill: rgba(31, 104, 86, .06); stroke: rgba(27, 91, 73, .82); stroke-width: 2; stroke-dasharray: 8 6; }
-.slot-safe-area-overlay rect.template-area { fill: none; stroke: rgba(83, 92, 88, .68); stroke-width: 1.5; stroke-dasharray: 3 4; }
-.slot-safe-area-overlay text { fill: rgba(27, 91, 73, .88); font: 600 15px sans-serif; letter-spacing: 0; }
-.slot-safe-area-overlay text.template-label { fill: rgba(72, 79, 76, .82); font-size: 13px; }
+.slot-safe-area-overlay rect.adjustment-area { fill: rgba(18, 122, 92, .08); stroke: rgba(10, 94, 70, .96); stroke-width: 2.5; stroke-dasharray: 9 6; }
+.slot-safe-area-overlay rect.template-area { fill: rgba(217, 119, 6, .1); stroke: rgba(180, 83, 9, .96); stroke-width: 2.5; stroke-dasharray: 5 4; }
+.slot-safe-area-overlay text { fill: #075f49; stroke: rgba(255, 255, 255, .92); stroke-width: 3px; paint-order: stroke; font: 700 15px sans-serif; letter-spacing: 0; }
+.slot-safe-area-overlay text.template-label { fill: #9a3f08; font-size: 14px; }
 .slot-source-stage.is-cropping { cursor: crosshair; }
 .slot-result-stage { cursor: grab; background: #e7ebe9; }
 .slot-result-stage:active { cursor: grabbing; }

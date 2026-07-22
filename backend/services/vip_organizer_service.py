@@ -41,7 +41,7 @@ JD_LOGO_BLACK_PATH = Path(__file__).resolve().parents[1] / "assets" / "elle_logo
 JD_LOGO_WHITE_PATH = Path(__file__).resolve().parents[1] / "assets" / "elle_logo_white.png"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-PREVIEW_RENDER_VERSION = 14
+PREVIEW_RENDER_VERSION = 15
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -1341,7 +1341,7 @@ def analyze_assets(
             "2.jpg": ([angle_view["id"]], selection_confidence(angle_view, role=angle_role), "优先使用半侧面或三分之二角度产品图"),
             "3.jpg": ([logo_id], selection_confidence(logo_view, tag="logo"), "优先使用ELLE Logo清晰可见的局部细节"),
             "4.jpg": ([interior_id], selection_confidence(interior_view, tag="interior"), "优先使用内里、开口或内袋细节"),
-            "5.jpg": ([front_view["id"]], selection_confidence(front_view, role="front"), "使用完整产品图生成尺寸与手机对比模板"),
+            "5.jpg": ([front_id], 98 if has_transparent else selection_confidence(front_view, role="front"), "优先使用透明正面图生成尺寸与手机对比模板，缺少时回退正面主图"),
             "透明.png": ([front_id], 98 if has_transparent else 35, "检测到透明通道" if has_transparent else "未检测到透明图，暂用正面候选图"),
         }
     slots = [
@@ -1516,7 +1516,7 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "phone_scale": number("phone_scale", 1.0, 0.5, 1.8),
         "phone_offset_x": number("phone_offset_x", 0.0, -1.5, 1.5),
         "phone_offset_y": number("phone_offset_y", 0.0, -1.5, 1.5),
-        "phone_alignment": "bottom" if value.get("phone_alignment") == "bottom" else "center",
+        "phone_alignment": "center" if value.get("phone_alignment") == "center" else "bottom",
         "product_show_ruler": value.get("product_show_ruler") is not False,
         "phone_show_ruler": value.get("phone_show_ruler") is not False,
     }
@@ -1860,6 +1860,44 @@ def _info_ruler_geometry(
     }
 
 
+def _info_width_ruler_geometry(
+    base_body: tuple[float, float, float, float],
+    current_body: tuple[float, float, float, float],
+    linked: bool,
+) -> dict[str, Any]:
+    segments = [
+        ((631, 480), (682, 453)),
+        ((625, 472), (636, 487)),
+        ((677, 446), (688, 461)),
+    ]
+    text_point = (631, 468)
+    if not linked:
+        return {"segments": segments, "text": text_point, "scale": 1.0}
+
+    base_left, base_top, base_right, base_bottom = base_body
+    current_left, current_top, current_right, current_bottom = current_body
+    base_width = max(1.0, base_right - base_left)
+    base_height = max(1.0, base_bottom - base_top)
+    scale = (
+        (current_right - current_left) / base_width
+        + (current_bottom - current_top) / base_height
+    ) / 2
+    base_center = ((base_left + base_right) / 2, (base_top + base_bottom) / 2)
+    current_center = ((current_left + current_right) / 2, (current_top + current_bottom) / 2)
+
+    def transform(point: tuple[float, float]) -> tuple[int, int]:
+        return (
+            round(current_center[0] + (point[0] - base_center[0]) * scale),
+            round(current_center[1] + (point[1] - base_center[1]) * scale),
+        )
+
+    return {
+        "segments": [(transform(start), transform(end)) for start, end in segments],
+        "text": transform(text_point),
+        "scale": scale,
+    }
+
+
 def _normalized_product_page(
     source: Image.Image,
     size: tuple[int, int] = (800, 800),
@@ -1949,39 +1987,52 @@ def _info_page(
         draw.text((45, y + 34), value[:18], font=_font(19), fill="#555555")
         y += 96
 
-    body = (384.0, 286.0, 594.0, 462.0)
+    normalized = _normalize_adjustment(adjustment)
+    base_body = (384.0, 286.0, 594.0, 462.0)
+    body = base_body
     if product_image is not None:
+        if _has_manual_layout_adjustment(adjustment):
+            base_body = _paste_info_product(Image.new("RGB", image.size, "white"), product_image, None)
         body = _paste_info_product(image, product_image, adjustment)
-    ruler = _info_ruler_geometry(body)
+        if not _has_manual_layout_adjustment(adjustment):
+            base_body = body
+    linked_rulers = normalized["product_show_ruler"]
+    ruler_body = body if linked_rulers else base_body
+    ruler = _info_ruler_geometry(ruler_body)
+    width_ruler = _info_width_ruler_geometry(base_body, body, linked_rulers)
 
-    if _normalize_adjustment(adjustment)["product_show_ruler"]:
-        line_color = "#8a8a8a"
-        horizontal_y = ruler["horizontal_y"]
-        draw.line((ruler["left"], horizontal_y, ruler["right"], horizontal_y), fill=line_color, width=2)
-        draw.line((ruler["left"], horizontal_y - 9, ruler["left"], horizontal_y + 9), fill=line_color, width=2)
-        draw.line((ruler["right"], horizontal_y - 9, ruler["right"], horizontal_y + 9), fill=line_color, width=2)
-        length_text = _dimension_mm(info.get("product_length") or "")
-        length_font = _font(19)
-        length_box = draw.textbbox((0, 0), length_text, font=length_font)
-        length_center = (ruler["left"] + ruler["right"]) / 2
-        draw.text((length_center - (length_box[2] - length_box[0]) / 2, horizontal_y + 16), length_text, font=length_font, fill="#555555")
+    line_color = "#8a8a8a"
+    horizontal_y = ruler["horizontal_y"]
+    draw.line((ruler["left"], horizontal_y, ruler["right"], horizontal_y), fill=line_color, width=2)
+    draw.line((ruler["left"], horizontal_y - 9, ruler["left"], horizontal_y + 9), fill=line_color, width=2)
+    draw.line((ruler["right"], horizontal_y - 9, ruler["right"], horizontal_y + 9), fill=line_color, width=2)
+    length_text = _dimension_mm(info.get("product_length") or "")
+    length_font = _font(19)
+    length_box = draw.textbbox((0, 0), length_text, font=length_font)
+    length_center = (ruler["left"] + ruler["right"]) / 2
+    draw.text((length_center - (length_box[2] - length_box[0]) / 2, horizontal_y + 16), length_text, font=length_font, fill="#555555")
 
-        vertical_x = ruler["vertical_x"]
-        draw.line((vertical_x, ruler["top"], vertical_x, ruler["bottom"]), fill=line_color, width=2)
-        draw.line((vertical_x - 9, ruler["top"], vertical_x + 9, ruler["top"]), fill=line_color, width=2)
-        draw.line((vertical_x - 9, ruler["bottom"], vertical_x + 9, ruler["bottom"]), fill=line_color, width=2)
-        _draw_rotated_text(
-            image,
-            _dimension_mm(info.get("product_height") or ""),
-            (vertical_x - 45, ruler["top"] + max(8, (ruler["bottom"] - ruler["top"] - 98) // 2)),
-            90,
-            _font(18),
-        )
+    vertical_x = ruler["vertical_x"]
+    draw.line((vertical_x, ruler["top"], vertical_x, ruler["bottom"]), fill=line_color, width=2)
+    draw.line((vertical_x - 9, ruler["top"], vertical_x + 9, ruler["top"]), fill=line_color, width=2)
+    draw.line((vertical_x - 9, ruler["bottom"], vertical_x + 9, ruler["bottom"]), fill=line_color, width=2)
+    _draw_rotated_text(
+        image,
+        _dimension_mm(info.get("product_height") or ""),
+        (vertical_x - 45, ruler["top"] + max(8, (ruler["bottom"] - ruler["top"] - 98) // 2)),
+        90,
+        _font(18),
+    )
 
-        draw.line((631, 480, 682, 453), fill=line_color, width=2)
-        draw.line((625, 472, 636, 487), fill=line_color, width=2)
-        draw.line((677, 446, 688, 461), fill=line_color, width=2)
-        _draw_rotated_text(image, _dimension_mm(info.get("product_width") or ""), (631, 468), 26, _font(18))
+    for start, end in width_ruler["segments"]:
+        draw.line((start, end), fill=line_color, width=2)
+    _draw_rotated_text(
+        image,
+        _dimension_mm(info.get("product_width") or ""),
+        width_ruler["text"],
+        26,
+        _font(18),
+    )
 
     disclaimer = info.get("disclaimer") or "包身长宽高测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
     notes = [line.strip() for line in disclaimer.splitlines() if line.strip()]

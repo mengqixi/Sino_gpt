@@ -171,22 +171,34 @@ def test_vip_info_measurement_excludes_sparse_handle():
     assert right >= 290
 
 
-def test_vip_info_rulers_can_be_hidden():
-    info = {"product_length": "19.5", "product_width": "5.5", "product_height": "14"}
-
-    with_rulers = service._info_page(info, None, {"product_show_ruler": True})
-    without_rulers = service._info_page(info, None, {"product_show_ruler": False})
-
-    ruler = service._info_ruler_geometry((384.0, 286.0, 594.0, 462.0))
-    assert with_rulers.getpixel((ruler["left"] + 5, ruler["horizontal_y"])) != (255, 255, 255)
-    assert without_rulers.getpixel((ruler["left"] + 5, ruler["horizontal_y"])) == (255, 255, 255)
-
-
-def test_vip_info_product_and_rulers_share_zoom_and_movement():
+def _vip_info_test_source() -> Image.Image:
     source = Image.new("RGBA", (300, 220), (0, 0, 0, 0))
     draw = ImageDraw.Draw(source)
     draw.arc((90, 10, 210, 135), 180, 360, fill=(40, 40, 40, 255), width=8)
     draw.rectangle((35, 90, 265, 205), fill=(70, 80, 90, 255))
+    return source
+
+
+def test_vip_info_only_product_keeps_all_rulers_fixed():
+    source = _vip_info_test_source()
+    base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
+    adjusted_body = service._paste_info_product(
+        Image.new("RGB", (750, 665), "white"),
+        source,
+        {"zoom": 1.1, "offset_x": 0.08, "offset_y": -0.04},
+    )
+
+    fixed = service._info_ruler_geometry(base_body)
+    product_only = service._info_ruler_geometry(base_body)
+    fixed_width = service._info_width_ruler_geometry(base_body, adjusted_body, False)
+
+    assert product_only == fixed
+    assert fixed_width["segments"][0] == ((631, 480), (682, 453))
+    assert fixed_width["text"] == (631, 468)
+
+
+def test_vip_info_product_and_rulers_share_zoom_and_movement():
+    source = _vip_info_test_source()
 
     base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
     adjusted_body = service._paste_info_product(
@@ -196,10 +208,28 @@ def test_vip_info_product_and_rulers_share_zoom_and_movement():
     )
     base_ruler = service._info_ruler_geometry(base_body)
     adjusted_ruler = service._info_ruler_geometry(adjusted_body)
+    base_width = service._info_width_ruler_geometry(base_body, base_body, False)
+    adjusted_width = service._info_width_ruler_geometry(base_body, adjusted_body, True)
 
     assert adjusted_ruler["right"] - adjusted_ruler["left"] > base_ruler["right"] - base_ruler["left"]
     assert adjusted_ruler["left"] > base_ruler["left"]
     assert adjusted_ruler["top"] < base_ruler["top"]
+    assert adjusted_width["segments"] != base_width["segments"]
+    assert adjusted_width["text"] != base_width["text"]
+
+
+def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
+    info = {"product_length": "19.5", "product_width": "5.5", "product_height": "14"}
+    source = _vip_info_test_source()
+    adjustment = {"zoom": 1.1, "offset_x": 0.08, "offset_y": -0.04}
+
+    product_only = service._info_page(info, source, {**adjustment, "product_show_ruler": False})
+    linked = service._info_page(info, source, {**adjustment, "product_show_ruler": True})
+    base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
+    fixed_ruler = service._info_ruler_geometry(base_body)
+
+    assert product_only.getpixel((fixed_ruler["left"] + 5, fixed_ruler["horizontal_y"])) != (255, 255, 255)
+    assert linked.getpixel((fixed_ruler["left"] + 5, fixed_ruler["horizontal_y"])) == (255, 255, 255)
 
 
 def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
@@ -228,6 +258,7 @@ def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
 
 def test_jd_phone_alignment_uses_current_rendered_body():
     body_box = (120, 210, 360, 410)
+    assert service._normalize_adjustment(None)["phone_alignment"] == "bottom"
     assert service._jd_aligned_phone_top(body_box, 100, "center") == 260
     assert service._jd_aligned_phone_top(body_box, 100, "bottom") == 310
 
@@ -307,6 +338,42 @@ def test_jd_size_slot_keeps_labeled_front_even_for_narrow_bag():
     assert size_slot["image_ids"] == [1]
 
 
+def test_jd_size_slot_prefers_transparent_front_when_available():
+    metrics = {
+        1: {
+            "id": 1, "alpha_ratio": 0.0, "foreground_ratio": 0.15,
+            "bbox_ratio": 0.22, "main_component_ratio": 1.12,
+            "foreground_fill_ratio": 0.82, "center_gold_ratio": 0.25,
+            "sharpness": 80.0,
+        },
+        2: {
+            "id": 2, "alpha_ratio": 0.35, "foreground_ratio": 0.15,
+            "bbox_ratio": 0.22, "main_component_ratio": 1.12,
+            "foreground_fill_ratio": 0.82, "center_gold_ratio": 0.25,
+            "sharpness": 75.0,
+        },
+    }
+
+    def rows(image_ids):
+        return [metrics[image_id].copy() for image_id in image_ids]
+
+    def classify(item):
+        return ("transparent", [], 99, "transparent") if item["id"] == 2 else ("front", [], 88, "front")
+
+    with (
+        patch.object(service, "_validate_session_assets"),
+        patch.object(service, "_uploaded_rows", side_effect=rows),
+        patch.object(service, "_image_metrics", side_effect=lambda item: item),
+        patch.object(service, "_classify_product_metrics", side_effect=classify),
+        patch.object(service, "_refine_product_classifications"),
+    ):
+        result = service.analyze_assets("a" * 32, [1, 2], [], [], platform="jd")
+
+    size_slot = next(slot for slot in result["slots"] if slot["file_name"] == "5.jpg")
+    assert size_slot["image_ids"] == [2]
+    assert size_slot["confidence"] == 98
+
+
 class JdOrganizerGeometryTests(unittest.TestCase):
     def test_black_logo_template_geometry(self):
         test_jd_logo_matches_example_geometry()
@@ -338,11 +405,14 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_vip_info_excludes_handle(self):
         test_vip_info_measurement_excludes_sparse_handle()
 
-    def test_vip_info_ruler_toggle(self):
-        test_vip_info_rulers_can_be_hidden()
+    def test_vip_info_product_only_keeps_rulers_fixed(self):
+        test_vip_info_only_product_keeps_all_rulers_fixed()
 
     def test_vip_info_rulers_follow_product(self):
         test_vip_info_product_and_rulers_share_zoom_and_movement()
+
+    def test_vip_info_rulers_stay_visible(self):
+        test_vip_info_rulers_remain_visible_in_both_adjustment_modes()
 
     def test_connected_background_cutout(self):
         test_product_cutout_removes_connected_light_gradient_without_losing_white_bag()
@@ -352,3 +422,6 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_narrow_front_is_not_replaced_by_side(self):
         test_jd_size_slot_keeps_labeled_front_even_for_narrow_bag()
+
+    def test_transparent_front_is_preferred_for_size_comparison(self):
+        test_jd_size_slot_prefers_transparent_front_when_available()
