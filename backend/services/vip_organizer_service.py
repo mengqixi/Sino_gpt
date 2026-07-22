@@ -39,8 +39,10 @@ JD_LOGO_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "
 JD_PHONE_REFERENCE_PATH = Path(__file__).resolve().parents[1] / "assets" / "iphone_reference.png"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-PREVIEW_RENDER_VERSION = 7
+PREVIEW_RENDER_VERSION = 8
 MAX_PREVIEW_CACHE_ENTRIES = 96
+JD_PHONE_HEIGHT_MM = 163.0
+JD_PHONE_LABEL = "iPhone 17 Pro Max"
 
 
 SLOT_DEFINITIONS = [
@@ -2232,8 +2234,8 @@ def _jd_size_comparison_page(
     rendered_body_width = max(1, rendered_body[2] - rendered_body[0])
     rendered_body_height = max(1, rendered_body[3] - rendered_body[1])
     rendered_pixels_per_mm = rendered_body_height / max(1.0, height_mm)
-    phone_height = round(163.0 * rendered_pixels_per_mm * 0.7 * normalized["phone_scale"])
-    phone_height = max(round(height * 0.095), min(round(height * 0.34), phone_height))
+    phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm * normalized["phone_scale"])
+    phone_height = max(round(height * 0.095), min(round(height * 0.46), phone_height))
     phone_center_x = width * 0.75 + normalized["phone_offset_x"] * width * 0.18
     if normalized["phone_alignment"] == "bottom":
         phone_top = rendered_body[3] - phone_height
@@ -2286,7 +2288,7 @@ def _jd_size_comparison_page(
             vertical_label_side="right",
         )
         label_font = _font(max(13, round(min(size) * 0.02)))
-        phone_label = "iPhone 16 Pro Max"
+        phone_label = JD_PHONE_LABEL
         label_box = draw.textbbox((0, 0), phone_label, font=label_font)
         draw.text(
             (round((phone_box[0] + phone_box[2] - (label_box[2] - label_box[0])) / 2), phone_box[3] + 12),

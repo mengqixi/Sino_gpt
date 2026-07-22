@@ -486,9 +486,8 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
           }
           context.restore();
         }
-        const heightValue = Number.parseFloat(productInfo.product_height || "") || 75;
-        const bodyHeight = Math.max(40, drawHeight * 0.68);
-        const phoneHeight = Math.max(output.height * 0.095, Math.min(output.height * 0.34, bodyHeight * (163 / heightValue) * 0.7 * (draft.phone_scale || 1)));
+        const heightValueMm = (Number.parseFloat(productInfo.product_height || "") || 7.5) * 10;
+        const phoneHeight = Math.max(output.height * 0.095, Math.min(output.height * 0.46, drawHeight * (163 / heightValueMm) * (draft.phone_scale || 1)));
         const pairWidth = phoneReference?.naturalWidth && phoneReference.naturalHeight
           ? phoneHeight * phoneReference.naturalWidth / phoneReference.naturalHeight
           : phoneHeight * 0.78;
@@ -526,7 +525,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
           context.stroke();
           context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
           context.textAlign = "center";
-          context.fillText("iPhone 16 Pro Max", phoneLeft + pairWidth / 2, adjustedPhoneTop + phoneHeight + 22);
+          context.fillText("iPhone 17 Pro Max", phoneLeft + pairWidth / 2, adjustedPhoneTop + phoneHeight + 22);
         }
         context.restore();
       }
