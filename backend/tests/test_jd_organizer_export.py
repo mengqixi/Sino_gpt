@@ -1,7 +1,9 @@
 import zipfile
+import unittest
+from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from backend.services import vip_organizer_service as service
 
@@ -121,3 +123,133 @@ def test_401_manual_product_layer_can_move_outside_original_box():
 def test_expanded_safe_boxes_match_editor_padding_rules():
     assert service._expanded_safe_box((120, 170, 680, 710), (800, 800)) == (76, 126, 724, 754)
     assert service._expanded_safe_box((78, 195, 323, 365), (750, 750), padding_ratio=0.035) == (52, 169, 349, 391)
+
+
+def test_jd_shape_profiles_cover_extreme_and_common_handbag_proportions():
+    assert service._jd_product_shape_profile(80, 200)[0] == "very_tall"
+    assert service._jd_product_shape_profile(130, 200)[0] == "tall"
+    assert service._jd_product_shape_profile(200, 200)[0] == "balanced"
+    assert service._jd_product_shape_profile(320, 200)[0] == "wide"
+    assert service._jd_product_shape_profile(430, 200)[0] == "very_wide"
+    assert service._jd_product_shape_profile(200, 200, physical_ratio=3.0)[0] == "very_wide"
+    assert service._jd_product_shape_profile(300, 160, physical_ratio=0.45)[0] == "tall"
+
+
+def test_jd_phone_comparison_waits_for_length_and_height():
+    assert not service._jd_size_dimensions_ready({})
+    assert not service._jd_size_dimensions_ready({"product_length": "20"})
+    assert service._jd_size_dimensions_ready({"product_length": "20", "product_height": "14"})
+
+
+def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
+    cases = [
+        ((140, 360), (35, 70, 105, 310)),
+        ((260, 320), (45, 70, 215, 270)),
+        ((360, 250), (35, 55, 325, 205)),
+        ((500, 220), (35, 60, 465, 180)),
+    ]
+    for size, body_box in cases:
+        layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        base = service._jd_size_product_layout(layer, body_box, (800, 800), {"product_length": "20", "product_height": "14"}, None)
+        zoomed = service._jd_size_product_layout(
+            layer,
+            body_box,
+            (800, 800),
+            {"product_length": "20", "product_height": "14"},
+            {"zoom": 1.1},
+        )
+
+        assert abs(zoomed["scale"] / base["scale"] - 1.1) < 0.001
+        assert zoomed["base_body_height"] == base["base_body_height"]
+        assert zoomed["reference_body_bottom"] == base["reference_body_bottom"]
+        assert zoomed["body_box"][2] - zoomed["body_box"][0] > base["body_box"][2] - base["body_box"][0]
+        assert zoomed["body_box"][3] - zoomed["body_box"][1] > base["body_box"][3] - base["body_box"][1]
+
+
+def test_product_cutout_removes_connected_light_gradient_without_losing_white_bag():
+    source = Image.new("RGB", (500, 500), "white")
+    pixels = np.asarray(source).copy()
+    yy, xx = np.indices((500, 500))
+    gradient = np.clip(250 - (1 - np.minimum(1, np.hypot(xx - 250, yy - 250) / 360)) * 15, 232, 250).astype(np.uint8)
+    pixels[:, :, 0] = gradient
+    pixels[:, :, 1] = gradient
+    pixels[:, :, 2] = gradient
+    source = Image.fromarray(pixels, "RGB")
+    draw = ImageDraw.Draw(source)
+    draw.rounded_rectangle((145, 180, 355, 360), radius=20, fill="#f7f7f5", outline="#252525", width=8)
+    draw.rectangle((225, 155, 275, 190), fill="#252525")
+
+    cutout = service._product_cutout(source)
+
+    assert cutout.width < 280
+    assert cutout.height < 260
+    assert np.asarray(cutout.getchannel("A")).mean() > 80
+
+
+def test_jd_body_measurement_excludes_sparse_handle_and_chain():
+    layer = Image.new("RGBA", (360, 420), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    draw.arc((105, 20, 255, 230), 180, 360, fill=(30, 30, 30, 255), width=12)
+    draw.rectangle((65, 175, 295, 385), fill=(70, 70, 70, 255))
+
+    left, top, right, bottom = service._jd_product_body_bbox(layer)
+
+    assert top >= 160
+    assert bottom >= 380
+    assert left <= 70
+    assert right >= 290
+
+
+def test_jd_size_slot_keeps_labeled_front_even_for_narrow_bag():
+    metrics = {
+        1: {
+            "id": 1, "alpha_ratio": 0.0, "foreground_ratio": 0.15,
+            "bbox_ratio": 0.22, "main_component_ratio": 0.42,
+            "foreground_fill_ratio": 0.82, "center_gold_ratio": 0.25,
+            "sharpness": 80.0,
+        },
+        2: {
+            "id": 2, "alpha_ratio": 0.0, "foreground_ratio": 0.15,
+            "bbox_ratio": 0.22, "main_component_ratio": 1.12,
+            "foreground_fill_ratio": 0.80, "center_gold_ratio": 0.05,
+            "sharpness": 90.0,
+        },
+    }
+
+    def rows(image_ids):
+        return [metrics[image_id].copy() for image_id in image_ids]
+
+    def classify(item):
+        return ("front", [], 86, "front") if item["id"] == 1 else ("side", [], 90, "side")
+
+    with (
+        patch.object(service, "_validate_session_assets"),
+        patch.object(service, "_uploaded_rows", side_effect=rows),
+        patch.object(service, "_image_metrics", side_effect=lambda item: item),
+        patch.object(service, "_classify_product_metrics", side_effect=classify),
+        patch.object(service, "_refine_product_classifications"),
+    ):
+        result = service.analyze_assets("a" * 32, [1, 2], [], [], platform="jd")
+
+    size_slot = next(slot for slot in result["slots"] if slot["file_name"] == "5.jpg")
+    assert size_slot["image_ids"] == [1]
+
+
+class JdOrganizerGeometryTests(unittest.TestCase):
+    def test_shape_profiles(self):
+        test_jd_shape_profiles_cover_extreme_and_common_handbag_proportions()
+
+    def test_zoom_uses_one_baseline_transform(self):
+        test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape()
+
+    def test_phone_comparison_dimension_gate(self):
+        test_jd_phone_comparison_waits_for_length_and_height()
+
+    def test_connected_background_cutout(self):
+        test_product_cutout_removes_connected_light_gradient_without_losing_white_bag()
+
+    def test_body_measurement_excludes_handle(self):
+        test_jd_body_measurement_excludes_sparse_handle_and_chain()
+
+    def test_narrow_front_is_not_replaced_by_side(self):
+        test_jd_size_slot_keeps_labeled_front_even_for_narrow_bag()

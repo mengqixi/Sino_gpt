@@ -39,8 +39,8 @@ JD_LOGO_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "
 JD_PHONE_REFERENCE_PATH = Path(__file__).resolve().parents[1] / "assets" / "iphone_reference.png"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-PREVIEW_RENDER_VERSION = 11
-MAX_PREVIEW_CACHE_ENTRIES = 96
+PREVIEW_RENDER_VERSION = 12
+MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
 
@@ -1235,9 +1235,11 @@ def analyze_assets(
 
     regular_views = [item for item in full_views if 0.9 <= view_ratio(item) <= 1.8]
     fixed_front_views = [item for item in usable_products if role_overrides.get(item["id"]) == "front"]
-    labeled_front_views = fixed_front_views or [item for item in regular_views if effective_role(item) == "front"]
+    # A front-facing phone bag can be much narrower than a regular handbag.
+    # Do not reject an explicit front label based on the product aspect ratio.
+    labeled_front_views = fixed_front_views or [item for item in full_views if effective_role(item) == "front"]
     front_view = max(
-        labeled_front_views or regular_views or full_views,
+        labeled_front_views or full_views,
         key=lambda item: (
             item["role_confidence"],
             item["foreground_fill_ratio"],
@@ -1360,7 +1362,7 @@ def analyze_assets(
     return {"assets": {"product": products, "model": models, "tag": tags}, "slots": slots}
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=12)
 def _load_image_file(image_id: int, file_path: str, modified_ns: int) -> Image.Image:
     with Image.open(file_path) as source:
         source.draft("RGB", (2400, 2400))
@@ -1431,7 +1433,19 @@ def _product_cutout(source: Image.Image) -> Image.Image:
         ])
         background = np.median(border, axis=0)
         distance = np.linalg.norm(rgb.astype(np.float32) - background, axis=2)
-        raw_mask = (distance > 18).astype(np.uint8)
+        channel_spread = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+        bright_neutral = (rgb.min(axis=2) >= 232) & (channel_spread <= 24)
+        background_candidate = (distance <= 34) | bright_neutral
+        candidate_count, candidate_labels = cv2.connectedComponents(background_candidate.astype(np.uint8), 8)
+        border_labels = np.unique(np.concatenate((
+            candidate_labels[0, :],
+            candidate_labels[-1, :],
+            candidate_labels[:, 0],
+            candidate_labels[:, -1],
+        )))
+        border_labels = border_labels[border_labels > 0]
+        connected_background = np.isin(candidate_labels, border_labels) if candidate_count > 1 else background_candidate
+        raw_mask = (~connected_background).astype(np.uint8)
         raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         count, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask, 8)
         if count <= 1:
@@ -1550,7 +1564,7 @@ def _crop_cache_key(adjustment: dict[str, Any] | None) -> tuple[int, int, int, i
     )
 
 
-@lru_cache(maxsize=96)
+@lru_cache(maxsize=16)
 def _cached_product_cutout(
     image_id: int,
     modified_ns: int,
@@ -1781,6 +1795,13 @@ def _dimension_value_mm(value: str | None) -> float | None:
     if "mm" not in normalized:
         number *= 10
     return number
+
+
+def _jd_size_dimensions_ready(product_info: dict[str, str]) -> bool:
+    return (
+        _dimension_value_mm(product_info.get("product_length")) is not None
+        and _dimension_value_mm(product_info.get("product_height")) is not None
+    )
 
 
 def _dimension_mm(value: str) -> str:
@@ -2055,7 +2076,10 @@ def _jd_product_body_bbox(cutout: Image.Image) -> tuple[int, int, int, int]:
     full_bottom = int(ys.max()) + 1
     row_counts = mask.sum(axis=1)
     max_row_width = int(row_counts.max())
-    broad_rows = row_counts >= max(10, int(round(max_row_width * 0.38)))
+    # Sparse handles and chains often form a closed shape after background
+    # removal. Requiring a substantially broad row keeps them in the cutout
+    # while excluding them from the physical bag-body measurement.
+    broad_rows = row_counts >= max(10, int(round(max_row_width * 0.65)))
     row_run = _mask_longest_run(broad_rows)
     if row_run is None:
         return full_left, full_top, full_right, full_bottom
@@ -2082,6 +2106,107 @@ def _jd_product_body_bbox(cutout: Image.Image) -> tuple[int, int, int, int]:
     if body_right - body_left < cutout.width * 0.18 or body_bottom - body_top < cutout.height * 0.12:
         return full_left, full_top, full_right, full_bottom
     return body_left, body_top, body_right, body_bottom
+
+
+def _jd_product_shape_profile(
+    body_width: int,
+    body_height: int,
+    physical_ratio: float | None = None,
+) -> tuple[str, float, float, float]:
+    """Return stable template limits for tall, balanced, and wide handbag bodies."""
+    visual_ratio = body_width / max(1, body_height)
+    ratio = visual_ratio
+    if physical_ratio is not None and 0.2 <= physical_ratio <= 5.0:
+        ratio = visual_ratio * 0.20 + physical_ratio * 0.80
+    if ratio < 0.55:
+        return "very_tall", 0.25, 0.44, 0.24
+    if ratio < 0.78:
+        return "tall", 0.30, 0.42, 0.29
+    if ratio > 2.0:
+        return "very_wide", 0.43, 0.26, 0.39
+    if ratio > 1.35:
+        return "wide", 0.40, 0.31, 0.36
+    return "balanced", 0.35, 0.37, 0.34
+
+
+def _jd_size_product_layout(
+    cutout: Image.Image,
+    body_box: tuple[int, int, int, int],
+    size: tuple[int, int],
+    product_info: dict[str, str],
+    adjustment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compute one immutable baseline transform, then apply user zoom and movement."""
+    width, height = size
+    normalized = _normalize_adjustment(adjustment)
+    body_left, body_top, body_right, body_bottom = body_box
+    body_width = max(1, body_right - body_left)
+    body_height = max(1, body_bottom - body_top)
+    length_mm = _dimension_value_mm(product_info.get("product_length", "")) or 200.0
+    height_mm = _dimension_value_mm(product_info.get("product_height", ""))
+    if height_mm is None:
+        height_mm = max(60.0, length_mm * body_height / body_width)
+    physical_ratio = length_mm / max(1.0, height_mm)
+    shape, max_width_ratio, max_height_ratio, preferred_width_ratio = _jd_product_shape_profile(
+        body_width,
+        body_height,
+        physical_ratio,
+    )
+
+    preferred_body_width = width * preferred_width_ratio * max(0.82, min(1.08, length_mm / 205.0))
+    base_scale = min(
+        width * max_width_ratio / body_width,
+        height * max_height_ratio / body_height,
+        width * 0.46 / max(1, cutout.width),
+        height * 0.60 / max(1, cutout.height),
+        preferred_body_width / body_width,
+    )
+    scale = base_scale * normalized["zoom"]
+    rendered_width = max(1, round(cutout.width * scale))
+    rendered_height = max(1, round(cutout.height * scale))
+    scaled_body = (
+        round(body_left * scale),
+        round(body_top * scale),
+        round(body_right * scale),
+        round(body_bottom * scale),
+    )
+
+    desired_body_center_x = width * 0.34 + normalized["offset_x"] * width * 0.18
+    desired_body_bottom = height * (0.70 if height > width else 0.73) + normalized["offset_y"] * height * 0.18
+    paste_x = round(desired_body_center_x - (scaled_body[0] + scaled_body[2]) / 2)
+    paste_y = round(desired_body_bottom - scaled_body[3])
+    safe_left = round(width * 0.04)
+    safe_top = round(height * 0.04)
+    safe_right = round(width * 0.96)
+    safe_bottom = round(height * 0.96)
+
+    def clamp_origin(position: int, layer_size: int, minimum: int, maximum: int) -> int:
+        if layer_size <= maximum - minimum:
+            return min(max(minimum, position), maximum - layer_size)
+        return min(max(maximum - layer_size, position), minimum)
+
+    paste_x = clamp_origin(paste_x, rendered_width, safe_left, safe_right)
+    paste_y = clamp_origin(paste_y, rendered_height, safe_top, safe_bottom)
+    rendered_body = (
+        paste_x + scaled_body[0],
+        paste_y + scaled_body[1],
+        paste_x + scaled_body[2],
+        paste_y + scaled_body[3],
+    )
+    return {
+        "shape": shape,
+        "base_scale": base_scale,
+        "base_body_height": body_height * base_scale,
+        "reference_body_bottom": height * (0.70 if height > width else 0.73),
+        "scale": scale,
+        "paste_x": paste_x,
+        "paste_y": paste_y,
+        "rendered_width": rendered_width,
+        "rendered_height": rendered_height,
+        "body_box": rendered_body,
+        "height_mm": height_mm,
+        "safe_box": (safe_left, safe_top, safe_right, safe_bottom),
+    }
 
 
 def _draw_jd_dimension_bar(
@@ -2247,72 +2372,26 @@ def _jd_size_comparison_page(
     width, height = size
     normalized = _normalize_adjustment(adjustment)
     cutout = _product_cutout(_crop_source(source, adjustment))
-    body_left, body_top, body_right, body_bottom = _jd_product_body_bbox(cutout)
-    body_width = max(1, body_right - body_left)
-    body_height = max(1, body_bottom - body_top)
-
-    length_mm = _dimension_value_mm(product_info.get("product_length", "")) or 200.0
-    height_mm = _dimension_value_mm(product_info.get("product_height", ""))
-    if height_mm is None:
-        height_mm = max(60.0, length_mm * body_height / body_width)
-
-    portrait = height > width
-    product_max_width = width * (0.39 if portrait else 0.37)
-    product_max_height = height * (0.36 if portrait else 0.37)
-    preferred_product_width = width * 0.35 * max(0.82, min(1.08, length_mm / 205.0))
-    target_body_width = min(product_max_width, preferred_product_width)
-    product_scale = min(target_body_width / body_width, product_max_height / body_height)
-    if _has_manual_crop(adjustment):
-        # A designer crop defines the complete visible region. Fit that region as
-        # a whole so sparse handles or straps are not clipped by body-only sizing.
-        product_scale = min(
-            product_scale,
-            width * 0.43 / max(1, cutout.width),
-            height * 0.58 / max(1, cutout.height),
-        )
-    product_scale *= normalized["zoom"]
-    resized_width = max(1, round(cutout.width * product_scale))
-    resized_height = max(1, round(cutout.height * product_scale))
+    layout = _jd_size_product_layout(cutout, _jd_product_body_bbox(cutout), size, product_info, adjustment)
+    resized_width = layout["rendered_width"]
+    resized_height = layout["rendered_height"]
     cutout = cutout.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
-    scaled_body = (
-        round(body_left * product_scale),
-        round(body_top * product_scale),
-        round(body_right * product_scale),
-        round(body_bottom * product_scale),
-    )
-
-    desired_body_center_x = width * (0.34 if portrait else 0.34)
-    desired_body_bottom = height * (0.70 if portrait else 0.73)
-    desired_body_center_x += normalized["offset_x"] * width * 0.18
-    desired_body_bottom += normalized["offset_y"] * height * 0.18
-    paste_x = round(desired_body_center_x - (scaled_body[0] + scaled_body[2]) / 2)
-    paste_y = round(desired_body_bottom - scaled_body[3])
-    safe_left = round(width * 0.04)
-    safe_top = round(height * 0.04)
-    safe_right = round(width * 0.96)
-    safe_bottom = round(height * 0.96)
-    paste_x = min(max(safe_left, paste_x), max(safe_left, safe_right - resized_width))
-    product_top = max(safe_top, round(height * 0.16))
-    paste_y = min(max(product_top, paste_y), max(product_top, safe_bottom - resized_height - 35))
+    paste_x = layout["paste_x"]
+    paste_y = layout["paste_y"]
+    safe_left, safe_top, safe_right, safe_bottom = layout["safe_box"]
     canvas.paste(cutout, (paste_x, paste_y), cutout)
-
-    rendered_body = (
-        paste_x + scaled_body[0],
-        paste_y + scaled_body[1],
-        paste_x + scaled_body[2],
-        paste_y + scaled_body[3],
-    )
+    rendered_body = layout["body_box"]
     draw = ImageDraw.Draw(canvas)
-    rendered_body_width = max(1, rendered_body[2] - rendered_body[0])
-    rendered_body_height = max(1, rendered_body[3] - rendered_body[1])
-    rendered_pixels_per_mm = rendered_body_height / max(1.0, height_mm)
+    rendered_pixels_per_mm = layout["base_body_height"] / max(1.0, layout["height_mm"])
     phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm * normalized["phone_scale"])
     phone_height = max(round(height * 0.095), min(round(height * 0.46), phone_height))
     phone_center_x = width * 0.75 + normalized["phone_offset_x"] * width * 0.18
+    reference_body_bottom = layout["reference_body_bottom"]
+    reference_body_top = reference_body_bottom - layout["base_body_height"]
     if normalized["phone_alignment"] == "bottom":
-        phone_top = rendered_body[3] - phone_height
+        phone_top = reference_body_bottom - phone_height
     else:
-        phone_top = round((rendered_body[1] + rendered_body[3] - phone_height) / 2)
+        phone_top = round((reference_body_top + reference_body_bottom - phone_height) / 2)
     phone_top += round(normalized["phone_offset_y"] * height * 0.18)
     reference = _jd_phone_reference_layer()
     phone_width = max(
@@ -2395,6 +2474,8 @@ def _render_jd_slot_image(
     if file_name in {"3.jpg", "4.jpg"}:
         return _jd_product_page(source, size, adjustment, detail=True, logo_color=logo_color)
     if file_name == "5.jpg":
+        if not _jd_size_dimensions_ready(product_info):
+            return None
         return _jd_size_comparison_page(source, size, product_info, adjustment, logo_color)
     if file_name == "透明.png":
         return _normalized_product_page(source, transparent=True, adjustment=adjustment)
@@ -2648,6 +2729,8 @@ def render_slot_preview(
     slot = slot_map.get(file_name, {"image_ids": [], "adjustments": [], "logo_color": "black"})
     if platform == "jd" and target_folder not in {"800", "750"}:
         raise ValueError("京东预览目录必须是 800 或 750")
+    if platform == "jd" and file_name == "5.jpg" and not _jd_size_dimensions_ready(product_info):
+        raise ValueError("请先填写商品长和高，再生成尺寸与手机对比图")
     preview_url = _render_cached_slot_preview(
         session_id,
         file_name,
@@ -2708,6 +2791,8 @@ def export_package(
     slot_definitions = _platform_slot_definitions(platform)
     slot_map = _slot_map(slots, platform)
     _validate_slot_map(session_id, slot_map, platform)
+    if platform == "jd" and not _jd_size_dimensions_ready(product_info):
+        raise ValueError("请先填写商品长和高，再下载京东套图")
     export_id = uuid.uuid4().hex[:12]
     session_result_dir = _session_result_dir(session_id)
     folder = session_result_dir / export_id

@@ -321,6 +321,17 @@ const livePreviewImageCache = new Map<string, HTMLImageElement>();
 const livePreviewBoundsCache = new Map<string, { left: number; top: number; right: number; bottom: number }>();
 const livePreviewCutoutCache = new Map<string, HTMLCanvasElement>();
 const livePreviewLightBorderCache = new Map<string, boolean>();
+type PixelBounds = { left: number; top: number; right: number; bottom: number };
+type LiveProductLayer = { canvas: HTMLCanvasElement; body: PixelBounds };
+const liveJdProductLayerCache = new Map<string, LiveProductLayer>();
+
+function clearLivePreviewCaches() {
+  livePreviewImageCache.clear();
+  livePreviewBoundsCache.clear();
+  livePreviewCutoutCache.clear();
+  livePreviewLightBorderCache.clear();
+  liveJdProductLayerCache.clear();
+}
 
 function livePreviewImage(url: string) {
   const cached = livePreviewImageCache.get(url);
@@ -473,7 +484,346 @@ function livePreviewContentBounds(url: string, image: HTMLImageElement) {
   return bounds;
 }
 
-function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo }: {
+function longestTrueRun(values: boolean[]) {
+  let bestStart = 0;
+  let bestEnd = 0;
+  let currentStart = -1;
+  values.forEach((value, index) => {
+    if (value && currentStart < 0) currentStart = index;
+    if ((!value || index === values.length - 1) && currentStart >= 0) {
+      const end = value && index === values.length - 1 ? index + 1 : index;
+      if (end - currentStart > bestEnd - bestStart) {
+        bestStart = currentStart;
+        bestEnd = end;
+      }
+      currentStart = -1;
+    }
+  });
+  return bestEnd > bestStart ? { start: bestStart, end: bestEnd } : null;
+}
+
+function liveProductBodyBounds(canvas: HTMLCanvasElement): PixelBounds {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return { left: 0, top: 0, right: canvas.width, bottom: canvas.height };
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  const rowCounts = new Array<number>(canvas.height).fill(0);
+  let fullLeft = canvas.width;
+  let fullTop = canvas.height;
+  let fullRight = 0;
+  let fullBottom = 0;
+  for (let y = 0; y < canvas.height; y += 1) {
+    for (let x = 0; x < canvas.width; x += 1) {
+      if (pixels[(y * canvas.width + x) * 4 + 3] <= 28) continue;
+      rowCounts[y] += 1;
+      fullLeft = Math.min(fullLeft, x);
+      fullTop = Math.min(fullTop, y);
+      fullRight = Math.max(fullRight, x + 1);
+      fullBottom = Math.max(fullBottom, y + 1);
+    }
+  }
+  if (fullRight <= fullLeft || fullBottom <= fullTop) {
+    return { left: 0, top: 0, right: canvas.width, bottom: canvas.height };
+  }
+  const maxRowWidth = Math.max(...rowCounts);
+  const broadRun = longestTrueRun(rowCounts.map((count) => count >= Math.max(10, Math.round(maxRowWidth * 0.65))));
+  if (!broadRun) return { left: fullLeft, top: fullTop, right: fullRight, bottom: fullBottom };
+  const paddingY = Math.max(1, Math.round((broadRun.end - broadRun.start) * 0.04));
+  const bodyTop = Math.max(fullTop, broadRun.start - paddingY);
+  const bodyBottom = Math.min(fullBottom, broadRun.end + paddingY);
+  const columnCounts = new Array<number>(canvas.width).fill(0);
+  for (let y = bodyTop; y < bodyBottom; y += 1) {
+    for (let x = 0; x < canvas.width; x += 1) {
+      if (pixels[(y * canvas.width + x) * 4 + 3] > 28) columnCounts[x] += 1;
+    }
+  }
+  const columnRun = longestTrueRun(columnCounts.map((count) => count >= Math.max(2, Math.round((bodyBottom - bodyTop) * 0.14))));
+  if (!columnRun) return { left: fullLeft, top: bodyTop, right: fullRight, bottom: bodyBottom };
+  const paddingX = Math.max(1, Math.round((columnRun.end - columnRun.start) * 0.025));
+  const body = {
+    left: Math.max(fullLeft, columnRun.start - paddingX),
+    top: bodyTop,
+    right: Math.min(fullRight, columnRun.end + paddingX),
+    bottom: bodyBottom
+  };
+  if (body.right - body.left < canvas.width * 0.18 || body.bottom - body.top < canvas.height * 0.12) {
+    return { left: fullLeft, top: fullTop, right: fullRight, bottom: fullBottom };
+  }
+  return body;
+}
+
+function liveJdProductLayer(url: string, image: HTMLImageElement, draft: ImageAdjustment): LiveProductLayer {
+  const cropKey = [draft.crop_x, draft.crop_y, draft.crop_width, draft.crop_height]
+    .map((value) => value.toFixed(5))
+    .join(":");
+  const key = `${url}|${cropKey}`;
+  const cached = liveJdProductLayerCache.get(key);
+  if (cached) return cached;
+  const cutout = livePreviewProductCutout(url, image);
+  const cropLeft = Math.max(0, Math.min(cutout.width - 1, Math.round(draft.crop_x * cutout.width)));
+  const cropTop = Math.max(0, Math.min(cutout.height - 1, Math.round(draft.crop_y * cutout.height)));
+  const cropRight = Math.max(cropLeft + 1, Math.min(cutout.width, Math.round((draft.crop_x + draft.crop_width) * cutout.width)));
+  const cropBottom = Math.max(cropTop + 1, Math.min(cutout.height, Math.round((draft.crop_y + draft.crop_height) * cutout.height)));
+  const context = cutout.getContext("2d", { willReadFrequently: true });
+  const pixels = context?.getImageData(cropLeft, cropTop, cropRight - cropLeft, cropBottom - cropTop).data;
+  let left = cropRight - cropLeft;
+  let top = cropBottom - cropTop;
+  let right = 0;
+  let bottom = 0;
+  if (pixels) {
+    const width = cropRight - cropLeft;
+    const height = cropBottom - cropTop;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (pixels[(y * width + x) * 4 + 3] <= 18) continue;
+        left = Math.min(left, x);
+        top = Math.min(top, y);
+        right = Math.max(right, x + 1);
+        bottom = Math.max(bottom, y + 1);
+      }
+    }
+  }
+  if (right <= left || bottom <= top) {
+    left = 0;
+    top = 0;
+    right = cropRight - cropLeft;
+    bottom = cropBottom - cropTop;
+  }
+  const padding = Math.max(2, Math.round(Math.max(right - left, bottom - top) * 0.012));
+  left = Math.max(0, left - padding);
+  top = Math.max(0, top - padding);
+  right = Math.min(cropRight - cropLeft, right + padding);
+  bottom = Math.min(cropBottom - cropTop, bottom + padding);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, right - left);
+  canvas.height = Math.max(1, bottom - top);
+  canvas.getContext("2d")?.drawImage(
+    cutout,
+    cropLeft + left,
+    cropTop + top,
+    canvas.width,
+    canvas.height,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+  const layer = { canvas, body: liveProductBodyBounds(canvas) };
+  liveJdProductLayerCache.set(key, layer);
+  return layer;
+}
+
+function jdProductShapeProfile(bodyWidth: number, bodyHeight: number, physicalRatio?: number) {
+  const visualRatio = bodyWidth / Math.max(1, bodyHeight);
+  const ratio = physicalRatio && physicalRatio >= 0.2 && physicalRatio <= 5
+    ? visualRatio * 0.20 + physicalRatio * 0.80
+    : visualRatio;
+  if (ratio < 0.55) return { shape: "very_tall", maxWidth: 0.25, maxHeight: 0.44, preferredWidth: 0.24 };
+  if (ratio < 0.78) return { shape: "tall", maxWidth: 0.30, maxHeight: 0.42, preferredWidth: 0.29 };
+  if (ratio > 2) return { shape: "very_wide", maxWidth: 0.43, maxHeight: 0.26, preferredWidth: 0.39 };
+  if (ratio > 1.35) return { shape: "wide", maxWidth: 0.40, maxHeight: 0.31, preferredWidth: 0.36 };
+  return { shape: "balanced", maxWidth: 0.35, maxHeight: 0.37, preferredWidth: 0.34 };
+}
+
+function jdProductGeometry(
+  output: { width: number; height: number },
+  layer: LiveProductLayer,
+  draft: ImageAdjustment,
+  productInfo: Record<string, string>
+) {
+  const bodyWidth = Math.max(1, layer.body.right - layer.body.left);
+  const bodyHeight = Math.max(1, layer.body.bottom - layer.body.top);
+  const lengthMm = (Number.parseFloat(productInfo.product_length || "") || 20) * 10;
+  const providedHeight = Number.parseFloat(productInfo.product_height || "");
+  const heightMm = Number.isFinite(providedHeight) && providedHeight > 0
+    ? providedHeight * 10
+    : Math.max(60, lengthMm * bodyHeight / bodyWidth);
+  const profile = jdProductShapeProfile(bodyWidth, bodyHeight, lengthMm / Math.max(1, heightMm));
+  const preferredBodyWidth = output.width * profile.preferredWidth * Math.max(0.82, Math.min(1.08, lengthMm / 205));
+  const baseScale = Math.min(
+    output.width * profile.maxWidth / bodyWidth,
+    output.height * profile.maxHeight / bodyHeight,
+    output.width * 0.46 / layer.canvas.width,
+    output.height * 0.60 / layer.canvas.height,
+    preferredBodyWidth / bodyWidth
+  );
+  const scale = baseScale * draft.zoom;
+  const width = layer.canvas.width * scale;
+  const height = layer.canvas.height * scale;
+  const scaledBody = {
+    left: layer.body.left * scale,
+    top: layer.body.top * scale,
+    right: layer.body.right * scale,
+    bottom: layer.body.bottom * scale
+  };
+  let x = output.width * 0.34 + draft.offset_x * output.width * 0.18 - (scaledBody.left + scaledBody.right) / 2;
+  let y = output.height * (output.height > output.width ? 0.70 : 0.73) + draft.offset_y * output.height * 0.18 - scaledBody.bottom;
+  const safe = { left: output.width * 0.04, top: output.height * 0.04, right: output.width * 0.96, bottom: output.height * 0.96 };
+  const clampOrigin = (position: number, layerSize: number, minimum: number, maximum: number) => layerSize <= maximum - minimum
+    ? Math.max(minimum, Math.min(position, maximum - layerSize))
+    : Math.max(maximum - layerSize, Math.min(position, minimum));
+  x = clampOrigin(x, width, safe.left, safe.right);
+  y = clampOrigin(y, height, safe.top, safe.bottom);
+  return {
+    x,
+    y,
+    width,
+    height,
+    body: {
+      left: x + scaledBody.left,
+      top: y + scaledBody.top,
+      right: x + scaledBody.right,
+      bottom: y + scaledBody.bottom
+    },
+    heightMm,
+    baseBodyHeight: bodyHeight * baseScale,
+    referenceBodyBottom: output.height * (output.height > output.width ? 0.70 : 0.73),
+    safe
+  };
+}
+
+function drawAdjustmentGuide(
+  context: CanvasRenderingContext2D,
+  output: { width: number; height: number },
+  slot: Slot,
+  platform: OrganizerPlatform,
+  sourceIndex: number,
+  targetFolder: PreviewFolder
+) {
+  const safeArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
+  const safeX = safeArea.x * output.width;
+  const safeY = safeArea.y * output.height;
+  const safeWidth = safeArea.width * output.width;
+  const safeHeight = safeArea.height * output.height;
+  context.save();
+  context.setLineDash([Math.max(5, output.width * 0.008), Math.max(4, output.width * 0.006)]);
+  context.lineWidth = Math.max(2, output.width * 0.002);
+  context.strokeStyle = "rgba(27, 91, 73, .78)";
+  context.strokeRect(safeX, safeY, safeWidth, safeHeight);
+  context.fillStyle = "rgba(27, 91, 73, .08)";
+  context.fillRect(safeX, safeY, safeWidth, safeHeight);
+  context.fillStyle = "rgba(27, 91, 73, .82)";
+  context.font = `600 ${Math.max(13, Math.round(output.width * 0.018))}px sans-serif`;
+  context.fillText("调整安全区（确认预览后不会写入成品）", safeX + 8, Math.max(18, safeY - 8));
+  context.restore();
+}
+
+function drawCanvasRuler(
+  context: CanvasRenderingContext2D,
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  label: string,
+  output: { width: number; height: number },
+  vertical = false,
+  labelOnRight = false
+) {
+  const cap = Math.max(7, output.width * 0.011);
+  context.save();
+  context.strokeStyle = "#777";
+  context.fillStyle = "#666";
+  context.lineWidth = Math.max(1, output.width * 0.002);
+  context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+  context.textAlign = "center";
+  context.beginPath();
+  context.moveTo(start.x, start.y);
+  context.lineTo(end.x, end.y);
+  if (vertical) {
+    context.moveTo(start.x - cap, start.y);
+    context.lineTo(start.x + cap, start.y);
+    context.moveTo(end.x - cap, end.y);
+    context.lineTo(end.x + cap, end.y);
+  } else {
+    context.moveTo(start.x, start.y - cap);
+    context.lineTo(start.x, start.y + cap);
+    context.moveTo(end.x, end.y - cap);
+    context.lineTo(end.x, end.y + cap);
+  }
+  context.stroke();
+  if (vertical) {
+    context.save();
+    context.translate(start.x + (labelOnRight ? cap + 14 : -cap - 14), (start.y + end.y) / 2);
+    context.rotate(-Math.PI / 2);
+    context.fillText(label, 0, 0);
+    context.restore();
+  } else {
+    context.fillText(label, (start.x + end.x) / 2, start.y + cap + 19);
+  }
+  context.restore();
+}
+
+function drawJdComparisonPreview(
+  context: CanvasRenderingContext2D,
+  output: { width: number; height: number },
+  image: HTMLImageElement,
+  sourceUrl: string,
+  phoneReference: HTMLImageElement | null,
+  draft: ImageAdjustment,
+  productInfo: Record<string, string>,
+  logoColor: LogoColor
+) {
+  const layer = liveJdProductLayer(sourceUrl, image, draft);
+  const geometry = jdProductGeometry(output, layer, draft, productInfo);
+  context.fillStyle = "#f3f3f3";
+  context.fillRect(0, 0, output.width, output.height);
+  context.fillStyle = logoColor === "white" ? "#fff" : "#111";
+  context.font = `500 ${Math.round(output.width * 0.078)}px Georgia, serif`;
+  context.textBaseline = "top";
+  context.fillText("ELLE", output.width * 0.04, output.height * 0.042);
+  context.drawImage(layer.canvas, geometry.x, geometry.y, geometry.width, geometry.height);
+
+  const rulerGap = Math.max(28, output.width * 0.045);
+  const lengthValue = Number.parseFloat(productInfo.product_length || "");
+  const heightValue = Number.parseFloat(productInfo.product_height || "");
+  const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue * 10)}mm` : "200mm";
+  const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue * 10)}mm` : `${Math.round(geometry.heightMm)}mm`;
+  if (draft.product_show_ruler !== false) {
+    const horizontalY = Math.min(output.height - 58, geometry.body.bottom + rulerGap);
+    const verticalX = Math.max(output.width * 0.04, geometry.body.left - rulerGap);
+    drawCanvasRuler(context, { x: geometry.body.left, y: horizontalY }, { x: geometry.body.right, y: horizontalY }, lengthLabel, output);
+    drawCanvasRuler(context, { x: verticalX, y: geometry.body.top }, { x: verticalX, y: geometry.body.bottom }, heightLabel, output, true);
+  }
+
+  const phoneHeight = Math.max(
+    output.height * 0.095,
+    Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * (draft.phone_scale || 1))
+  );
+  const phoneWidth = phoneReference?.naturalWidth && phoneReference.naturalHeight
+    ? phoneHeight * phoneReference.naturalWidth / phoneReference.naturalHeight
+    : phoneHeight * 0.78;
+  const phoneRulerGap = Math.max(38, output.width * 0.075);
+  const phoneRightAllowance = draft.phone_show_ruler === false ? 0 : phoneRulerGap + Math.max(18, output.width * 0.025);
+  const phoneBottomAllowance = draft.phone_show_ruler === false ? 0 : Math.max(28, output.height * 0.055);
+  let phoneLeft = output.width * 0.75 + (draft.phone_offset_x || 0) * output.width * 0.18 - phoneWidth / 2;
+  const referenceBodyTop = geometry.referenceBodyBottom - geometry.baseBodyHeight;
+  let phoneTop = (draft.phone_alignment || "center") === "bottom"
+    ? geometry.referenceBodyBottom - phoneHeight
+    : (referenceBodyTop + geometry.referenceBodyBottom - phoneHeight) / 2;
+  phoneTop += (draft.phone_offset_y || 0) * output.height * 0.18;
+  phoneLeft = Math.max(geometry.safe.left, Math.min(phoneLeft, geometry.safe.right - phoneWidth - phoneRightAllowance));
+  phoneTop = Math.max(geometry.safe.top, Math.min(phoneTop, geometry.safe.bottom - phoneHeight - phoneBottomAllowance));
+  if (phoneReference?.complete && phoneReference.naturalWidth) {
+    context.drawImage(phoneReference, phoneLeft, phoneTop, phoneWidth, phoneHeight);
+  }
+  if (draft.phone_show_ruler !== false) {
+    const phoneRulerX = Math.min(geometry.safe.right - Math.max(12, output.width * 0.02), phoneLeft + phoneWidth + phoneRulerGap);
+    drawCanvasRuler(
+      context,
+      { x: phoneRulerX, y: phoneTop },
+      { x: phoneRulerX, y: phoneTop + phoneHeight },
+      "163mm",
+      output,
+      true,
+      true
+    );
+    context.save();
+    context.fillStyle = "#666";
+    context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+    context.textAlign = "center";
+    context.fillText("iPhone 17 Pro Max", phoneLeft + phoneWidth / 2, phoneTop + phoneHeight + 22);
+    context.restore();
+  }
+}
+
+function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor }: {
   sourceUrl: string;
   templateUrl?: string;
   slot: Slot;
@@ -482,6 +832,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
   sourceIndex: number;
   targetFolder: PreviewFolder;
   productInfo: Record<string, string>;
+  logoColor: LogoColor;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -505,6 +856,11 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       context.fillStyle = slot.file_name === "5.jpg" && platform === "jd" ? "#f3f3f3" : "#fff";
       context.fillRect(0, 0, output.width, output.height);
       if (template) context.drawImage(template, 0, 0, output.width, output.height);
+      if (platform === "jd" && slot.file_name === "5.jpg") {
+        drawJdComparisonPreview(context, output, image, sourceUrl, phoneReference, draft, productInfo, logoColor);
+        drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
+        return;
+      }
 
       let area = slotPreviewLayout(slot, platform, sourceIndex, targetFolder);
       const areaX = area.x * output.width;
@@ -525,7 +881,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         area = { x: 0.0875, y: 0.145, width: 0.825, height: 0.775, mode: "contain" };
       }
       const usesProductCutout = (platform === "jd"
-        ? ["2.jpg", "5.jpg", "透明.png"].includes(slot.file_name)
+        ? ["2.jpg", "透明.png"].includes(slot.file_name)
         : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg", "801.jpg"].includes(slot.file_name))
         || usesAutomaticDetailCutout;
       // A manual crop is expressed in full-image coordinates. Automatic content
@@ -633,107 +989,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         context.restore();
       }
 
-      if (platform === "jd" && slot.file_name === "5.jpg") {
-        if (draft.product_show_ruler !== false) {
-          const rulerGap = Math.max(22, output.width * 0.045);
-          const horizontalY = Math.min(output.height - 34, drawY + drawHeight + rulerGap);
-          const verticalX = Math.max(18, drawX - rulerGap);
-          context.save();
-          context.strokeStyle = "#777";
-          context.fillStyle = "#666";
-          context.lineWidth = Math.max(1, output.width * 0.002);
-          context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
-          context.beginPath();
-          context.moveTo(drawX, horizontalY);
-          context.lineTo(drawX + drawWidth, horizontalY);
-          context.moveTo(drawX, horizontalY - 7);
-          context.lineTo(drawX, horizontalY + 7);
-          context.moveTo(drawX + drawWidth, horizontalY - 7);
-          context.lineTo(drawX + drawWidth, horizontalY + 7);
-          context.moveTo(verticalX, drawY);
-          context.lineTo(verticalX, drawY + drawHeight);
-          context.moveTo(verticalX - 7, drawY);
-          context.lineTo(verticalX + 7, drawY);
-          context.moveTo(verticalX - 7, drawY + drawHeight);
-          context.lineTo(verticalX + 7, drawY + drawHeight);
-          context.stroke();
-          const lengthValue = Number.parseFloat(productInfo.product_length || "");
-          const heightValue = Number.parseFloat(productInfo.product_height || "");
-          const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue * 10)}mm` : "200mm";
-          const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue * 10)}mm` : "";
-          context.textAlign = "center";
-          context.fillText(lengthLabel, drawX + drawWidth / 2, horizontalY + 22);
-          if (heightLabel) {
-            context.save();
-            context.translate(verticalX - 12, drawY + drawHeight / 2);
-            context.rotate(-Math.PI / 2);
-            context.fillText(heightLabel, 0, 0);
-            context.restore();
-          }
-          context.restore();
-        }
-        const heightValueMm = (Number.parseFloat(productInfo.product_height || "") || 7.5) * 10;
-        const phoneHeight = Math.max(output.height * 0.095, Math.min(output.height * 0.46, drawHeight * (163 / heightValueMm) * (draft.phone_scale || 1)));
-        const pairWidth = phoneReference?.naturalWidth && phoneReference.naturalHeight
-          ? phoneHeight * phoneReference.naturalWidth / phoneReference.naturalHeight
-          : phoneHeight * 0.78;
-        const phoneCenterX = output.width * 0.75 + (draft.phone_offset_x || 0) * output.width * 0.18;
-        let phoneLeft = phoneCenterX - pairWidth / 2;
-        const phoneTop = (draft.phone_alignment || "center") === "bottom"
-          ? drawY + drawHeight - phoneHeight
-          : drawY + (drawHeight - phoneHeight) / 2;
-        let adjustedPhoneTop = phoneTop + (draft.phone_offset_y || 0) * output.height * 0.18;
-        const phoneSafeArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
-        const phoneSafeLeft = phoneSafeArea.x * output.width;
-        const phoneSafeTop = phoneSafeArea.y * output.height;
-        const phoneSafeRight = (phoneSafeArea.x + phoneSafeArea.width) * output.width;
-        const phoneSafeBottom = (phoneSafeArea.y + phoneSafeArea.height) * output.height;
-        const phoneRulerGap = Math.max(38, output.width * 0.075);
-        const phoneRightAllowance = draft.phone_show_ruler === false ? 0 : phoneRulerGap + Math.max(18, output.width * 0.025);
-        const phoneBottomAllowance = draft.phone_show_ruler === false ? 0 : Math.max(28, output.height * 0.055);
-        phoneLeft = Math.max(phoneSafeLeft, Math.min(phoneLeft, phoneSafeRight - pairWidth - phoneRightAllowance));
-        adjustedPhoneTop = Math.max(phoneSafeTop, Math.min(adjustedPhoneTop, phoneSafeBottom - phoneHeight - phoneBottomAllowance));
-        context.save();
-        if (phoneReference?.complete && phoneReference.naturalWidth) {
-          context.drawImage(phoneReference, phoneLeft, adjustedPhoneTop, pairWidth, phoneHeight);
-        }
-        if (draft.phone_show_ruler !== false) {
-          const phoneRight = phoneLeft + pairWidth;
-          const phoneRulerX = Math.min(phoneSafeRight - Math.max(12, output.width * 0.02), phoneRight + phoneRulerGap);
-          context.strokeStyle = "#777";
-          context.fillStyle = "#666";
-          context.lineWidth = Math.max(1, output.width * 0.002);
-          context.beginPath();
-          context.moveTo(phoneRulerX, adjustedPhoneTop);
-          context.lineTo(phoneRulerX, adjustedPhoneTop + phoneHeight);
-          context.moveTo(phoneRulerX - 7, adjustedPhoneTop);
-          context.lineTo(phoneRulerX + 7, adjustedPhoneTop);
-          context.moveTo(phoneRulerX - 7, adjustedPhoneTop + phoneHeight);
-          context.lineTo(phoneRulerX + 7, adjustedPhoneTop + phoneHeight);
-          context.stroke();
-          context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
-          context.textAlign = "center";
-          context.fillText("iPhone 17 Pro Max", phoneLeft + pairWidth / 2, adjustedPhoneTop + phoneHeight + 22);
-        }
-        context.restore();
-      }
-
-      const safeArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
-      const safeX = safeArea.x * output.width;
-      const safeY = safeArea.y * output.height;
-      const safeWidth = safeArea.width * output.width;
-      const safeHeight = safeArea.height * output.height;
-      context.save();
-      context.setLineDash([Math.max(5, output.width * 0.008), Math.max(4, output.width * 0.006)]);
-      context.lineWidth = Math.max(2, output.width * 0.002);
-      context.strokeStyle = "rgba(27, 91, 73, .78)";
-      context.strokeRect(safeX, safeY, safeWidth, safeHeight);
-      context.fillStyle = "rgba(27, 91, 73, .08)";
-      context.fillRect(safeX, safeY, safeWidth, safeHeight);
-      context.fillStyle = "rgba(27, 91, 73, .82)";
-      context.font = `600 ${Math.max(13, Math.round(output.width * 0.018))}px sans-serif`;
-      context.fillText("调整安全区（确认预览后不会写入成品）", safeX + 8, Math.max(18, safeY - 8));
-      context.restore();
+      drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
     };
     image.addEventListener("load", draw);
     if (template) template.addEventListener("load", draw);
@@ -753,6 +1009,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
     sourceUrl,
     targetFolder,
     templateUrl,
+    logoColor,
     productInfo.product_length,
     productInfo.product_width,
     productInfo.product_height
@@ -767,14 +1024,24 @@ function slotPreviewSignature(
   platform: OrganizerPlatform,
   targetFolder: PreviewFolder = "800"
 ) {
+  const jdSizeInfo = {
+    product_length: productInfo.product_length || "",
+    product_height: productInfo.product_height || ""
+  };
   return JSON.stringify({
     platform,
     targetFolder,
     slot,
-    productInfo: slot.file_name === "401.jpg" || (platform === "jd" && slot.file_name === "5.jpg")
+    productInfo: slot.file_name === "401.jpg"
       ? productInfo
-      : undefined
+      : platform === "jd" && slot.file_name === "5.jpg" ? jdSizeInfo : undefined
   });
+}
+
+function jdComparisonDimensionsReady(productInfo: Record<string, string>) {
+  const length = Number.parseFloat(productInfo.product_length || "");
+  const height = Number.parseFloat(productInfo.product_height || "");
+  return Number.isFinite(length) && length > 0 && Number.isFinite(height) && height > 0;
 }
 
 function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onPreview }: {
@@ -1278,6 +1545,7 @@ function SlotAdjustmentEditor({
                 sourceIndex={sourceIndex}
                 targetFolder={targetFolder}
                 productInfo={productInfo}
+                logoColor={logoColor}
               />
               {renderedPreview && <img
                 className={`slot-exact-preview${previewSynced || holdExactPreview ? " is-visible" : ""}`}
@@ -1426,13 +1694,15 @@ export default function VipOrganizer() {
       return;
     }
     const productInfo = organizerProductInfo();
-    const previewTargets = slots.flatMap((slot) =>
-      previewFoldersForSlot(slot, platform).map((targetFolder) => ({
+    const jdSizeReady = jdComparisonDimensionsReady(productInfo);
+    const previewTargets = slots.flatMap((slot) => {
+      if (platform === "jd" && slot.file_name === "5.jpg" && !jdSizeReady) return [];
+      return previewFoldersForSlot(slot, platform).map((targetFolder) => ({
         slot,
         targetFolder,
         key: slotPreviewKey(platform, slot.file_name, targetFolder)
-      }))
-    );
+      }));
+    });
     const signatures = Object.fromEntries(previewTargets.map((target) => [
       target.key,
       slotPreviewSignature(target.slot, productInfo, platform, target.targetFolder)
@@ -1579,10 +1849,13 @@ export default function VipOrganizer() {
           asset_tags: assetTagsRef.current,
           platform: "jd"
         });
+        const backgroundSlots = result.slots.filter((slot: Slot) => (
+          slot.file_name !== "5.jpg" || jdComparisonDimensionsReady(productInfo)
+        ));
         const folderResults = await Promise.allSettled((["800", "750"] as PreviewFolder[]).map(async (targetFolder) => {
           const previews = await api.previewVipOrganizer({
             session_id: sessionId,
-            slots: result.slots,
+            slots: backgroundSlots,
             product_info: productInfo,
             platform: "jd",
             target_folder: targetFolder
@@ -1596,7 +1869,7 @@ export default function VipOrganizer() {
         const entries = folderResults
           .filter((item): item is PromiseFulfilledResult<(readonly [string, string])[]> => item.status === "fulfilled")
           .flatMap((item) => item.value);
-        const signatures = Object.fromEntries(result.slots.flatMap((slot: Slot) =>
+        const signatures = Object.fromEntries(backgroundSlots.flatMap((slot: Slot) =>
           previewFoldersForSlot(slot, "jd").map((targetFolder) => [
             slotPreviewKey("jd", slot.file_name, targetFolder),
             slotPreviewSignature(slot, productInfo, "jd", targetFolder)
@@ -1668,6 +1941,7 @@ export default function VipOrganizer() {
   }, []);
 
   function applyNewSession(nextSessionId: string) {
+    clearLivePreviewCaches();
     sessionIdRef.current = nextSessionId;
     window.sessionStorage.setItem(sessionStorageKey, nextSessionId);
     setSessionId(nextSessionId);
@@ -2091,13 +2365,18 @@ export default function VipOrganizer() {
   }
 
   async function exportZip() {
+    const productInfo = organizerProductInfo();
+    if (platform === "jd" && !jdComparisonDimensionsReady(productInfo)) {
+      setMessage("请先填写商品长和高，再下载京东套图");
+      return;
+    }
     setBusy(true);
     setMessage("");
     try {
       const result = await api.exportVipOrganizer({
         session_id: sessionId,
         slots,
-        product_info: organizerProductInfo(),
+        product_info: productInfo,
         platform
       });
       const anchor = document.createElement("a");
@@ -2271,7 +2550,7 @@ export default function VipOrganizer() {
         </section>
 
         <section className="panel organizer-info-panel">
-          <div className="section-title-row"><div><h2>3. 商品信息</h2><p>用于自动生成401.jpg产品信息页。</p></div></div>
+          <div className="section-title-row"><div><h2>3. 商品信息</h2><p>用于401.jpg产品信息页；填写长和高后才生成京东5.jpg尺寸与手机对比图。</p></div></div>
           <div className="organizer-info-grid">
             <label>商品名称<input value={info.product_name} onChange={(event) => setInfo({ ...info, product_name: event.target.value })} /></label>
             <label>长（cm）<input inputMode="decimal" placeholder="例如：20" value={info.product_length} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
@@ -2316,9 +2595,12 @@ export default function VipOrganizer() {
               <div className="organizer-slot-grid">
                 {group.slots.map((slot) => {
                   const count = slot.file_name === "606.jpg" ? 4 : 1;
-                  const editableSource = slot.kind !== "generated" || ["401.jpg", "5.jpg"].includes(slot.file_name);
+                  const isLockedJdFront = platform === "jd" && slot.file_name === "5.jpg";
+                  const editableSource = !isLockedJdFront && (slot.kind !== "generated" || slot.file_name === "401.jpg");
                   const previewKey = slotPreviewKey(platform, slot.file_name, group.folder);
-                  const renderedPreview = slotPreviews[previewKey];
+                  const jdSizeReady = platform !== "jd" || slot.file_name !== "5.jpg"
+                    || jdComparisonDimensionsReady(organizerProductInfo());
+                  const renderedPreview = jdSizeReady ? slotPreviews[previewKey] : undefined;
                   const outputSize = slotCanvasSize(slot.size, platform, group.folder);
                   return <article className={`organizer-slot${slot.file_name === "606.jpg" ? " is-composite" : ""}`} key={previewKey}>
                     <div
@@ -2334,7 +2616,7 @@ export default function VipOrganizer() {
                             });
                             delete slotPreviewSignaturesRef.current[previewKey];
                           }} /></button>
-                        : <div className="generated-placeholder"><FileImage size={30} /><span>{previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
+                        : <div className="generated-placeholder"><FileImage size={30} /><span>{!jdSizeReady ? "请先填写商品长和高" : previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                     </div>
                     <div className="organizer-slot-body">
                       <div className="organizer-slot-title"><strong>{slot.file_name}</strong><span>{slot.title}</span><small>{outputSize.width}×{outputSize.height}</small></div>
@@ -2342,13 +2624,13 @@ export default function VipOrganizer() {
                         <button
                           type="button"
                           className="organizer-adjust-output"
-                          disabled={!slot.image_ids[0]}
+                          disabled={!slot.image_ids[0] || !jdSizeReady}
                           onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder, "product")}
                         ><Crop size={16} />调整商品图</button>
                         <button
                           type="button"
                           className="organizer-adjust-output"
-                          disabled={!slot.image_ids[0]}
+                          disabled={!slot.image_ids[0] || !jdSizeReady}
                           onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder, "phone")}
                         ><Smartphone size={16} />调整手机</button>
                       </div> : count === 1 && <button
@@ -2357,6 +2639,13 @@ export default function VipOrganizer() {
                         disabled={!slot.image_ids[0]}
                         onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)}
                       ><Crop size={16} />调整成品</button>}
+                      {isLockedJdFront && <label>来源图片
+                        <span className="organizer-source-picker">
+                          <select value={slot.image_ids[0] || ""} disabled aria-label="京东5固定使用正面主图">
+                            <option value={slot.image_ids[0] || ""}>{selectedAsset(slot.image_ids[0]) ? assetOptionLabel(selectedAsset(slot.image_ids[0]), "product") : "正面主图"}</option>
+                          </select>
+                        </span>
+                      </label>}
                       {editableSource && Array.from({ length: count }).map((_, index) => {
                         const currentAsset = selectedAsset(slot.image_ids[index]);
                         return <label key={index}>{count > 1 ? `来源 ${index + 1}` : "来源图片"}
