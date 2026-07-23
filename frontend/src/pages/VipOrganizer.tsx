@@ -898,7 +898,12 @@ function jdProductGeometry(
     const overlapsLogoColumns = x < logo.left + 190 + horizontalGap
       && x + width > logo.left - horizontalGap;
     if (overlapsLogoColumns) {
-      effectiveSafeTop = Math.max(effectiveSafeTop, logo.top + 60 + output.height * 0.04);
+      const isTallHandleBag = bodyWidth / Math.max(1, bodyHeight) <= 1.15
+        && liveHandleVisualLift(layer.canvas) >= 0.55;
+      const clearance = output.width === 800 && output.height === 800
+        ? isTallHandleBag ? 97 : output.height * 0.09
+        : output.height * (isTallHandleBag ? 0.07 : 0.04);
+      effectiveSafeTop = Math.max(effectiveSafeTop, logo.top + 60 + clearance);
     }
   }
   y = clampOrigin(y, height, effectiveSafeTop, safe.bottom);
@@ -1236,6 +1241,20 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       const safeBottom = (editorArea.y + editorArea.height) * output.height;
       if (drawWidth <= safeRight - safeLeft) drawX = Math.max(safeLeft, Math.min(drawX, safeRight - drawWidth));
       if (drawHeight <= safeBottom - safeTop) drawY = Math.max(safeTop, Math.min(drawY, safeBottom - drawHeight));
+      if (platform === "jd" && slot.file_name === "2.jpg") {
+        const body = productLayer ? liveInfoMeasurementBounds(productLayer) : null;
+        const isTallHandleBag = productLayer && body
+          ? (body.right - body.left) / Math.max(1, body.bottom - body.top) <= 1.15
+            && liveHandleVisualLift(productLayer) >= 0.55
+          : false;
+        const baseSafeTop = output.width === 800 && output.height === 800 ? 162 : 175;
+        const tallHandleSafeTop = output.width === 800 && output.height === 800 ? 190 : 195;
+        const minimumTop = isTallHandleBag ? tallHandleSafeTop : baseSafeTop;
+        const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
+        drawY = drawHeight <= maximumBottom - minimumTop
+          ? Math.max(minimumTop, Math.min(drawY, maximumBottom - drawHeight))
+          : Math.max(drawY, minimumTop);
+      }
 
       context.fillStyle = "#fff";
       if (platform === "vip" && slot.file_name === "401.jpg") {

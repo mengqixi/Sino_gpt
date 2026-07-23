@@ -1603,6 +1603,8 @@ def _paste_layer(
     *,
     mode: str = "contain",
     clip_box: tuple[int, int, int, int] | None = None,
+    minimum_top: int | None = None,
+    maximum_bottom: int | None = None,
 ) -> None:
     left, top, right, bottom = box
     box_width = max(1, right - left)
@@ -1627,6 +1629,12 @@ def _paste_layer(
         global_x = max(clip_left, min(global_x, clip_right - rendered.width))
     if rendered.height <= clip_height:
         global_y = max(clip_top, min(global_y, clip_bottom - rendered.height))
+    if minimum_top is not None:
+        global_y = max(minimum_top, global_y)
+    if maximum_bottom is not None:
+        latest_y = maximum_bottom - rendered.height
+        if minimum_top is None or latest_y >= minimum_top:
+            global_y = min(latest_y, global_y)
     x = global_x - clip_left
     y = global_y - clip_top
     region_mode = "RGBA" if canvas.mode == "RGBA" or rendered.mode == "RGBA" else "RGB"
@@ -1745,6 +1753,9 @@ def _paste_product(
     auto_tall_handle_drop: bool = False,
     tall_handle_drop_ratio: float = 0.12,
     auto_offset_y: float = 0.0,
+    minimum_rendered_top: int | None = None,
+    tall_handle_minimum_rendered_top: int | None = None,
+    maximum_rendered_bottom: int | None = None,
 ) -> None:
     image_id = source.info.get("_organizer_image_id")
     modified_ns = source.info.get("_organizer_modified_ns")
@@ -1756,6 +1767,15 @@ def _paste_product(
         ).copy()
     else:
         cutout = _product_cutout(_crop_source(source, adjustment))
+    effective_minimum_top = minimum_rendered_top
+    if tall_handle_minimum_rendered_top is not None:
+        body_left, body_top, body_right, body_bottom = _info_measurement_bbox(cutout)
+        body_ratio = (body_right - body_left) / max(1, body_bottom - body_top)
+        if body_ratio <= 1.15 and _handle_visual_lift(cutout) >= 0.55:
+            effective_minimum_top = max(
+                effective_minimum_top or 0,
+                tall_handle_minimum_rendered_top,
+            )
     layout_adjustment = adjustment
     if auto_handle_layout and not _has_manual_crop(adjustment):
         normalized = _normalize_adjustment(adjustment)
@@ -1777,7 +1797,15 @@ def _paste_product(
                 + (cutout.height / 2 - body_center_y) * scale / box_height
             ),
         }
-    _paste_layer(canvas, cutout, box, layout_adjustment, clip_box=clip_box)
+    _paste_layer(
+        canvas,
+        cutout,
+        box,
+        layout_adjustment,
+        clip_box=clip_box,
+        minimum_top=effective_minimum_top,
+        maximum_bottom=maximum_rendered_bottom,
+    )
 
 
 def _paste_product_floating(
@@ -2425,6 +2453,21 @@ def _jd_product_page(
             clip_box=clip_box,
             auto_handle_layout=True,
             auto_tall_handle_drop=True,
+            minimum_rendered_top=(
+                162
+                if size == (800, 800)
+                else 175
+            ),
+            tall_handle_minimum_rendered_top=(
+                190
+                if size == (800, 800)
+                else 195
+            ),
+            maximum_rendered_bottom=(
+                740
+                if size == (800, 800)
+                else 930
+            ),
         )
     _draw_jd_elle_logo(canvas, size, logo_color)
     return canvas
@@ -2566,7 +2609,13 @@ def _jd_size_product_layout(
             and paste_x + rendered_width > logo_left - horizontal_gap
         )
         if overlaps_logo_columns:
-            effective_safe_top = max(effective_safe_top, logo_bottom + round(height * 0.04))
+            body_ratio = body_width / max(1, body_height)
+            is_tall_handle_bag = body_ratio <= 1.15 and _handle_visual_lift(cutout) >= 0.55
+            if size == (800, 800):
+                clearance = 97 if is_tall_handle_bag else round(height * 0.09)
+            else:
+                clearance = round(height * (0.07 if is_tall_handle_bag else 0.04))
+            effective_safe_top = max(effective_safe_top, logo_bottom + clearance)
     paste_y = clamp_origin(paste_y, rendered_height, effective_safe_top, safe_bottom)
     rendered_body = (
         paste_x + scaled_body[0],

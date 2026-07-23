@@ -679,10 +679,38 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         )
         constrained = _jd_size_product_layout(cutout, body, (800, 800), product_info, None)
 
-        self.assertLess(unconstrained["paste_y"], 130)
-        self.assertEqual(constrained["paste_y"], 130)
+        self.assertLess(unconstrained["paste_y"], 195)
+        self.assertEqual(constrained["paste_y"], 195)
         self.assertGreater(constrained["paste_y"], unconstrained["paste_y"])
-        self.assertEqual(constrained["body_box"][1] - unconstrained["body_box"][1], 12)
+        self.assertEqual(constrained["body_box"][1] - unconstrained["body_box"][1], 77)
+
+    def test_jd_second_slot_keeps_handles_below_logo_safe_line(self):
+        tote = Image.new("RGBA", (440, 700), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tote)
+        draw.arc((120, 20, 320, 360), 180, 360, fill=(30, 30, 30, 255), width=24)
+        draw.rectangle((45, 250, 395, 680), fill=(70, 70, 70, 255))
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=tote):
+            square = _render_slot_image("2.jpg", [1], {}, platform="jd", target_folder="800")
+            portrait = _render_slot_image("2.jpg", [1], {}, platform="jd", target_folder="750")
+
+        self.assertIsNotNone(square)
+        self.assertIsNotNone(portrait)
+        assert square is not None and portrait is not None
+
+        def product_top(image: Image.Image, left: int) -> int:
+            crop = image.crop((left, 0, image.width, image.height))
+            bbox = ImageChops.difference(crop, Image.new("RGB", crop.size, "white")).getbbox()
+            self.assertIsNotNone(bbox)
+            assert bbox is not None
+            return bbox[1]
+
+        square_top = product_top(square, 250)
+        portrait_top = product_top(portrait, 260)
+        self.assertGreaterEqual(square_top, 190)
+        self.assertGreaterEqual(portrait_top, 195)
+        self.assertLessEqual(square_top, 205)
+        self.assertLessEqual(portrait_top, 210)
 
     def test_slot_map_links_the_two_model_output_sizes(self):
         mapped = _slot_map([
