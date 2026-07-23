@@ -1133,7 +1133,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         || draft.crop_width < 0.9999
         || draft.crop_height < 0.9999;
       const automaticDetailCandidate = platform !== "jd"
-        && ["604.jpg", "605.jpg"].includes(slot.file_name);
+        && ["15.jpg", "604.jpg", "605.jpg"].includes(slot.file_name);
       const usesAutomaticDetailCutout = automaticDetailCandidate
         && !hasManualCrop
         && livePreviewHasLightStudioBorder(sourceUrl, image);
@@ -1163,7 +1163,9 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       const fitScale = area.mode === "cover" && !hasManualCrop && !usesAutomaticDetailCutout
         ? Math.max(areaWidth / sourceWidth, areaHeight / sourceHeight)
         : Math.min(areaWidth / sourceWidth, areaHeight / sourceHeight);
-      const automaticDetailScale = usesAutomaticDetailCutout ? 0.82 : 1;
+      const automaticDetailScale = usesAutomaticDetailCutout
+        ? slot.file_name === "15.jpg" ? 0.9 : 0.82
+        : 1;
       const detailRatio = contentWidth / Math.max(1, contentHeight);
       const vipDetailOffset = detailRatio <= 0.78
         ? -0.105
@@ -1179,7 +1181,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         && productLayer
         && !hasManualCrop;
       let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
-        + (usesAutomaticDetailCutout ? vipDetailOffset * areaHeight : 0)
+        + (usesAutomaticDetailCutout && slot.file_name !== "15.jpg" ? vipDetailOffset * areaHeight : 0)
         - (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name) && !hasManualCrop ? 0.03 * areaHeight : 0)
         + (tallHandleDropAware && productLayer && !hasManualCrop ? 0.12 * liveHandleVisualLift(productLayer) * areaHeight : 0);
       if (bodyCentered) {
@@ -1952,12 +1954,10 @@ function SlotAdjustmentEditor({
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("length_ruler");
                 setCropMode(false);
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
               }}>长标线</button>
               <button type="button" className={infoMoveTarget === "height_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("height_ruler");
                 setCropMode(false);
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
               }}>高标线</button>
               <button type="button" className={infoMoveTarget === "width_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("width_ruler");

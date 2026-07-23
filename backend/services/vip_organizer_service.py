@@ -2973,7 +2973,15 @@ def _render_slot_image(
         return canvas
     if file_name == "15.jpg":
         canvas = Image.new("RGB", (800, 800), "white")
-        _paste_layer(canvas, _crop_source(source.convert("RGB"), adjustment), (0, 0, 800, 800), adjustment)
+        _paste_detail_layer(
+            canvas,
+            source,
+            (0, 0, 800, 800),
+            adjustment,
+            auto_zoom=0.9,
+            auto_offset_y=0.0,
+            default_mode="contain",
+        )
         return canvas
     if file_name in {"601.jpg", "602.jpg", "603.jpg"}:
         return _model_showcase_page(source, adjustment)

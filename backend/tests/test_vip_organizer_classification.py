@@ -538,18 +538,32 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(hardware_showcase.getpixel((375, 400)), (181, 34, 38))
         self.assertIsNone(ImageChops.difference(detail_showcase, hardware_showcase).getbbox())
 
-    def test_interior_slot_preserves_the_full_uploaded_frame(self):
+    def test_interior_slot_enlarges_a_small_subject_on_a_white_studio_frame(self):
         source = Image.new("RGB", (400, 600), "white")
         ImageDraw.Draw(source).rectangle((120, 85, 365, 540), fill="#252525")
-        expected = Image.new("RGB", (800, 800), "white")
-        _paste_layer(expected, source, (0, 0, 800, 800))
 
         with patch("backend.services.vip_organizer_service._load_image", return_value=source):
             rendered = _render_slot_image("15.jpg", [12], {})
 
         self.assertIsNotNone(rendered)
         assert rendered is not None
-        self.assertIsNone(ImageChops.difference(rendered, expected).getbbox())
+        foreground = ImageChops.difference(rendered, Image.new("RGB", rendered.size, "white")).getbbox()
+        self.assertIsNotNone(foreground)
+        assert foreground is not None
+        self.assertGreaterEqual(foreground[3] - foreground[1], 700)
+        self.assertAlmostEqual((foreground[0] + foreground[2]) / 2, 400, delta=2)
+        self.assertAlmostEqual((foreground[1] + foreground[3]) / 2, 400, delta=2)
+
+    def test_interior_slot_keeps_a_full_bleed_detail_frame_unchanged(self):
+        source = Image.new("RGB", (800, 800), "#7fa1bd")
+        ImageDraw.Draw(source).rectangle((0, 260, 800, 800), fill="#8a6548")
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=source):
+            rendered = _render_slot_image("15.jpg", [12], {})
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIsNone(ImageChops.difference(rendered, source).getbbox())
 
     def test_slot_map_links_the_two_model_output_sizes(self):
         mapped = _slot_map([
