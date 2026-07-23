@@ -854,7 +854,8 @@ function jdProductGeometry(
   output: { width: number; height: number },
   layer: LiveProductLayer,
   draft: ImageAdjustment,
-  productInfo: Record<string, string>
+  productInfo: Record<string, string>,
+  enforceLogoClearance = true
 ) {
   const bodyWidth = Math.max(1, layer.body.right - layer.body.left);
   const bodyHeight = Math.max(1, layer.body.bottom - layer.body.top);
@@ -888,7 +889,19 @@ function jdProductGeometry(
     ? Math.max(minimum, Math.min(position, maximum - layerSize))
     : Math.max(maximum - layerSize, Math.min(position, minimum));
   x = clampOrigin(x, width, safe.left, safe.right);
-  y = clampOrigin(y, height, safe.top, safe.bottom);
+  let effectiveSafeTop = safe.top;
+  if (enforceLogoClearance) {
+    const logo = output.width === 750 && output.height === 1000
+      ? { left: 56, top: 45 }
+      : { left: 32, top: 38 };
+    const horizontalGap = output.width * 0.02;
+    const overlapsLogoColumns = x < logo.left + 190 + horizontalGap
+      && x + width > logo.left - horizontalGap;
+    if (overlapsLogoColumns) {
+      effectiveSafeTop = Math.max(effectiveSafeTop, logo.top + 60 + output.height * 0.04);
+    }
+  }
+  y = clampOrigin(y, height, effectiveSafeTop, safe.bottom);
   return {
     x,
     y,
@@ -993,6 +1006,12 @@ function drawJdComparisonPreview(
     offset_x: 0,
     offset_y: 0
   }, productInfo);
+  const phoneAnchorGeometry = jdProductGeometry(output, layer, {
+    ...draft,
+    zoom: 1,
+    offset_x: 0,
+    offset_y: 0
+  }, productInfo, false);
   context.fillStyle = "#f3f3f3";
   context.fillRect(0, 0, output.width, output.height);
   if (logoReference?.complete && logoReference.naturalWidth) {
@@ -1043,8 +1062,8 @@ function drawJdComparisonPreview(
       : height * 0.78;
     let left = output.width * 0.75 + offsetX * output.width * 0.18 - width / 2;
     let top = (draft.phone_alignment || "bottom") === "bottom"
-      ? baseGeometry.body.bottom - height
-      : (baseGeometry.body.top + baseGeometry.body.bottom - height) / 2;
+      ? phoneAnchorGeometry.body.bottom - height
+      : (phoneAnchorGeometry.body.top + phoneAnchorGeometry.body.bottom - height) / 2;
     top += offsetY * output.height * 0.18;
     left = Math.max(geometry.safe.left, Math.min(left, geometry.safe.right - width - phoneRightAllowance));
     top = Math.max(geometry.safe.top, Math.min(top, geometry.safe.bottom - height - phoneBottomAllowance));
@@ -1081,8 +1100,9 @@ function drawJdComparisonPreview(
   context.restore();
 }
 
-function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor }: {
+function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor }: {
   sourceUrl: string;
+  compositePrimaryUrl?: string;
   templateUrl?: string;
   slot: Slot;
   draft: ImageAdjustment;
@@ -1103,6 +1123,9 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
     canvas.width = output.width;
     canvas.height = output.height;
     const image = livePreviewImage(sourceUrl);
+    const compositePrimary = platform === "vip" && slot.file_name === "606.jpg"
+      ? livePreviewImage(compositePrimaryUrl || sourceUrl)
+      : null;
     const template = templateUrl && platform !== "jd" ? livePreviewImage(templateUrl) : null;
     const phoneReference = platform === "jd" && slot.file_name === "5.jpg"
       ? livePreviewImage("/organizer-assets/iphone_reference.png")
@@ -1112,6 +1135,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       : null;
     const draw = () => {
       if (!image.complete || !image.naturalWidth) return;
+      if (compositePrimary && (!compositePrimary.complete || !compositePrimary.naturalWidth)) return;
       if (template && (!template.complete || !template.naturalWidth)) return;
       context.clearRect(0, 0, output.width, output.height);
       context.fillStyle = slot.file_name === "5.jpg" && platform === "jd" ? "#f3f3f3" : "#fff";
@@ -1132,8 +1156,10 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         || draft.crop_y > 0.0001
         || draft.crop_width < 0.9999
         || draft.crop_height < 0.9999;
-      const automaticDetailCandidate = platform !== "jd"
-        && ["15.jpg", "604.jpg", "605.jpg"].includes(slot.file_name);
+      const automaticInteriorDetail = (platform === "vip" && slot.file_name === "15.jpg")
+        || (platform === "jd" && slot.file_name === "4.jpg");
+      const automaticDetailCandidate = automaticInteriorDetail
+        || (platform === "vip" && ["604.jpg", "605.jpg"].includes(slot.file_name));
       const usesAutomaticDetailCutout = automaticDetailCandidate
         && !hasManualCrop
         && livePreviewHasLightStudioBorder(sourceUrl, image);
@@ -1164,7 +1190,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
         ? Math.max(areaWidth / sourceWidth, areaHeight / sourceHeight)
         : Math.min(areaWidth / sourceWidth, areaHeight / sourceHeight);
       const automaticDetailScale = usesAutomaticDetailCutout
-        ? slot.file_name === "15.jpg" ? 0.9 : 0.82
+        ? automaticInteriorDetail ? 0.9 : 0.82
         : 1;
       const detailRatio = contentWidth / Math.max(1, contentHeight);
       const vipDetailOffset = detailRatio <= 0.78
@@ -1173,17 +1199,27 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       const drawWidth = sourceWidth * fitScale * draft.zoom * automaticDetailScale;
       const drawHeight = sourceHeight * fitScale * draft.zoom * automaticDetailScale;
       let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+      const multiAngleHandleLift = compositePrimary
+        ? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
+        : 0;
+      const multiAngleRowShift = multiAngleHandleLift >= 0.55
+        ? (sourceIndex < 2 ? 1 : -1) * Math.round(13 * multiAngleHandleLift * output.height / 750)
+        : 0;
       const handleAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
         || (platform === "jd" && slot.file_name === "2.jpg");
       const tallHandleDropAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
         || (platform === "jd" && slot.file_name === "2.jpg");
+      const tallHandleDropRatio = platform === "vip" && slot.file_name === "2.jpg" ? 0.14 : 0.12;
       const bodyCentered = (handleAware || (platform === "vip" && slot.file_name === "401.jpg"))
         && productLayer
         && !hasManualCrop;
       let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
-        + (usesAutomaticDetailCutout && slot.file_name !== "15.jpg" ? vipDetailOffset * areaHeight : 0)
+        + multiAngleRowShift
+        + (usesAutomaticDetailCutout && !automaticInteriorDetail ? vipDetailOffset * areaHeight : 0)
         - (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name) && !hasManualCrop ? 0.03 * areaHeight : 0)
-        + (tallHandleDropAware && productLayer && !hasManualCrop ? 0.12 * liveHandleVisualLift(productLayer) * areaHeight : 0);
+        + (tallHandleDropAware && productLayer && !hasManualCrop
+          ? tallHandleDropRatio * liveHandleVisualLift(productLayer) * areaHeight
+          : 0);
       if (bodyCentered) {
         const body = liveInfoMeasurementBounds(productLayer);
         const cropLeft = sourceX * drawSourceScaleX;
@@ -1343,12 +1379,14 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
       drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
     };
     image.addEventListener("load", draw);
+    if (compositePrimary) compositePrimary.addEventListener("load", draw);
     if (template) template.addEventListener("load", draw);
     if (phoneReference) phoneReference.addEventListener("load", draw);
     if (logoReference) logoReference.addEventListener("load", draw);
     draw();
     return () => {
       image.removeEventListener("load", draw);
+      if (compositePrimary) compositePrimary.removeEventListener("load", draw);
       if (template) template.removeEventListener("load", draw);
       if (phoneReference) phoneReference.removeEventListener("load", draw);
       if (logoReference) logoReference.removeEventListener("load", draw);
@@ -1360,6 +1398,7 @@ function LiveSlotPreview({ sourceUrl, templateUrl, slot, draft, platform, source
     slot.size,
     sourceIndex,
     sourceUrl,
+    compositePrimaryUrl,
     targetFolder,
     templateUrl,
     logoColor,
@@ -1464,6 +1503,7 @@ function SlotAdjustmentEditor({
   slot,
   sourceIndex,
   sourceUrl,
+  compositePrimaryUrl,
   displaySourceUrl,
   initialPreview,
   productInfo,
@@ -1477,6 +1517,7 @@ function SlotAdjustmentEditor({
   slot: Slot;
   sourceIndex: number;
   sourceUrl: string;
+  compositePrimaryUrl?: string;
   displaySourceUrl?: string;
   initialPreview?: string;
   productInfo: Record<string, string>;
@@ -1896,6 +1937,7 @@ function SlotAdjustmentEditor({
             >
               <LiveSlotPreview
                 sourceUrl={sourceUrl}
+                compositePrimaryUrl={compositePrimaryUrl}
                 templateUrl={renderedPreview || initialPreview}
                 slot={slot}
                 draft={draft}
@@ -2880,6 +2922,9 @@ export default function VipOrganizer() {
   const activeEditorAsset = activeEditorSlot && adjustmentEditor
     ? selectedAsset(activeEditorSlot.image_ids[adjustmentEditor.sourceIndex])
     : undefined;
+  const activeEditorPrimaryAsset = activeEditorSlot?.file_name === "606.jpg"
+    ? selectedAsset(activeEditorSlot.image_ids[0])
+    : undefined;
   const previewGroups = useMemo(() => {
     if (platform !== "jd") {
       return [{
@@ -3141,6 +3186,7 @@ export default function VipOrganizer() {
         slot={activeEditorSlot}
         sourceIndex={adjustmentEditor.sourceIndex}
         sourceUrl={activeEditorAsset.original_url || activeEditorAsset.preview_url}
+        compositePrimaryUrl={activeEditorPrimaryAsset?.original_url || activeEditorPrimaryAsset?.preview_url}
         displaySourceUrl={adjustmentEditor.targetObject === "phone" ? "/organizer-assets/iphone_reference.png" : undefined}
         initialPreview={slotPreviews[slotPreviewKey(platform, activeEditorSlot.file_name, adjustmentEditor.targetFolder)]}
         productInfo={organizerProductInfo()}

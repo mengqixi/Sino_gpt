@@ -1743,6 +1743,7 @@ def _paste_product(
     clip_box: tuple[int, int, int, int] | None = None,
     auto_handle_layout: bool = False,
     auto_tall_handle_drop: bool = False,
+    tall_handle_drop_ratio: float = 0.12,
     auto_offset_y: float = 0.0,
 ) -> None:
     image_id = source.info.get("_organizer_image_id")
@@ -1765,7 +1766,7 @@ def _paste_product(
         body_left, body_top, body_right, body_bottom = _info_measurement_bbox(cutout)
         body_center_x = (body_left + body_right) / 2
         body_center_y = (body_top + body_bottom) / 2
-        tall_handle_drop_y = 0.12 * _handle_visual_lift(cutout) if auto_tall_handle_drop else 0.0
+        tall_handle_drop_y = tall_handle_drop_ratio * _handle_visual_lift(cutout) if auto_tall_handle_drop else 0.0
         layout_adjustment = {
             **normalized,
             "offset_x": normalized["offset_x"] + (cutout.width / 2 - body_center_x) * scale / box_width,
@@ -1894,6 +1895,24 @@ def _handle_visual_lift(cutout: Image.Image) -> float:
         return 0.0
     ratio = headroom / body_height
     return max(0.0, min(1.0, (ratio - 0.06) / 0.28))
+
+
+def _multi_angle_visual_row_shift(source: Image.Image) -> int:
+    """Pull the two 606 rows toward the center when the bag has tall handles."""
+    image_id = source.info.get("_organizer_image_id")
+    modified_ns = source.info.get("_organizer_modified_ns")
+    if isinstance(image_id, int) and isinstance(modified_ns, int):
+        cutout = _cached_product_cutout(
+            image_id,
+            modified_ns,
+            _crop_cache_key(None),
+        ).copy()
+    else:
+        cutout = _product_cutout(source)
+    handle_lift = _handle_visual_lift(cutout)
+    if handle_lift < 0.55:
+        return 0
+    return round(13 * handle_lift)
 
 
 def _paste_info_product(
@@ -2030,6 +2049,7 @@ def _normalized_product_page(
     adjustment: dict[str, Any] | None = None,
     auto_handle_layout: bool = False,
     auto_tall_handle_drop: bool = False,
+    tall_handle_drop_ratio: float = 0.12,
     auto_offset_y: float = 0.0,
     manual_padding_ratio: float | None = None,
 ) -> Image.Image:
@@ -2056,18 +2076,25 @@ def _normalized_product_page(
         clip_box=clip_box,
         auto_handle_layout=auto_handle_layout,
         auto_tall_handle_drop=auto_tall_handle_drop,
+        tall_handle_drop_ratio=tall_handle_drop_ratio,
         auto_offset_y=auto_offset_y,
     )
     return canvas
 
 
-def _catalog_product_page(source: Image.Image, adjustment: dict[str, Any] | None = None) -> Image.Image:
+def _catalog_product_page(
+    source: Image.Image,
+    adjustment: dict[str, Any] | None = None,
+    *,
+    tall_handle_drop_ratio: float = 0.12,
+) -> Image.Image:
     """Match the catalog reference while centering the visible bag body."""
     return _normalized_product_page(
         source,
         adjustment=adjustment,
         auto_handle_layout=True,
         auto_tall_handle_drop=True,
+        tall_handle_drop_ratio=tall_handle_drop_ratio,
         auto_offset_y=-0.03,
     )
 
@@ -2258,10 +2285,18 @@ def _multi_angle_page(
         (427, 500, 672, 680),
     ]
     adjustments = adjustments or []
-    for index, (image_id, box) in enumerate(zip(image_ids[:4], boxes)):
+    sources = [_load_image(image_id) for image_id in image_ids[:4]]
+    visual_row_shift = _multi_angle_visual_row_shift(sources[0]) if sources else 0
+    for index, (source, box) in enumerate(zip(sources, boxes)):
         adjustment = adjustments[index] if index < len(adjustments) else None
-        clip_box = _expanded_safe_box(box, canvas.size, padding_ratio=0.06) if _has_manual_layout_adjustment(adjustment) else None
-        _paste_product(canvas, _load_image(image_id), box, adjustment, clip_box=clip_box)
+        row_shift = visual_row_shift if index < 2 else -visual_row_shift
+        shifted_box = (box[0], box[1] + row_shift, box[2], box[3] + row_shift)
+        clip_box = (
+            _expanded_safe_box(shifted_box, canvas.size, padding_ratio=0.06)
+            if _has_manual_layout_adjustment(adjustment)
+            else None
+        )
+        _paste_product(canvas, source, shifted_box, adjustment, clip_box=clip_box)
     draw.line((346, 420, 404, 420), fill="#a8a8a8", width=2)
     draw.line((375, 391, 375, 449), fill="#a8a8a8", width=2)
     return canvas
@@ -2395,6 +2430,27 @@ def _jd_product_page(
     return canvas
 
 
+def _jd_interior_detail_page(
+    source: Image.Image,
+    size: tuple[int, int],
+    adjustment: dict[str, Any] | None,
+    logo_color: str = "black",
+) -> Image.Image:
+    """Use the VIP 15 interior-detail framing while retaining the JD logo."""
+    canvas = Image.new("RGB", size, "white")
+    _paste_detail_layer(
+        canvas,
+        source,
+        (0, 0, *size),
+        adjustment,
+        auto_zoom=0.9,
+        auto_offset_y=0.0,
+        default_mode="contain",
+    )
+    _draw_jd_elle_logo(canvas, size, logo_color)
+    return canvas
+
+
 def _mask_longest_run(values: np.ndarray) -> tuple[int, int] | None:
     indices = np.flatnonzero(values)
     if not len(indices):
@@ -2446,6 +2502,8 @@ def _jd_size_product_layout(
     size: tuple[int, int],
     product_info: dict[str, str],
     adjustment: dict[str, Any] | None,
+    *,
+    enforce_logo_clearance: bool = True,
 ) -> dict[str, Any]:
     """Compute one immutable baseline transform, then apply user zoom and movement."""
     width, height = size
@@ -2497,7 +2555,19 @@ def _jd_size_product_layout(
         return min(max(maximum - layer_size, position), minimum)
 
     paste_x = clamp_origin(paste_x, rendered_width, safe_left, safe_right)
-    paste_y = clamp_origin(paste_y, rendered_height, safe_top, safe_bottom)
+    effective_safe_top = safe_top
+    if enforce_logo_clearance:
+        logo_left, logo_top = ((32, 38) if size == (800, 800) else (56, 45))
+        logo_right = logo_left + 190
+        logo_bottom = logo_top + 60
+        horizontal_gap = round(width * 0.02)
+        overlaps_logo_columns = (
+            paste_x < logo_right + horizontal_gap
+            and paste_x + rendered_width > logo_left - horizontal_gap
+        )
+        if overlaps_logo_columns:
+            effective_safe_top = max(effective_safe_top, logo_bottom + round(height * 0.04))
+    paste_y = clamp_origin(paste_y, rendered_height, effective_safe_top, safe_bottom)
     rendered_body = (
         paste_x + scaled_body[0],
         paste_y + scaled_body[1],
@@ -2701,6 +2771,14 @@ def _jd_size_comparison_page(
     body_bbox = _jd_product_body_bbox(cutout)
     layout = _jd_size_product_layout(cutout, body_bbox, size, product_info, adjustment)
     base_layout = _jd_size_product_layout(cutout, body_bbox, size, product_info, None)
+    phone_anchor_layout = _jd_size_product_layout(
+        cutout,
+        body_bbox,
+        size,
+        product_info,
+        None,
+        enforce_logo_clearance=False,
+    )
     resized_width = layout["rendered_width"]
     resized_height = layout["rendered_height"]
     cutout = cutout.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
@@ -2714,7 +2792,7 @@ def _jd_size_comparison_page(
     phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm * normalized["phone_scale"])
     phone_height = max(round(height * 0.095), min(round(height * 0.46), phone_height))
     phone_center_x = width * 0.75 + normalized["phone_offset_x"] * width * 0.18
-    phone_top = _jd_aligned_phone_top(base_layout["body_box"], phone_height, normalized["phone_alignment"])
+    phone_top = _jd_aligned_phone_top(phone_anchor_layout["body_box"], phone_height, normalized["phone_alignment"])
     phone_top += round(normalized["phone_offset_y"] * height * 0.18)
     reference = _jd_phone_reference_layer()
     phone_width = max(
@@ -2851,7 +2929,7 @@ def _render_jd_slot_image(
         return _jd_model_page(source, size, adjustment, with_logo=True, logo_color=logo_color)
     if file_name == "2.jpg":
         return _jd_product_page(source, size, adjustment, logo_color=logo_color)
-    if file_name in {"3.jpg", "4.jpg"}:
+    if file_name == "3.jpg":
         canvas = Image.new("RGB", size, "white")
         _paste_layer(
             canvas,
@@ -2862,6 +2940,8 @@ def _render_jd_slot_image(
         )
         _draw_jd_elle_logo(canvas, size, logo_color)
         return canvas
+    if file_name == "4.jpg":
+        return _jd_interior_detail_page(source, size, adjustment, logo_color)
     if file_name == "5.jpg":
         if not _jd_size_dimensions_ready(product_info):
             return None
@@ -2983,6 +3063,8 @@ def _render_slot_image(
             default_mode="contain",
         )
         return canvas
+    if file_name == "2.jpg":
+        return _catalog_product_page(source, adjustment, tall_handle_drop_ratio=0.14)
     if file_name in {"601.jpg", "602.jpg", "603.jpg"}:
         return _model_showcase_page(source, adjustment)
     if file_name in {"604.jpg", "605.jpg"}:

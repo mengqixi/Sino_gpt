@@ -15,7 +15,10 @@ from backend.services.vip_organizer_service import (
     _api_analysis_prompt,
     _font,
     _jd_product_body_bbox,
+    _jd_size_product_layout,
     _model_showcase_page,
+    _multi_angle_page,
+    _multi_angle_visual_row_shift,
     _normalized_product_page,
     _paste_layer,
     _paste_product,
@@ -103,6 +106,72 @@ class VipOrganizerClassificationTests(unittest.TestCase):
             (catalog_bbox[1] + catalog_bbox[3]) / 2,
             delta=2,
         )
+
+    def test_multi_angle_tall_handles_pull_both_rows_toward_visual_center(self):
+        tote = Image.new("RGBA", (440, 440), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tote)
+        draw.arc((120, 20, 320, 285), 180, 360, fill=(30, 30, 30, 255), width=24)
+        draw.rectangle((45, 180, 395, 410), fill=(70, 70, 70, 255))
+        ordinary = Image.new("RGBA", (440, 440), (0, 0, 0, 0))
+        ImageDraw.Draw(ordinary).rectangle((45, 90, 395, 410), fill=(70, 70, 70, 255))
+
+        self.assertEqual(_multi_angle_visual_row_shift(tote), 13)
+        self.assertEqual(_multi_angle_visual_row_shift(ordinary), 0)
+
+        with (
+            patch("backend.services.vip_organizer_service._load_image", return_value=self._small_catalog_product()),
+            patch("backend.services.vip_organizer_service._multi_angle_visual_row_shift", return_value=0),
+        ):
+            baseline = _multi_angle_page([1, 2, 3, 4])
+        with (
+            patch("backend.services.vip_organizer_service._load_image", return_value=self._small_catalog_product()),
+            patch("backend.services.vip_organizer_service._multi_angle_visual_row_shift", return_value=13),
+        ):
+            centered = _multi_angle_page([1, 2, 3, 4])
+
+        def row_bbox(image: Image.Image, top: int, bottom: int) -> tuple[int, int, int, int]:
+            crop = image.crop((0, top, 750, bottom))
+            pixels = np.asarray(crop)
+            foreground = (
+                (pixels[:, :, 0] > 150)
+                & (pixels[:, :, 0] < 225)
+                & (pixels[:, :, 1] < 150)
+                & (pixels[:, :, 2] < 170)
+            )
+            bbox = Image.fromarray((foreground * 255).astype(np.uint8), mode="L").getbbox()
+            self.assertIsNotNone(bbox)
+            assert bbox is not None
+            return bbox[0], bbox[1] + top, bbox[2], bbox[3] + top
+
+        baseline_top = row_bbox(baseline, 170, 380)
+        centered_top = row_bbox(centered, 170, 395)
+        baseline_bottom = row_bbox(baseline, 470, 710)
+        centered_bottom = row_bbox(centered, 455, 710)
+        self.assertEqual(centered_top[1] - baseline_top[1], 13)
+        self.assertEqual(centered_top[3] - baseline_top[3], 13)
+        self.assertEqual(centered_bottom[1] - baseline_bottom[1], -13)
+        self.assertEqual(centered_bottom[3] - baseline_bottom[3], -13)
+
+    def test_vip_second_catalog_slot_lowers_only_tall_handle_bags_a_little_more(self):
+        tote = Image.new("RGBA", (440, 440), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tote)
+        draw.arc((120, 20, 320, 285), 180, 360, fill=(30, 30, 30, 255), width=24)
+        draw.rectangle((45, 180, 395, 410), fill=(70, 70, 70, 255))
+        with patch("backend.services.vip_organizer_service._load_image", return_value=tote):
+            second = _render_slot_image("2.jpg", [1], {})
+            third = _render_slot_image("3.jpg", [1], {})
+
+        self.assertIsNotNone(second)
+        self.assertIsNotNone(third)
+        assert second is not None and third is not None
+        white = Image.new("RGB", (800, 800), "white")
+        second_bbox = ImageChops.difference(second, white).getbbox()
+        third_bbox = ImageChops.difference(third, white).getbbox()
+        self.assertIsNotNone(second_bbox)
+        self.assertIsNotNone(third_bbox)
+        assert second_bbox is not None and third_bbox is not None
+        self.assertAlmostEqual(second_bbox[1] - third_bbox[1], 11, delta=1)
+        self.assertAlmostEqual(second_bbox[3] - third_bbox[3], 11, delta=1)
 
     def test_detail_shape_offset_moves_tall_details_lower_than_wide_details(self):
         self.assertEqual(_detail_shape_offset_y(Image.new("RGBA", (60, 120))), -0.105)
@@ -564,6 +633,56 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertIsNotNone(rendered)
         assert rendered is not None
         self.assertIsNone(ImageChops.difference(rendered, source).getbbox())
+
+    def test_jd_fourth_slot_enlarges_white_border_details_but_keeps_full_bleed_frames(self):
+        small = self._small_catalog_product()
+        full_bleed = Image.new("RGB", (800, 800), "#7fa1bd")
+        ImageDraw.Draw(full_bleed).rectangle((0, 260, 800, 800), fill="#8a6548")
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=small):
+            enlarged = _render_slot_image("4.jpg", [11], {}, platform="jd")
+        with patch("backend.services.vip_organizer_service._load_image", return_value=full_bleed):
+            unchanged = _render_slot_image("4.jpg", [12], {}, platform="jd")
+
+        self.assertIsNotNone(enlarged)
+        self.assertIsNotNone(unchanged)
+        assert enlarged is not None and unchanged is not None
+        pixels = np.asarray(enlarged)
+        foreground = (
+            (pixels[:, :, 0] > 150)
+            & (pixels[:, :, 0] < 225)
+            & (pixels[:, :, 1] < 150)
+            & (pixels[:, :, 2] < 170)
+        )
+        bbox = Image.fromarray((foreground * 255).astype(np.uint8), mode="L").getbbox()
+        self.assertIsNotNone(bbox)
+        assert bbox is not None
+        self.assertGreaterEqual(bbox[2] - bbox[0], 690)
+        self.assertEqual(unchanged.getpixel((400, 400)), full_bleed.getpixel((400, 400)))
+        self.assertEqual(unchanged.getpixel((700, 700)), full_bleed.getpixel((700, 700)))
+
+    def test_jd_comparison_keeps_tall_handle_product_below_logo_clearance(self):
+        cutout = Image.new("RGBA", (440, 700), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(cutout)
+        draw.arc((120, 20, 320, 360), 180, 360, fill=(30, 30, 30, 255), width=24)
+        draw.rectangle((45, 250, 395, 680), fill=(70, 70, 70, 255))
+        body = (45, 250, 395, 680)
+        product_info = {"product_length": "20", "product_height": "14"}
+
+        unconstrained = _jd_size_product_layout(
+            cutout,
+            body,
+            (800, 800),
+            product_info,
+            None,
+            enforce_logo_clearance=False,
+        )
+        constrained = _jd_size_product_layout(cutout, body, (800, 800), product_info, None)
+
+        self.assertLess(unconstrained["paste_y"], 130)
+        self.assertEqual(constrained["paste_y"], 130)
+        self.assertGreater(constrained["paste_y"], unconstrained["paste_y"])
+        self.assertEqual(constrained["body_box"][1] - unconstrained["body_box"][1], 12)
 
     def test_slot_map_links_the_two_model_output_sizes(self):
         mapped = _slot_map([
