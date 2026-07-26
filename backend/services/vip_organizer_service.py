@@ -2201,6 +2201,7 @@ def _paste_layer(
     clip_box: tuple[int, int, int, int] | None = None,
     minimum_top: int | None = None,
     maximum_bottom: int | None = None,
+    allow_free_position: bool = False,
 ) -> None:
     left, top, right, bottom = box
     box_width = max(1, right - left)
@@ -2221,8 +2222,9 @@ def _paste_layer(
     rendered = layer.resize(rendered_size, Image.Resampling.LANCZOS)
     global_x = left + (box_width - rendered.width) // 2 + int(round(normalized["offset_x"] * box_width))
     global_y = top + (box_height - rendered.height) // 2 + int(round(normalized["offset_y"] * box_height))
-    global_x = _clamp_layer_origin(global_x, rendered.width, clip_left, clip_right)
-    global_y = _clamp_layer_origin(global_y, rendered.height, clip_top, clip_bottom)
+    if not allow_free_position:
+        global_x = _clamp_layer_origin(global_x, rendered.width, clip_left, clip_right)
+        global_y = _clamp_layer_origin(global_y, rendered.height, clip_top, clip_bottom)
     if minimum_top is not None:
         global_y = max(minimum_top, global_y)
     if maximum_bottom is not None:
@@ -3675,6 +3677,7 @@ def _render_jd_slot_image(
             (0, 0, *size),
             adjustment,
             mode=_crop_aware_mode(adjustment, "cover"),
+            allow_free_position=_has_manual_layout_adjustment(adjustment),
         )
         _draw_jd_elle_logo(canvas, size, logo_color)
         return canvas

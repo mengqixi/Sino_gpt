@@ -857,8 +857,8 @@ function infoRulerGeometry(body: PixelBounds) {
     right,
     top,
     bottom,
-    verticalX: Math.max(285, left - Math.max(34, Math.round(width * 0.205))),
-    horizontalY: Math.min(535, bottom + Math.max(34, Math.round(lineHeight * 0.19)))
+    verticalX: left - Math.max(34, Math.round(width * 0.205)),
+    horizontalY: bottom + Math.max(34, Math.round(lineHeight * 0.19))
   };
 }
 
@@ -910,7 +910,7 @@ function transformProductRulerSegment(
 }
 
 function infoWidthRulerGeometry(baseBody: PixelBounds, draft: ImageAdjustment) {
-  const start = { x: Math.min(660, baseBody.right + 22), y: Math.min(520, baseBody.bottom + 18) };
+  const start = { x: baseBody.right + 22, y: baseBody.bottom + 18 };
   const end = { x: start.x + 51, y: start.y - 27 };
   const center = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
   const scale = draft.width_ruler_scale || 1;
@@ -1529,8 +1529,11 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       const safeTop = editorArea.y * output.height;
       const safeRight = (editorArea.x + editorArea.width) * output.width;
       const safeBottom = (editorArea.y + editorArea.height) * output.height;
-      const allowFreeInfoMovement = platform === "vip" && slot.file_name === "401.jpg" && hasManualLayout;
-      if (!allowFreeInfoMovement) {
+      const allowFreeMovement = hasManualLayout && (
+        (platform === "vip" && slot.file_name === "401.jpg")
+        || (platform === "jd" && slot.file_name === "3.jpg")
+      );
+      if (!allowFreeMovement) {
         drawX = clampLayerOrigin(drawX, drawWidth, safeLeft, safeRight);
         drawY = clampLayerOrigin(drawY, drawHeight, safeTop, safeBottom);
       }
@@ -2213,7 +2216,7 @@ function SlotAdjustmentEditor({
           ? infoMoveTarget === "product_rulers"
           : draftRef.current.product_show_ruler
       };
-      applyDraft(linkedProductRulersRef.current ? {
+      const automaticDraft = linkedProductRulersRef.current ? {
         ...resetProduct,
         product_ruler_group_scale: 1,
         product_ruler_group_offset_x: 0,
@@ -2224,7 +2227,10 @@ function SlotAdjustmentEditor({
         height_ruler_scale: 1,
         height_ruler_offset_x: 0,
         height_ruler_offset_y: 0
-      } : resetProduct);
+      } : resetProduct;
+      // A reset must discard the stored manual ruler body. Re-syncing here would
+      // rebuild it from the pre-reset draft and make "恢复自动" retain stale state.
+      applyDraft(automaticDraft, false);
     } else {
       applyDraft({ ...DEFAULT_ADJUSTMENT });
     }
@@ -2277,7 +2283,7 @@ function SlotAdjustmentEditor({
         <header>
           <div>
             <strong>{slot.file_name} · {slot.title}</strong>
-            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? "手机" : moveTarget === "phone_ruler" ? "手机高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "商品图和长高标线"}` : "当前输出位置独立调整"}</span>
+            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? "手机" : moveTarget === "phone_ruler" ? "手机高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
           </div>
           <button type="button" className="icon-button" onClick={requestClose} title="关闭"><X size={21} /></button>
         </header>
@@ -2425,7 +2431,7 @@ function SlotAdjustmentEditor({
                 setInfoMoveTarget("product_rulers");
                 linkedProductRulersRef.current = true;
                 applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
-              }}>商品图和长高标线</button>
+              }}>全部</button>
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("length_ruler");
                 linkedProductRulersRef.current = false;

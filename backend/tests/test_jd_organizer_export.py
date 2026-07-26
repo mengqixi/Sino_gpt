@@ -111,6 +111,25 @@ def test_jd_logo_detail_fills_the_canvas_without_white_border():
     assert rendered.getpixel((797, 400)) == (181, 34, 38)
 
 
+def test_jd_logo_detail_manual_offset_moves_the_image_horizontally():
+    source = Image.new("RGB", (800, 800), "white")
+    ImageDraw.Draw(source).rectangle((300, 300, 499, 499), fill="black")
+    with (
+        patch.object(service, "_load_image", return_value=source),
+        patch.object(service, "_draw_jd_elle_logo"),
+    ):
+        automatic = service._render_jd_slot_image("3.jpg", [1], {}, [])
+        moved_left = service._render_jd_slot_image("3.jpg", [1], {}, [{"offset_x": -0.25}])
+        moved_right = service._render_jd_slot_image("3.jpg", [1], {}, [{"offset_x": 0.25}])
+
+    assert automatic is not None
+    assert moved_left is not None
+    assert moved_right is not None
+    assert _dark_pixel_bbox(automatic) == (300, 300, 500, 500)
+    assert _dark_pixel_bbox(moved_left) == (100, 300, 300, 500)
+    assert _dark_pixel_bbox(moved_right) == (500, 300, 700, 500)
+
+
 def test_jd_interior_detail_fills_the_canvas_without_white_border():
     source = Image.new("RGB", (800, 800), (181, 34, 38))
     with patch.object(service, "_load_image", return_value=source):
@@ -785,6 +804,9 @@ def test_product_ruler_base_is_preserved_for_exact_preview():
 class JdOrganizerGeometryTests(unittest.TestCase):
     def test_product_ruler_base_is_preserved(self):
         test_product_ruler_base_is_preserved_for_exact_preview()
+
+    def test_jd_logo_detail_manual_horizontal_movement(self):
+        test_jd_logo_detail_manual_offset_moves_the_image_horizontally()
 
     def test_jd_interior_detail_is_full_bleed(self):
         test_jd_interior_detail_fills_the_canvas_without_white_border()
