@@ -229,33 +229,19 @@ function withTargetOffset(draft: ImageAdjustment, target: AdjustmentTarget, x: n
 function withLinkedProductOffset(
   draft: ImageAdjustment,
   x: number,
-  y: number,
-  productBasis: { x: number; y: number },
-  rulerBasis: { x: number; y: number }
+  y: number
 ): ImageAdjustment {
-  const deltaX = x - draft.offset_x;
-  const deltaY = y - draft.offset_y;
   return {
     ...draft,
     offset_x: x,
-    offset_y: y,
-    product_ruler_group_offset_x: (draft.product_ruler_group_offset_x || 0)
-      + deltaX * productBasis.x / Math.max(1, rulerBasis.x),
-    product_ruler_group_offset_y: (draft.product_ruler_group_offset_y || 0)
-      + deltaY * productBasis.y / Math.max(1, rulerBasis.y)
+    offset_y: y
   };
 }
 
 function withLinkedProductScale(draft: ImageAdjustment, scale: number): ImageAdjustment {
-  const currentScale = Math.max(0.01, draft.zoom);
-  const ratio = scale / currentScale;
   return {
     ...draft,
-    zoom: scale,
-    product_ruler_group_scale: Math.max(
-      0.25,
-      Math.min(4, (draft.product_ruler_group_scale || 1) * ratio)
-    )
+    zoom: scale
   };
 }
 
@@ -1030,6 +1016,71 @@ function storedProductRulerBase(draft: ImageAdjustment): PixelBounds | null {
   return right > left && bottom > top ? { left, top, right, bottom } : null;
 }
 
+function liveInfoProductBody(
+  sourceUrl: string,
+  image: HTMLImageElement,
+  draft: ImageAdjustment
+): PixelBounds {
+  const output = { width: 750, height: 665 };
+  const area = { x: 359 / 750, y: 283 / 665, width: 262 / 750, height: 182 / 665 };
+  const areaX = area.x * output.width;
+  const areaY = area.y * output.height;
+  const areaWidth = area.width * output.width;
+  const areaHeight = area.height * output.height;
+  const hasManualCrop = draft.crop_x > 0.0001
+    || draft.crop_y > 0.0001
+    || draft.crop_width < 0.9999
+    || draft.crop_height < 0.9999;
+  const automaticBounds = livePreviewContentBounds(sourceUrl, image);
+  const bounds = hasManualCrop ? {
+    left: 0,
+    top: 0,
+    right: image.naturalWidth,
+    bottom: image.naturalHeight
+  } : automaticBounds;
+  const contentWidth = Math.max(1, bounds.right - bounds.left);
+  const contentHeight = Math.max(1, bounds.bottom - bounds.top);
+  const sourceX = Math.max(0, Math.min(image.naturalWidth - 1, bounds.left + draft.crop_x * contentWidth));
+  const sourceY = Math.max(0, Math.min(image.naturalHeight - 1, bounds.top + draft.crop_y * contentHeight));
+  const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, draft.crop_width * contentWidth));
+  const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, draft.crop_height * contentHeight));
+  const productLayer = livePreviewProductCutout(sourceUrl, image);
+  const croppedProductLayer = hasManualCrop ? liveJdProductLayer(sourceUrl, image, draft) : null;
+  const drawSourceScaleX = productLayer.width / Math.max(1, image.naturalWidth);
+  const drawSourceScaleY = productLayer.height / Math.max(1, image.naturalHeight);
+  const drawSourceX = croppedProductLayer ? 0 : sourceX * drawSourceScaleX;
+  const drawSourceY = croppedProductLayer ? 0 : sourceY * drawSourceScaleY;
+  const drawSourceWidth = croppedProductLayer ? croppedProductLayer.canvas.width : sourceWidth * drawSourceScaleX;
+  const drawSourceHeight = croppedProductLayer ? croppedProductLayer.canvas.height : sourceHeight * drawSourceScaleY;
+  const fitScale = Math.min(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight);
+  const drawWidth = drawSourceWidth * fitScale * draft.zoom;
+  const drawHeight = drawSourceHeight * fitScale * draft.zoom;
+  let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+  let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight;
+  const layerBounds = croppedProductLayer?.body || liveInfoMeasurementBounds(productLayer);
+
+  if (!hasManualCrop) {
+    drawX += (drawSourceX + drawSourceWidth / 2 - (layerBounds.left + layerBounds.right) / 2)
+      * drawWidth / drawSourceWidth;
+    drawY += (drawSourceY + drawSourceHeight / 2 - (layerBounds.top + layerBounds.bottom) / 2)
+      * drawHeight / drawSourceHeight;
+  }
+
+  const measuredLeft = Math.max(drawSourceX, layerBounds.left);
+  const measuredTop = Math.max(drawSourceY, layerBounds.top);
+  const measuredRight = Math.min(drawSourceX + drawSourceWidth, layerBounds.right);
+  const measuredBottom = Math.min(drawSourceY + drawSourceHeight, layerBounds.bottom);
+  if (measuredRight <= measuredLeft || measuredBottom <= measuredTop) {
+    return { left: drawX, top: drawY, right: drawX + drawWidth, bottom: drawY + drawHeight };
+  }
+  return {
+    left: drawX + (measuredLeft - drawSourceX) / drawSourceWidth * drawWidth,
+    top: drawY + (measuredTop - drawSourceY) / drawSourceHeight * drawHeight,
+    right: drawX + (measuredRight - drawSourceX) / drawSourceWidth * drawWidth,
+    bottom: drawY + (measuredBottom - drawSourceY) / drawSourceHeight * drawHeight
+  };
+}
+
 function jdProductShapeProfile(bodyWidth: number, bodyHeight: number, physicalRatio?: number) {
   const visualRatio = bodyWidth / Math.max(1, bodyHeight);
   const ratio = physicalRatio && physicalRatio >= 0.2 && physicalRatio <= 5
@@ -1232,7 +1283,7 @@ function drawJdComparisonPreview(
   const heightValue = Number.parseFloat(productInfo.product_height || "");
   const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue)}mm` : "200mm";
   const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue)}mm` : `${Math.round(geometry.heightMm)}mm`;
-  const productRulerBody = storedProductRulerBase(draft) || baseGeometry.body;
+  const productRulerBody = storedProductRulerBase(draft) || geometry.body;
   const horizontalY = Math.min(output.height - 58, productRulerBody.bottom + rulerGap);
   const verticalX = Math.max(output.width * 0.04, productRulerBody.left - rulerGap);
   const productRulerCenter = {
@@ -1524,55 +1575,8 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         const scaleX = output.width / 750;
         const scaleY = output.height / 665;
         const lineColor = "#777";
-        let baseBody: PixelBounds;
         const storedBaseBody = storedProductRulerBase(draft);
-        if (storedBaseBody) {
-          baseBody = storedBaseBody;
-        } else if (croppedProductLayer) {
-          const baseFitScale = Math.min(
-            areaWidth / croppedProductLayer.canvas.width,
-            areaHeight / croppedProductLayer.canvas.height
-          );
-          const baseDrawWidth = croppedProductLayer.canvas.width * baseFitScale;
-          const baseDrawHeight = croppedProductLayer.canvas.height * baseFitScale;
-          const baseDrawX = areaX + (areaWidth - baseDrawWidth) / 2;
-          const baseDrawY = areaY + (areaHeight - baseDrawHeight) / 2;
-          baseBody = {
-            left: baseDrawX + croppedProductLayer.body.left * baseFitScale,
-            top: baseDrawY + croppedProductLayer.body.top * baseFitScale,
-            right: baseDrawX + croppedProductLayer.body.right * baseFitScale,
-            bottom: baseDrawY + croppedProductLayer.body.bottom * baseFitScale
-          };
-        } else {
-          const layerBounds = productLayer ? liveInfoMeasurementBounds(productLayer) : automaticBounds;
-          const automaticWidth = Math.max(1, automaticBounds.right - automaticBounds.left);
-          const automaticHeight = Math.max(1, automaticBounds.bottom - automaticBounds.top);
-          const baseCropLeft = automaticBounds.left * drawSourceScaleX;
-          const baseCropTop = automaticBounds.top * drawSourceScaleY;
-          const baseCropRight = automaticBounds.right * drawSourceScaleX;
-          const baseCropBottom = automaticBounds.bottom * drawSourceScaleY;
-          const baseFitScale = Math.min(areaWidth / automaticWidth, areaHeight / automaticHeight);
-          const baseDrawWidth = automaticWidth * baseFitScale;
-          const baseDrawHeight = automaticHeight * baseFitScale;
-          let baseDrawX = areaX + (areaWidth - baseDrawWidth) / 2;
-          let baseDrawY = areaY + (areaHeight - baseDrawHeight) / 2;
-          if (productLayer) {
-            baseDrawX += (baseCropLeft + (baseCropRight - baseCropLeft) / 2 - (layerBounds.left + layerBounds.right) / 2)
-              * baseDrawWidth / Math.max(1, baseCropRight - baseCropLeft);
-            baseDrawY += (baseCropTop + (baseCropBottom - baseCropTop) / 2 - (layerBounds.top + layerBounds.bottom) / 2)
-              * baseDrawHeight / Math.max(1, baseCropBottom - baseCropTop);
-          }
-          const baseMeasuredLeft = Math.max(baseCropLeft, layerBounds.left);
-          const baseMeasuredTop = Math.max(baseCropTop, layerBounds.top);
-          const baseMeasuredRight = Math.min(baseCropRight, layerBounds.right);
-          const baseMeasuredBottom = Math.min(baseCropBottom, layerBounds.bottom);
-          baseBody = baseMeasuredRight > baseMeasuredLeft && baseMeasuredBottom > baseMeasuredTop ? {
-            left: baseDrawX + (baseMeasuredLeft - baseCropLeft) / Math.max(1, baseCropRight - baseCropLeft) * baseDrawWidth,
-            top: baseDrawY + (baseMeasuredTop - baseCropTop) / Math.max(1, baseCropBottom - baseCropTop) * baseDrawHeight,
-            right: baseDrawX + (baseMeasuredRight - baseCropLeft) / Math.max(1, baseCropRight - baseCropLeft) * baseDrawWidth,
-            bottom: baseDrawY + (baseMeasuredBottom - baseCropTop) / Math.max(1, baseCropBottom - baseCropTop) * baseDrawHeight
-          } : { left: baseDrawX, top: baseDrawY, right: baseDrawX + baseDrawWidth, bottom: baseDrawY + baseDrawHeight };
-        }
+        const baseBody = storedBaseBody || liveInfoProductBody(sourceUrl, image, draft);
         const ruler = infoRulerGeometry(baseBody);
         const widthRuler = infoWidthRulerGeometry(baseBody, draft);
         const productRulerCenter = {
@@ -1857,51 +1861,85 @@ function SlotAdjustmentEditor({
     return withLinkedProductOffset(
       current,
       x,
-      y,
-      adjustmentOffsetBasis(slot, platform, sourceIndex, targetFolder, "product"),
-      adjustmentOffsetBasis(slot, platform, sourceIndex, targetFolder, "length_ruler")
+      y
     );
   }
 
-  function productRulerBaseForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
+  function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
     if ((!isInfoPage && !isPhoneComparison) || !sourceImageRef.current?.naturalWidth) return null;
     const output = slotCanvasSize(slot.size, platform, targetFolder);
     const layer = liveJdProductLayer(sourceUrl, sourceImageRef.current, nextDraft);
     if (isPhoneComparison) {
-      const geometry = jdProductGeometry(output, layer, {
-        ...nextDraft,
-        zoom: 1,
-        offset_x: 0,
-        offset_y: 0
-      }, productInfo);
+      const hasManualLayout = nextDraft.crop_x > 0.0001
+        || nextDraft.crop_y > 0.0001
+        || nextDraft.crop_width < 0.9999
+        || nextDraft.crop_height < 0.9999
+        || Math.abs(nextDraft.zoom - 1) > 0.0001
+        || Math.abs(nextDraft.offset_x) > 0.0001
+        || Math.abs(nextDraft.offset_y) > 0.0001;
+      const geometry = jdProductGeometry(
+        output,
+        layer,
+        nextDraft,
+        productInfo,
+        !hasManualLayout,
+        !hasManualLayout
+      );
       return geometry.body;
     }
-    const area = slotPreviewLayout(slot, platform, sourceIndex, targetFolder);
-    const areaX = area.x * output.width;
-    const areaY = area.y * output.height;
-    const areaWidth = area.width * output.width;
-    const areaHeight = area.height * output.height;
-    const scale = Math.min(areaWidth / layer.canvas.width, areaHeight / layer.canvas.height);
-    const drawX = areaX + (areaWidth - layer.canvas.width * scale) / 2;
-    const drawY = areaY + (areaHeight - layer.canvas.height * scale) / 2;
-    return {
-      left: drawX + layer.body.left * scale,
-      top: drawY + layer.body.top * scale,
-      right: drawX + layer.body.right * scale,
-      bottom: drawY + layer.body.bottom * scale
-    };
+    return liveInfoProductBody(sourceUrl, sourceImageRef.current, nextDraft);
   }
 
-  function withProductRulerBase(nextDraft: ImageAdjustment): ImageAdjustment {
+  function withSyncedProductRulerBody(nextDraft: ImageAdjustment): ImageAdjustment {
     if (isPhoneObjectEditor) return nextDraft;
-    if (storedProductRulerBase(nextDraft)) return nextDraft;
-    const base = productRulerBaseForDraft(nextDraft);
-    return base ? {
+    const current = draftRef.current;
+    const currentBody = storedProductRulerBase(current);
+    const cropUnchanged = current.crop_x === nextDraft.crop_x
+      && current.crop_y === nextDraft.crop_y
+      && current.crop_width === nextDraft.crop_width
+      && current.crop_height === nextDraft.crop_height;
+    const hasLegacyGroupTransform = Math.abs((current.product_ruler_group_scale || 1) - 1) > 0.0001
+      || Math.abs(current.product_ruler_group_offset_x || 0) > 0.0001
+      || Math.abs(current.product_ruler_group_offset_y || 0) > 0.0001;
+    if (currentBody && cropUnchanged && !hasLegacyGroupTransform) {
+      const output = slotCanvasSize(slot.size, platform, targetFolder);
+      const ratio = nextDraft.zoom / Math.max(0.01, current.zoom);
+      const currentAnchor = isPhoneComparison ? {
+        x: output.width * 0.34 + current.offset_x * output.width * 0.18,
+        y: output.height * (output.height > output.width ? 0.70 : 0.73) + current.offset_y * output.height * 0.18
+      } : {
+        x: (359 + 621) / 2 + current.offset_x * (621 - 359),
+        y: (283 + 465) / 2 + current.offset_y * (465 - 283)
+      };
+      const moveX = isPhoneComparison
+        ? (nextDraft.offset_x - current.offset_x) * output.width * 0.18
+        : (nextDraft.offset_x - current.offset_x) * (621 - 359);
+      const moveY = isPhoneComparison
+        ? (nextDraft.offset_y - current.offset_y) * output.height * 0.18
+        : (nextDraft.offset_y - current.offset_y) * (465 - 283);
+      const transformX = (value: number) => currentAnchor.x + (value - currentAnchor.x) * ratio + moveX;
+      const transformY = (value: number) => currentAnchor.y + (value - currentAnchor.y) * ratio + moveY;
+      return {
+        ...nextDraft,
+        product_ruler_base_left: transformX(currentBody.left),
+        product_ruler_base_top: transformY(currentBody.top),
+        product_ruler_base_right: transformX(currentBody.right),
+        product_ruler_base_bottom: transformY(currentBody.bottom),
+        product_ruler_group_scale: 1,
+        product_ruler_group_offset_x: 0,
+        product_ruler_group_offset_y: 0
+      };
+    }
+    const body = productRulerBodyForDraft(nextDraft);
+    return body ? {
       ...nextDraft,
-      product_ruler_base_left: base.left,
-      product_ruler_base_top: base.top,
-      product_ruler_base_right: base.right,
-      product_ruler_base_bottom: base.bottom
+      product_ruler_base_left: body.left,
+      product_ruler_base_top: body.top,
+      product_ruler_base_right: body.right,
+      product_ruler_base_bottom: body.bottom,
+      product_ruler_group_scale: 1,
+      product_ruler_group_offset_x: 0,
+      product_ruler_group_offset_y: 0
     } : nextDraft;
   }
 
@@ -1920,8 +1958,13 @@ function SlotAdjustmentEditor({
     setBusy(false);
   }
 
-  function applyDraft(nextDraft: ImageAdjustment) {
-    const preparedDraft = withProductRulerBase(nextDraft);
+  function applyDraft(
+    nextDraft: ImageAdjustment,
+    syncProductRulerBody = linkedProductRulersRef.current
+  ) {
+    const preparedDraft = syncProductRulerBody
+      ? withSyncedProductRulerBody(nextDraft)
+      : nextDraft;
     cancelStalePreview();
     setHoldExactPreview(false);
     draftVersionRef.current += 1;
@@ -2373,42 +2416,55 @@ function SlotAdjustmentEditor({
             </> : isInfoPage ? <>
               <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product");
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
+                linkedProductRulersRef.current = false;
+                if (draftRef.current.product_show_ruler !== false) {
+                  applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+                }
               }}>仅商品图</button>
               <button type="button" className={infoMoveTarget === "product_rulers" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product_rulers");
-                if (draftRef.current.product_show_ruler === false) applyDraft({ ...draftRef.current, product_show_ruler: true });
+                linkedProductRulersRef.current = true;
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
               }}>商品图和长高标线</button>
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("length_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
               }}>长标线</button>
               <button type="button" className={infoMoveTarget === "height_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("height_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
               }}>高标线</button>
               <button type="button" className={infoMoveTarget === "width_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("width_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
               }}>宽标线</button>
             </> : <>
               <button type="button" className={moveTarget === "product" && draft.product_show_ruler === false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("product");
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
+                linkedProductRulersRef.current = false;
+                if (draftRef.current.product_show_ruler !== false) {
+                  applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+                }
               }}>商品图</button>
               <button type="button" className={moveTarget === "product" && draft.product_show_ruler !== false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("product");
-                if (draftRef.current.product_show_ruler === false) applyDraft({ ...draftRef.current, product_show_ruler: true });
+                linkedProductRulersRef.current = true;
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
               }}>商品图和长高标线</button>
               <button type="button" className={moveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("length_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
+                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
               }}>商品长标线</button>
               <button type="button" className={moveTarget === "height_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("height_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
+                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
               }}>商品高标线</button>
             </>}
           </div>}

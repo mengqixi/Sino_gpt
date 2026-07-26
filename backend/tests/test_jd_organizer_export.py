@@ -413,10 +413,10 @@ def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
 
     product_only = service._info_page(info, source, {**adjustment, "product_show_ruler": False})
     linked = service._info_page(info, source, {**adjustment, "product_show_ruler": True})
-    base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
-    fixed_ruler = service._info_ruler_geometry(base_body)
+    adjusted_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, adjustment)
+    adjusted_ruler = service._info_ruler_geometry(adjusted_body)
 
-    assert product_only.getpixel((fixed_ruler["left"] + 5, fixed_ruler["horizontal_y"])) != (255, 255, 255)
+    assert product_only.getpixel((adjusted_ruler["left"] + 5, adjusted_ruler["horizontal_y"])) != (255, 255, 255)
     assert np.array_equal(np.asarray(product_only), np.asarray(linked))
 
 

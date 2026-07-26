@@ -2843,9 +2843,9 @@ def _info_page(
         body = _paste_info_product(image, product_image, adjustment)
         if not _has_manual_layout_adjustment(adjustment):
             base_body = body
-    base_body = _stored_product_ruler_base(normalized) or base_body
-    ruler = _info_ruler_geometry(base_body)
-    width_ruler = _info_width_ruler_geometry(base_body, adjustment)
+    ruler_body = _stored_product_ruler_base(normalized) or body
+    ruler = _info_ruler_geometry(ruler_body)
+    width_ruler = _info_width_ruler_geometry(ruler_body, adjustment)
     product_ruler_center = (
         (INFO_PRODUCT_BOX[0] + INFO_PRODUCT_BOX[2]) / 2,
         (INFO_PRODUCT_BOX[1] + INFO_PRODUCT_BOX[3]) / 2,
@@ -3545,7 +3545,7 @@ def _jd_size_comparison_page(
     )
 
     ruler_gap = max(28, round(width * 0.045))
-    product_ruler_body = _stored_product_ruler_base(normalized) or base_layout["body_box"]
+    product_ruler_body = _stored_product_ruler_base(normalized) or rendered_body
     horizontal_y = min(height - 70, product_ruler_body[3] + ruler_gap)
     product_ruler_center = (
         (product_ruler_body[0] + product_ruler_body[2]) / 2,
