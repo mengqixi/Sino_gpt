@@ -322,6 +322,81 @@ def test_vip_info_product_and_rulers_share_zoom_and_movement():
     assert adjusted_width["text"] != base_width["text"]
 
 
+def test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product():
+    source = _vip_info_test_source()
+    base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
+    product_adjustment = {"zoom": 1.1, "offset_x": 0.08, "offset_y": -0.04}
+    adjusted_body = service._paste_info_product(
+        Image.new("RGB", (750, 665), "white"),
+        source,
+        product_adjustment,
+    )
+    base_ruler = service._info_ruler_geometry(base_body)
+    product_dx = product_adjustment["offset_x"] * (
+        service.INFO_PRODUCT_BOX[2] - service.INFO_PRODUCT_BOX[0]
+    )
+    product_dy = product_adjustment["offset_y"] * (
+        service.INFO_PRODUCT_BOX[3] - service.INFO_PRODUCT_BOX[1]
+    )
+    normalized = service._normalize_adjustment({
+        "product_ruler_group_scale": 1.1,
+        "product_ruler_group_offset_x": product_dx / (750 * 0.18),
+        "product_ruler_group_offset_y": product_dy / (665 * 0.18),
+    })
+    start, end = service._transform_product_ruler_segment(
+        (base_ruler["left"], base_ruler["horizontal_y"]),
+        (base_ruler["right"], base_ruler["horizontal_y"]),
+        (
+            (service.INFO_PRODUCT_BOX[0] + service.INFO_PRODUCT_BOX[2]) / 2,
+            (service.INFO_PRODUCT_BOX[1] + service.INFO_PRODUCT_BOX[3]) / 2,
+        ),
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(750, 665),
+    )
+
+    origin_x = (service.INFO_PRODUCT_BOX[0] + service.INFO_PRODUCT_BOX[2]) / 2
+    origin_y = (service.INFO_PRODUCT_BOX[1] + service.INFO_PRODUCT_BOX[3]) / 2
+    expected_left = origin_x + (base_ruler["left"] - origin_x) * 1.1 + product_dx
+    expected_right = origin_x + (base_ruler["right"] - origin_x) * 1.1 + product_dx
+    expected_horizontal_y = origin_y + (base_ruler["horizontal_y"] - origin_y) * 1.1 + product_dy
+    assert abs(start[0] - expected_left) <= 2
+    assert abs(end[0] - expected_right) <= 2
+    assert abs(start[1] - expected_horizontal_y) <= 2
+    vertical_start, vertical_end = service._transform_product_ruler_segment(
+        (base_ruler["vertical_x"], base_ruler["top"]),
+        (base_ruler["vertical_x"], base_ruler["bottom"]),
+        (
+            (service.INFO_PRODUCT_BOX[0] + service.INFO_PRODUCT_BOX[2]) / 2,
+            (service.INFO_PRODUCT_BOX[1] + service.INFO_PRODUCT_BOX[3]) / 2,
+        ),
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(750, 665),
+    )
+    expected_vertical_x = origin_x + (base_ruler["vertical_x"] - origin_x) * 1.1 + product_dx
+    expected_top = origin_y + (base_ruler["top"] - origin_y) * 1.1 + product_dy
+    expected_bottom = origin_y + (base_ruler["bottom"] - origin_y) * 1.1 + product_dy
+    assert abs(vertical_start[0] - expected_vertical_x) <= 2
+    assert abs(vertical_start[1] - expected_top) <= 2
+    assert abs(vertical_end[1] - expected_bottom) <= 2
+
+
+def test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size():
+    # 604/605 use the 30..720 editable interval. Crossing from one pixel
+    # smaller to one pixel larger must not jump back to an unclamped origin.
+    just_inside = service._clamp_layer_origin(200, 689, 30, 720)
+    just_outside = service._clamp_layer_origin(200, 691, 30, 720)
+
+    assert just_inside == 31
+    assert just_outside == 30
+    assert abs(just_inside - just_outside) == 1
+
+
 def test_vip_info_centers_the_bag_body_instead_of_the_handle_layer():
     source = _vip_info_test_source()
     body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
@@ -420,12 +495,78 @@ def test_jd_manual_product_movement_can_cross_the_automatic_logo_clearance():
         body_box,
         (800, 800),
         info,
-        {"offset_y": -0.35},
+        {"offset_y": -0.8},
         enforce_logo_clearance=False,
     )
 
     assert raised["paste_y"] < automatic["paste_y"] - 40
     assert raised["paste_y"] >= raised["safe_box"][1]
+
+    freely_raised = service._jd_size_product_layout(
+        source,
+        body_box,
+        (800, 800),
+        info,
+        {"offset_y": -0.8},
+        enforce_logo_clearance=False,
+        clamp_to_safe=False,
+    )
+    assert freely_raised["paste_y"] < freely_raised["safe_box"][1]
+
+
+def test_jd_size_linked_rulers_use_the_same_canvas_transform_as_product():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
+    body_box = service._jd_product_body_bbox(source)
+    info = {"product_length": "200", "product_height": "140"}
+    base = service._jd_size_product_layout(source, body_box, (800, 800), info, None)
+    adjusted = service._jd_size_product_layout(
+        source,
+        body_box,
+        (800, 800),
+        info,
+        {"zoom": 1.12, "offset_x": 0.09, "offset_y": -0.06},
+        enforce_logo_clearance=False,
+        clamp_to_safe=False,
+    )
+    base_body = base["body_box"]
+    adjusted_body = adjusted["body_box"]
+    dx = (adjusted_body[0] + adjusted_body[2] - base_body[0] - base_body[2]) / 2
+    dy = adjusted_body[3] - base_body[3]
+    normalized = service._normalize_adjustment({
+        "product_ruler_group_scale": 1.12,
+        "product_ruler_group_offset_x": dx / (800 * 0.18),
+        "product_ruler_group_offset_y": dy / (800 * 0.18),
+    })
+    center = ((base_body[0] + base_body[2]) / 2, base_body[3])
+    horizontal_y = min(800 - 70, base_body[3] + max(28, round(800 * 0.045)))
+    start, end = service._transform_product_ruler_segment(
+        (base_body[0], horizontal_y),
+        (base_body[2], horizontal_y),
+        center,
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(800, 800),
+    )
+    assert abs(start[0] - adjusted_body[0]) <= 2
+    assert abs(end[0] - adjusted_body[2]) <= 2
+    vertical_x = max(30, base_body[0] - max(28, round(800 * 0.045)))
+    vertical_start, vertical_end = service._transform_product_ruler_segment(
+        (vertical_x, base_body[1]),
+        (vertical_x, base_body[3]),
+        center,
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(800, 800),
+    )
+    assert abs(vertical_start[1] - adjusted_body[1]) <= 2
+    assert abs(vertical_end[1] - adjusted_body[3]) <= 2
 
 
 def test_jd_phone_alignment_uses_the_same_automatic_product_baseline():
@@ -493,11 +634,15 @@ def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
 
 def test_independent_ruler_adjustments_are_normalized_and_transformed():
     normalized = service._normalize_adjustment({
+        "product_ruler_group_scale": 9,
+        "product_ruler_group_offset_x": 0.2,
         "length_ruler_scale": 9,
         "height_ruler_offset_x": -9,
         "phone_ruler_offset_y": 0.25,
     })
 
+    assert normalized["product_ruler_group_scale"] == 4.0
+    assert normalized["product_ruler_group_offset_x"] == 0.2
     assert normalized["length_ruler_scale"] == 2.0
     assert normalized["height_ruler_offset_x"] == -1.5
     assert normalized["phone_ruler_offset_y"] == 0.25
@@ -620,7 +765,27 @@ def test_jd_size_slot_prefers_transparent_front_when_available():
     assert size_slot["confidence"] == 98
 
 
+def test_product_ruler_base_is_preserved_for_exact_preview():
+    normalized = service._normalize_adjustment({
+        "product_ruler_base_left": 321.25,
+        "product_ruler_base_top": 278.5,
+        "product_ruler_base_right": 612.75,
+        "product_ruler_base_bottom": 489.5,
+    })
+    assert service._stored_product_ruler_base(normalized) == (321.25, 278.5, 612.75, 489.5)
+    invalid = service._normalize_adjustment({
+        "product_ruler_base_left": 500,
+        "product_ruler_base_top": 300,
+        "product_ruler_base_right": 400,
+        "product_ruler_base_bottom": 450,
+    })
+    assert service._stored_product_ruler_base(invalid) is None
+
+
 class JdOrganizerGeometryTests(unittest.TestCase):
+    def test_product_ruler_base_is_preserved(self):
+        test_product_ruler_base_is_preserved_for_exact_preview()
+
     def test_jd_interior_detail_is_full_bleed(self):
         test_jd_interior_detail_fills_the_canvas_without_white_border()
 
@@ -659,6 +824,15 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_independent_ruler_adjustments(self):
         test_independent_ruler_adjustments_are_normalized_and_transformed()
+
+    def test_linked_rulers_share_product_canvas_transform(self):
+        test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product()
+
+    def test_jd_linked_rulers_share_product_canvas_transform(self):
+        test_jd_size_linked_rulers_use_the_same_canvas_transform_as_product()
+
+    def test_safe_area_zoom_transition_is_continuous(self):
+        test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size()
 
     def test_phone_comparison_dimension_gate(self):
         test_jd_phone_comparison_waits_for_length_and_height()

@@ -5,6 +5,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1625,6 +1626,11 @@ def _prepared_product_cutout(
     rgb = rgba[:, :, :3]
     source_alpha = rgba[:, :, 3]
     height, width = rgb.shape[:2]
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    dark_product = False
 
     if float(np.mean(source_alpha < 250)) > 0.01:
         mask = source_alpha > 12
@@ -1644,9 +1650,6 @@ def _prepared_product_cutout(
             cv2.COLOR_RGB2LAB,
         )[0, 0].astype(np.float32)
         lab_distance = np.linalg.norm(lab - background_lab, axis=2)
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        saturation = hsv[:, :, 1]
-        value = hsv[:, :, 2]
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         gradient_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gradient_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -1778,10 +1781,26 @@ def _prepared_product_cutout(
         broad_runs = [run for run in broad_runs if run.size >= 3]
         product_bottom_rows = max(broad_runs, key=lambda run: int(run[-1]), default=np.array([], dtype=int))
         if product_bottom_rows.size:
+            sample_top = height * 2 // 5
+            sample_bottom = height * 4 // 5
+            sample_left = width // 4
+            sample_right = width * 3 // 4
+            sample_mask = mask_u8[
+                sample_top:sample_bottom,
+                sample_left:sample_right,
+            ].astype(bool)
+            sample_value = value[
+                sample_top:sample_bottom,
+                sample_left:sample_right,
+            ][sample_mask]
+            dark_product = bool(
+                sample_value.size
+                and float(np.median(sample_value)) <= 120
+            )
             dense_bottom = int(product_bottom_rows[-1])
             central_material = mask_u8.astype(bool) & (
                 (saturation >= 24)
-                | (value <= 130)
+                | (dark_product & (value <= 130))
                 | ((lab_distance >= 16) & (gradient >= 4))
             )
             material_column_bottoms = []
@@ -1821,7 +1840,7 @@ def _prepared_product_cutout(
                 & (rgb[:, :, 0].astype(np.int16) >= rgb[:, :, 2].astype(np.int16) + 7)
                 & (rgb[:, :, 1].astype(np.int16) >= rgb[:, :, 2].astype(np.int16) + 2)
             )
-            dark_detail = (gradient >= 18) & (value <= 125)
+            dark_detail = dark_product & (gradient >= 18) & (value <= 125)
             outside_colored_detail = (
                 ~inside_body_width
                 & (gradient >= 16)
@@ -1832,7 +1851,8 @@ def _prepared_product_cutout(
                 model_detail = (
                     (model_matte >= 0.82)
                     & (gradient >= 18)
-                    & ((saturation >= 18) | (value <= 150))
+                    & (saturation >= 18)
+                    & (value >= 140)
                 )
             detail_below_body = (
                 gold_detail
@@ -1856,37 +1876,41 @@ def _prepared_product_cutout(
                 )
                 mask_u8[connected_floor_shadow] = 0
 
-                sample_top = height * 2 // 5
-                sample_bottom = height * 4 // 5
-                sample_left = width // 4
-                sample_right = width * 3 // 4
-                sample_mask = mask_u8[
-                    sample_top:sample_bottom,
-                    sample_left:sample_right,
-                ].astype(bool)
                 sample_saturation = saturation[
                     sample_top:sample_bottom,
                     sample_left:sample_right,
                 ][sample_mask]
-                sample_value = value[
-                    sample_top:sample_bottom,
-                    sample_left:sample_right,
-                ][sample_mask]
                 if sample_saturation.size:
+                    median_saturation = float(np.median(sample_saturation))
                     material_saturation = float(np.clip(
-                        np.median(sample_saturation) * 0.75,
+                        median_saturation * 0.75,
                         18,
                         50,
                     ))
-                    dark_product = bool(
-                        sample_value.size
-                        and float(np.median(sample_value)) <= 120
-                    )
                     column_material = mask_u8.astype(bool) & (
-                        (saturation >= material_saturation)
-                        | (dark_product & (value <= 105))
+                        (dark_product & (value <= 105))
                         | gold_detail
                     )
+                    if median_saturation >= 18:
+                        sample_hue = hue[
+                            sample_top:sample_bottom,
+                            sample_left:sample_right,
+                        ][sample_mask]
+                        sample_hue = sample_hue[sample_saturation >= material_saturation]
+                        if sample_hue.size:
+                            angles = sample_hue.astype(np.float32) * (2 * np.pi / 180.0)
+                            dominant_hue = (
+                                np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
+                                * 180.0 / (2 * np.pi)
+                            ) % 180.0
+                            hue_distance = np.abs(hue.astype(np.float32) - dominant_hue)
+                            hue_distance = np.minimum(hue_distance, 180.0 - hue_distance)
+                            coloured_material = (
+                                (saturation >= material_saturation)
+                                & (hue_distance <= 20)
+                                & (gradient >= 7)
+                            )
+                            column_material |= mask_u8.astype(bool) & coloured_material
                     material_rows = np.where(
                         column_material,
                         np.arange(height)[:, None],
@@ -1939,6 +1963,7 @@ def _prepared_product_cutout(
                     and component_area >= max(30, width // 8)
                 ):
                     mask_u8[component_labels == component] = 0
+
         mask = mask_u8 > 0
 
     ys, xs = np.where(mask)
@@ -1953,6 +1978,8 @@ def _prepared_product_cutout(
     bottom = min(height, int(ys.max()) + padding + 1)
 
     cropped_mask = mask[top:bottom, left:right].astype(np.uint8)
+    cropped_saturation = saturation[top:bottom, left:right]
+    cropped_value = value[top:bottom, left:right]
     inside = cv2.distanceTransform(cropped_mask, cv2.DIST_L2, 3)
     outside = cv2.distanceTransform(1 - cropped_mask, cv2.DIST_L2, 3)
     alpha = np.clip((inside - outside) * 100.0 + 128.0, 0, 255).astype(np.uint8)
@@ -1961,8 +1988,6 @@ def _prepared_product_cutout(
     cropped_rgb = rgb[top:bottom, left:right].astype(np.float32)
     if float(np.mean(source_alpha < 250)) <= 0.01:
         cropped_lab_distance = lab_distance[top:bottom, left:right]
-        cropped_saturation = saturation[top:bottom, left:right]
-        cropped_value = value[top:bottom, left:right]
         boundary = (inside <= 4.0) & (outside <= 4.0)
         neutral_fringe = boundary & (cropped_saturation <= 32) & (cropped_value >= 165)
         fringe_strength = np.clip((cropped_lab_distance - 4.0) / 20.0, 0.0, 1.0)
@@ -1999,6 +2024,38 @@ def _prepared_product_cutout(
                 + nearest_colors * edge_mix
             )
 
+    # A few dark floor pixels can become detached only after edge decontamination.
+    # Remove small lower islands after the final alpha refinement, while keeping
+    # the connected product and gold hardware regardless of image occupancy.
+    cropped_rgb_u8 = rgb[top:bottom, left:right]
+    cropped_gradient = gradient[top:bottom, left:right]
+    cropped_gold_detail = (
+        (cropped_gradient >= 18)
+        & (cropped_saturation >= 25)
+        & (cropped_rgb_u8[:, :, 0].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 7)
+        & (cropped_rgb_u8[:, :, 1].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 2)
+    )
+    component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+        (alpha > 64).astype(np.uint8),
+        8,
+    )
+    if component_count > 2:
+        largest_component = 1 + int(np.argmax(component_stats[1:, cv2.CC_STAT_AREA]))
+        small_component_limit = max(24, cropped_mask.shape[1] // 10)
+        lower_quarter = cropped_mask.shape[0] * 3 // 4
+        for component in range(1, component_count):
+            if component == largest_component:
+                continue
+            component_area = int(component_stats[component, cv2.CC_STAT_AREA])
+            component_top = int(component_stats[component, cv2.CC_STAT_TOP])
+            component_pixels = component_labels == component
+            if (
+                component_area <= small_component_limit
+                and component_top >= lower_quarter
+                and float(np.mean(cropped_gold_detail[component_pixels])) <= 0.15
+            ):
+                alpha[component_pixels] = 0
+
     result = Image.fromarray(np.clip(cropped_rgb, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
     result.putalpha(Image.fromarray(alpha, "L"))
     return result
@@ -2012,6 +2069,18 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
             parsed = float(value.get(name, default))
         except (TypeError, ValueError):
             parsed = default
+        return max(minimum, min(maximum, parsed))
+
+    def optional_number(name: str, minimum: float, maximum: float) -> float | None:
+        raw = value.get(name)
+        if raw is None:
+            return None
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
         return max(minimum, min(maximum, parsed))
 
     crop_x = number("crop_x", 0.0, 0.0, 0.98)
@@ -2032,6 +2101,13 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "phone_alignment": "center" if value.get("phone_alignment") == "center" else "bottom",
         "product_show_ruler": value.get("product_show_ruler") is not False,
         "phone_show_ruler": value.get("phone_show_ruler") is not False,
+        "product_ruler_group_scale": number("product_ruler_group_scale", 1.0, 0.25, 4.0),
+        "product_ruler_group_offset_x": number("product_ruler_group_offset_x", 0.0, -1.5, 1.5),
+        "product_ruler_group_offset_y": number("product_ruler_group_offset_y", 0.0, -1.5, 1.5),
+        "product_ruler_base_left": optional_number("product_ruler_base_left", -2000.0, 4000.0),
+        "product_ruler_base_top": optional_number("product_ruler_base_top", -2000.0, 4000.0),
+        "product_ruler_base_right": optional_number("product_ruler_base_right", -2000.0, 4000.0),
+        "product_ruler_base_bottom": optional_number("product_ruler_base_bottom", -2000.0, 4000.0),
         "length_ruler_scale": number("length_ruler_scale", 1.0, 0.5, 2.0),
         "length_ruler_offset_x": number("length_ruler_offset_x", 0.0, -1.5, 1.5),
         "length_ruler_offset_y": number("length_ruler_offset_y", 0.0, -1.5, 1.5),
@@ -2108,6 +2184,13 @@ def _cached_product_cutout(
     return _product_cutout(cropped)
 
 
+def _clamp_layer_origin(position: int, layer_size: int, minimum: int, maximum: int) -> int:
+    available = max(1, maximum - minimum)
+    if layer_size <= available:
+        return max(minimum, min(position, maximum - layer_size))
+    return max(maximum - layer_size, min(position, minimum))
+
+
 def _paste_layer(
     canvas: Image.Image,
     layer: Image.Image,
@@ -2138,10 +2221,8 @@ def _paste_layer(
     rendered = layer.resize(rendered_size, Image.Resampling.LANCZOS)
     global_x = left + (box_width - rendered.width) // 2 + int(round(normalized["offset_x"] * box_width))
     global_y = top + (box_height - rendered.height) // 2 + int(round(normalized["offset_y"] * box_height))
-    if rendered.width <= clip_width:
-        global_x = max(clip_left, min(global_x, clip_right - rendered.width))
-    if rendered.height <= clip_height:
-        global_y = max(clip_top, min(global_y, clip_bottom - rendered.height))
+    global_x = _clamp_layer_origin(global_x, rendered.width, clip_left, clip_right)
+    global_y = _clamp_layer_origin(global_y, rendered.height, clip_top, clip_bottom)
     if minimum_top is not None:
         global_y = max(minimum_top, global_y)
     if maximum_bottom is not None:
@@ -2486,16 +2567,6 @@ def _paste_info_product(
     if not _has_manual_crop(adjustment):
         x += round((cutout.width / 2 - body_center_x) * scale)
         y += round((cutout.height / 2 - body_center_y) * scale)
-    if _has_manual_layout_adjustment(adjustment):
-        safe_left = round(canvas.width * 0.04)
-        safe_top = round(canvas.height * 0.04)
-        safe_right = round(canvas.width * 0.96)
-        safe_bottom = round(canvas.height * 0.96)
-        if rendered.width <= safe_right - safe_left:
-            x = max(safe_left, min(x, safe_right - rendered.width))
-        if rendered.height <= safe_bottom - safe_top:
-            y = max(safe_top, min(y, safe_bottom - rendered.height))
-
     canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
     return (
         x + body_left * scale,
@@ -2535,9 +2606,10 @@ def _transform_ruler_segment(
     offset_x: float,
     offset_y: float,
     canvas_size: tuple[int, int],
+    origin: tuple[float, float] | None = None,
 ) -> tuple[tuple[int, int], tuple[int, int]]:
-    center_x = (start[0] + end[0]) / 2
-    center_y = (start[1] + end[1]) / 2
+    center_x = origin[0] if origin is not None else (start[0] + end[0]) / 2
+    center_y = origin[1] if origin is not None else (start[1] + end[1]) / 2
     move_x = offset_x * canvas_size[0] * 0.18
     move_y = offset_y * canvas_size[1] * 0.18
 
@@ -2548,6 +2620,51 @@ def _transform_ruler_segment(
         )
 
     return transform(start), transform(end)
+
+
+def _transform_product_ruler_segment(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    product_center: tuple[float, float],
+    normalized: dict[str, Any],
+    *,
+    scale: float,
+    offset_x: float,
+    offset_y: float,
+    canvas_size: tuple[int, int],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    grouped_start, grouped_end = _transform_ruler_segment(
+        start,
+        end,
+        scale=normalized["product_ruler_group_scale"],
+        offset_x=normalized["product_ruler_group_offset_x"],
+        offset_y=normalized["product_ruler_group_offset_y"],
+        canvas_size=canvas_size,
+        origin=product_center,
+    )
+    return _transform_ruler_segment(
+        grouped_start,
+        grouped_end,
+        scale=scale,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        canvas_size=canvas_size,
+    )
+
+
+def _stored_product_ruler_base(
+    normalized: dict[str, Any],
+) -> tuple[float, float, float, float] | None:
+    values = (
+        normalized.get("product_ruler_base_left"),
+        normalized.get("product_ruler_base_top"),
+        normalized.get("product_ruler_base_right"),
+        normalized.get("product_ruler_base_bottom"),
+    )
+    if not all(isinstance(value, (int, float)) for value in values):
+        return None
+    left, top, right, bottom = (float(value) for value in values)
+    return (left, top, right, bottom) if right > left and bottom > top else None
 
 
 def _info_width_ruler_geometry(
@@ -2712,17 +2829,34 @@ def _info_page(
     body = base_body
     if product_image is not None:
         if _has_manual_layout_adjustment(adjustment):
-            base_body = _paste_info_product(Image.new("RGB", image.size, "white"), product_image, None)
+            base_adjustment = {
+                **normalized,
+                "zoom": 1.0,
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+            }
+            base_body = _paste_info_product(
+                Image.new("RGB", image.size, "white"),
+                product_image,
+                base_adjustment,
+            )
         body = _paste_info_product(image, product_image, adjustment)
         if not _has_manual_layout_adjustment(adjustment):
             base_body = body
+    base_body = _stored_product_ruler_base(normalized) or base_body
     ruler = _info_ruler_geometry(base_body)
     width_ruler = _info_width_ruler_geometry(base_body, adjustment)
+    product_ruler_center = (
+        (INFO_PRODUCT_BOX[0] + INFO_PRODUCT_BOX[2]) / 2,
+        (INFO_PRODUCT_BOX[1] + INFO_PRODUCT_BOX[3]) / 2,
+    )
 
     line_color = "#8a8a8a"
-    length_start, length_end = _transform_ruler_segment(
+    length_start, length_end = _transform_product_ruler_segment(
         (ruler["left"], ruler["horizontal_y"]),
         (ruler["right"], ruler["horizontal_y"]),
+        product_ruler_center,
+        normalized,
         scale=normalized["length_ruler_scale"],
         offset_x=normalized["length_ruler_offset_x"],
         offset_y=normalized["length_ruler_offset_y"],
@@ -2737,9 +2871,11 @@ def _info_page(
     length_center = (length_start[0] + length_end[0]) / 2
     draw.text((length_center - (length_box[2] - length_box[0]) / 2, length_start[1] + 16), length_text, font=length_font, fill="#555555")
 
-    height_start, height_end = _transform_ruler_segment(
+    height_start, height_end = _transform_product_ruler_segment(
         (ruler["vertical_x"], ruler["top"]),
         (ruler["vertical_x"], ruler["bottom"]),
+        product_ruler_center,
+        normalized,
         scale=normalized["height_ruler_scale"],
         offset_x=normalized["height_ruler_offset_x"],
         offset_y=normalized["height_ruler_offset_y"],
@@ -3082,6 +3218,7 @@ def _jd_size_product_layout(
     adjustment: dict[str, Any] | None,
     *,
     enforce_logo_clearance: bool = True,
+    clamp_to_safe: bool = True,
 ) -> dict[str, Any]:
     """Compute one immutable baseline transform, then apply user zoom and movement."""
     width, height = size
@@ -3132,7 +3269,8 @@ def _jd_size_product_layout(
             return min(max(minimum, position), maximum - layer_size)
         return min(max(maximum - layer_size, position), minimum)
 
-    paste_x = clamp_origin(paste_x, rendered_width, safe_left, safe_right)
+    if clamp_to_safe:
+        paste_x = clamp_origin(paste_x, rendered_width, safe_left, safe_right)
     effective_safe_top = safe_top
     if enforce_logo_clearance:
         logo_left, logo_top = ((32, 38) if size == (800, 800) else (56, 45))
@@ -3151,7 +3289,8 @@ def _jd_size_product_layout(
             else:
                 clearance = round(height * (0.07 if is_tall_handle_bag else 0.04))
             effective_safe_top = max(effective_safe_top, logo_bottom + clearance)
-    paste_y = clamp_origin(paste_y, rendered_height, effective_safe_top, safe_bottom)
+    if clamp_to_safe:
+        paste_y = clamp_origin(paste_y, rendered_height, effective_safe_top, safe_bottom)
     rendered_body = (
         paste_x + scaled_body[0],
         paste_y + scaled_body[1],
@@ -3361,6 +3500,7 @@ def _jd_size_comparison_page(
         product_info,
         adjustment,
         enforce_logo_clearance=not has_manual_product_layout,
+        clamp_to_safe=not has_manual_product_layout,
     )
     base_layout = _jd_size_product_layout(cutout, body_bbox, size, product_info, None)
     resized_width = layout["rendered_width"]
@@ -3387,10 +3527,16 @@ def _jd_size_comparison_page(
     phone_ruler_gap = max(22, round(width * 0.035))
     phone_label_clearance = max(40, round(width * 0.05))
     phone_right_allowance = phone_ruler_gap + phone_label_clearance if normalized["phone_show_ruler"] else 8
-    phone_left = min(max(safe_left, phone_left), max(safe_left, safe_right - phone_width - phone_right_allowance))
-    phone_center_x = phone_left + phone_width / 2
     phone_bottom_allowance = max(28, round(height * 0.055))
-    phone_top = min(max(safe_top, phone_top), max(safe_top, safe_bottom - phone_height - phone_bottom_allowance))
+    has_manual_phone_layout = (
+        abs(normalized["phone_scale"] - 1.0) > 0.0001
+        or abs(normalized["phone_offset_x"]) > 0.0001
+        or abs(normalized["phone_offset_y"]) > 0.0001
+    )
+    if not has_manual_phone_layout:
+        phone_left = min(max(safe_left, phone_left), max(safe_left, safe_right - phone_width - phone_right_allowance))
+        phone_top = min(max(safe_top, phone_top), max(safe_top, safe_bottom - phone_height - phone_bottom_allowance))
+    phone_center_x = phone_left + phone_width / 2
     phone_box = _draw_jd_phone_reference(
         canvas,
         round(phone_center_x),
@@ -3399,11 +3545,17 @@ def _jd_size_comparison_page(
     )
 
     ruler_gap = max(28, round(width * 0.045))
-    product_ruler_body = base_layout["body_box"]
+    product_ruler_body = _stored_product_ruler_base(normalized) or base_layout["body_box"]
     horizontal_y = min(height - 70, product_ruler_body[3] + ruler_gap)
-    length_start, length_end = _transform_ruler_segment(
+    product_ruler_center = (
+        (product_ruler_body[0] + product_ruler_body[2]) / 2,
+        product_ruler_body[3],
+    )
+    length_start, length_end = _transform_product_ruler_segment(
         (product_ruler_body[0], horizontal_y),
         (product_ruler_body[2], horizontal_y),
+        product_ruler_center,
+        normalized,
         scale=normalized["length_ruler_scale"],
         offset_x=normalized["length_ruler_offset_x"],
         offset_y=normalized["length_ruler_offset_y"],
@@ -3416,9 +3568,11 @@ def _jd_size_comparison_page(
         _dimension_mm(product_info.get("product_length", "")),
     )
     vertical_x = max(30, product_ruler_body[0] - ruler_gap)
-    height_start, height_end = _transform_ruler_segment(
+    height_start, height_end = _transform_product_ruler_segment(
         (vertical_x, product_ruler_body[1]),
         (vertical_x, product_ruler_body[3]),
+        product_ruler_center,
+        normalized,
         scale=normalized["height_ruler_scale"],
         offset_x=normalized["height_ruler_offset_x"],
         offset_y=normalized["height_ruler_offset_y"],

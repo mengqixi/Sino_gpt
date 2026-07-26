@@ -145,8 +145,10 @@
 .organizer-slot-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; gap: 12px; }
 .organizer-slot { display: grid; grid-template-columns: 190px minmax(0, 1fr); min-width: 0; border: 1px solid #dde3df; border-radius: 6px; overflow: hidden; background: #fafbfa; }
 .organizer-slot-preview { position: relative; display: grid; align-self: start; min-height: 0; padding: 7px; background: #eef1ef; }
-.organizer-slot-preview > button { width: 100%; height: 100%; min-height: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; background: #fff; cursor: pointer; }
-.organizer-slot-preview > button img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
+.organizer-slot-preview > .organizer-slot-edit-preview { width: 100%; height: 100%; min-height: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; background: #fff; cursor: pointer; }
+.organizer-slot-preview > .organizer-slot-edit-preview img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
+.organizer-slot-preview > .organizer-slot-view-preview { position: absolute; left: 13px; bottom: 13px; z-index: 2; display: grid; width: 36px; min-width: 36px; height: 36px; min-height: 36px; place-items: center; padding: 0; border: 1px solid rgba(31, 90, 75, .32); border-radius: 50%; color: #174d3f; background: rgba(255, 255, 255, .94); box-shadow: 0 4px 14px rgba(12, 45, 36, .18); }
+.organizer-slot-preview > .organizer-slot-view-preview:hover { border-color: #1f5a4b; color: #fff; background: #1f5a4b; }
 .generated-placeholder { display: grid; height: 100%; min-height: 0; place-content: center; justify-items: center; gap: 6px; color: #738079; }
 .organizer-slot-body { min-width: 0; padding: 12px; }
 .organizer-slot-title { display: flex; align-items: baseline; gap: 7px; margin-bottom: 9px; }
@@ -165,8 +167,8 @@
 .organizer-adjust-output { width: 100%; margin-top: 8px; }
 .organizer-slot.is-composite { grid-column: span 2; grid-template-columns: minmax(320px, .95fr) minmax(280px, 1.05fr); }
 .organizer-slot.is-composite .organizer-slot-preview,
-.organizer-slot.is-composite .organizer-slot-preview > button,
-.organizer-slot.is-composite .organizer-slot-preview > button img { min-height: 0; }
+.organizer-slot.is-composite .organizer-slot-preview > .organizer-slot-edit-preview,
+.organizer-slot.is-composite .organizer-slot-preview > .organizer-slot-edit-preview img { min-height: 0; }
 .organizer-preview-status { display: inline-flex; align-items: center; gap: 7px; color: #31594d; font-size: 13px; white-space: nowrap; }
 .organizer-object-adjustments { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .organizer-object-adjustments .organizer-adjust-output { width: 100%; min-width: 0; }
