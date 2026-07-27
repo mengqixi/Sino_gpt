@@ -53,6 +53,27 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertGreater(int(alpha[35:130, :].max()), 220)
         self.assertEqual(int(alpha[0, alpha.shape[1] // 2]), 0)
 
+    def test_coloured_product_does_not_lose_gold_hardware(self):
+        source = Image.new("RGB", (520, 420), "white")
+        draw = ImageDraw.Draw(source)
+        draw.rounded_rectangle((105, 105, 415, 325), radius=38, fill="#7198b8")
+        draw.rectangle((145, 323, 375, 336), fill="#746b65")
+        draw.line((75, 340, 445, 340), fill="#d5ad55", width=5)
+
+        model_matte = np.zeros((420, 520), dtype=np.float32)
+        cv2.rectangle(model_matte, (105, 105), (415, 325), 0.995, -1)
+        cv2.rectangle(model_matte, (145, 323), (375, 336), 0.86, -1)
+        cv2.line(model_matte, (75, 340), (445, 340), 0.995, 5)
+
+        rgba = np.asarray(service._prepared_product_cutout(source, model_matte))
+        rgb = rgba[:, :, :3].astype(np.int16)
+        alpha = rgba[:, :, 3]
+        product_pixels = np.linalg.norm(rgb - np.array([113, 152, 184]), axis=2) <= 8
+        hardware_pixels = np.linalg.norm(rgb - np.array([213, 173, 85]), axis=2) <= 12
+
+        self.assertGreater(float(np.median(alpha[product_pixels])), 245.0)
+        self.assertGreater(float(np.median(alpha[hardware_pixels])), 220.0)
+
     def test_vip_30_export_is_800_square_and_within_required_file_size(self):
         image = Image.new("RGBA", (1100, 900), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)

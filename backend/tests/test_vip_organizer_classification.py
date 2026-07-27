@@ -308,6 +308,10 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         width_ratio = (bbox_110[2] - bbox_110[0]) / (bbox_105[2] - bbox_105[0])
         self.assertGreater(width_ratio, 1.01)
         self.assertLess(width_ratio, 1.08)
+        center_105 = ((bbox_105[0] + bbox_105[2]) / 2, (bbox_105[1] + bbox_105[3]) / 2)
+        center_110 = ((bbox_110[0] + bbox_110[2]) / 2, (bbox_110[1] + bbox_110[3]) / 2)
+        self.assertLessEqual(abs(center_105[0] - center_110[0]), 2)
+        self.assertLessEqual(abs(center_105[1] - center_110[1]), 2)
 
     def test_template_product_box_allows_upscaling(self):
         canvas = Image.new("RGB", (750, 665), "white")

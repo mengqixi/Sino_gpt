@@ -49,7 +49,7 @@ _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 _CUTOUT_SEMAPHORE = Semaphore(3)
 _CUTOUT_INFERENCE_SEMAPHORE = Semaphore(1)
-PREVIEW_RENDER_VERSION = 19
+PREVIEW_RENDER_VERSION = 20
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -83,8 +83,8 @@ JD_SLOT_DEFINITIONS = [
     ("透明.png", "正面透明底", "800×800", "product"),
 ]
 ORGANIZER_PLATFORMS = {"vip", "jd"}
-INFO_PRODUCT_BOX = (359, 283, 621, 465)
-INFO_LENGTH_LINE_Y = 482
+INFO_PRODUCT_BOX = (294, 238, 687, 511)
+INFO_LENGTH_LINE_Y = 528
 
 PRODUCT_ROLES = {
     "auto",
@@ -1837,8 +1837,11 @@ def _prepared_product_cutout(
             gold_detail = (
                 (gradient >= 18)
                 & (saturation >= 25)
+                & (hue >= 5)
+                & (hue <= 40)
+                & (value >= 80)
                 & (rgb[:, :, 0].astype(np.int16) >= rgb[:, :, 2].astype(np.int16) + 7)
-                & (rgb[:, :, 1].astype(np.int16) >= rgb[:, :, 2].astype(np.int16) + 2)
+                & (rgb[:, :, 1].astype(np.int16) >= rgb[:, :, 2].astype(np.int16) + 10)
             )
             dark_detail = dark_product & (gradient >= 18) & (value <= 125)
             outside_colored_detail = (
@@ -1882,10 +1885,16 @@ def _prepared_product_cutout(
                 ][sample_mask]
                 if sample_saturation.size:
                     median_saturation = float(np.median(sample_saturation))
+                    median_value = float(np.median(sample_value)) if sample_value.size else 180.0
                     material_saturation = float(np.clip(
                         median_saturation * 0.75,
                         18,
                         50,
+                    ))
+                    material_value_floor = float(np.clip(
+                        median_value * 0.78,
+                        90,
+                        165,
                     ))
                     column_material = mask_u8.astype(bool) & (
                         (dark_product & (value <= 105))
@@ -1908,6 +1917,7 @@ def _prepared_product_cutout(
                             coloured_material = (
                                 (saturation >= material_saturation)
                                 & (hue_distance <= 20)
+                                & (value >= material_value_floor)
                                 & (gradient >= 7)
                             )
                             column_material |= mask_u8.astype(bool) & coloured_material
@@ -1978,6 +1988,7 @@ def _prepared_product_cutout(
     bottom = min(height, int(ys.max()) + padding + 1)
 
     cropped_mask = mask[top:bottom, left:right].astype(np.uint8)
+    cropped_hue = hue[top:bottom, left:right]
     cropped_saturation = saturation[top:bottom, left:right]
     cropped_value = value[top:bottom, left:right]
     inside = cv2.distanceTransform(cropped_mask, cv2.DIST_L2, 3)
@@ -2032,11 +2043,144 @@ def _prepared_product_cutout(
     cropped_gold_detail = (
         (cropped_gradient >= 18)
         & (cropped_saturation >= 25)
+        & (cropped_hue >= 5)
+        & (cropped_hue <= 40)
+        & (cropped_value >= 80)
         & (cropped_rgb_u8[:, :, 0].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 7)
-        & (cropped_rgb_u8[:, :, 1].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 2)
+        & (cropped_rgb_u8[:, :, 1].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 10)
     )
+    cropped_gold_protection = cv2.dilate(
+        cropped_gold_detail.astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=2,
+    ).astype(bool)
+    if model_matte is not None and not dark_product:
+        cropped_model_matte = model_matte[top:bottom, left:right]
+        verified_floor_hardware = cropped_gold_protection & (
+            (cropped_model_matte >= 0.80)
+            | (
+                (cropped_value >= 170)
+                & (cropped_gradient >= 40)
+                & (
+                    cropped_rgb_u8[:, :, 1].astype(np.int16)
+                    >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 15
+                )
+            )
+        )
+        cropped_height, cropped_width = alpha.shape
+        yy, xx = np.indices(alpha.shape)
+        material_sample = (
+            (yy >= cropped_height * 2 // 5)
+            & (yy < cropped_height * 4 // 5)
+            & (xx >= cropped_width // 4)
+            & (xx < cropped_width * 3 // 4)
+            & (alpha >= 200)
+        )
+        material_saturation = cropped_saturation[material_sample]
+        strongly_coloured_product = bool(
+            material_saturation.size
+            and float(np.median(material_saturation)) >= 30
+        )
+        refined_value = cv2.cvtColor(
+            np.clip(cropped_rgb, 0, 255).astype(np.uint8),
+            cv2.COLOR_RGB2HSV,
+        )[:, :, 2]
+        # Preparation photos are supplied on a white studio background. Clear
+        # genuinely white pixels directly instead of asking the segmentation
+        # model to distinguish every tiny gap around chains and zip hardware.
+        # The supplied pale bag is ivory rather than pure white, so this narrow
+        # RGB rule preserves its material while removing white pockets.
+        source_min = cropped_rgb_u8.min(axis=2)
+        source_spread = (
+            cropped_rgb_u8.max(axis=2).astype(np.int16)
+            - source_min.astype(np.int16)
+        )
+        white_background = (
+            (alpha > 0)
+            & (source_min >= 235)
+            & (source_spread <= 18)
+            & ~cropped_gold_protection
+        )
+        alpha[white_background] = 0
+
+        if strongly_coloured_product:
+            # Find the lowest broad row that still has the bag material's
+            # normal brightness.  A cast shadow drops sharply below that row,
+            # while the real curved/rectangular bottom remains above it.  Use
+            # one global floor line (rather than trimming each column) so the
+            # bag silhouette is never reshaped; gold chains and fittings are
+            # explicitly retained below the line.
+            material_value_floor = float(np.clip(
+                float(np.median(cropped_value[material_sample])) * 0.78,
+                90,
+                165,
+            )) if np.any(material_sample) else 125.0
+            central_columns = (
+                (xx >= round(cropped_width * 0.10))
+                & (xx < round(cropped_width * 0.90))
+            )
+            material_floor: int | None = None
+            dim_row_run = 0
+            for row in range(round(cropped_height * 0.70), cropped_height):
+                row_material = (
+                    central_columns[row]
+                    & (alpha[row] >= 200)
+                    & ~cropped_gold_protection[row]
+                )
+                row_values = cropped_value[row][row_material]
+                reliable_row = (
+                    row_values.size >= max(12, round(cropped_width * 0.08))
+                )
+                if reliable_row and float(np.median(row_values)) >= material_value_floor:
+                    if dim_row_run >= 2:
+                        break
+                    material_floor = row
+                    dim_row_run = 0
+                elif material_floor is not None:
+                    dim_row_run += 1
+                    if dim_row_run >= 2:
+                        break
+            if material_floor is not None:
+                shadow_below_floor = (
+                    (yy > material_floor)
+                    & central_columns
+                    & (alpha > 0)
+                    & ~verified_floor_hardware
+                )
+                alpha[shadow_below_floor] = 0
+
+        transparent_neighbour = cv2.dilate(
+            (alpha == 0).astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+            iterations=1,
+        ).astype(bool)
+
+        # Shadows are handled separately: flood only low-confidence pixels at
+        # the central lower edge. The outer fifths are excluded because chains
+        # and metal accessories commonly hang below the bag body there.
+        floor_candidate = (
+            (yy >= round(cropped_height * 0.90))
+            & (xx >= round(cropped_width * 0.10))
+            & (xx < round(cropped_width * 0.90))
+            & (alpha > 0)
+            & (
+                (cropped_model_matte < 0.72)
+                | (strongly_coloured_product & (cropped_saturation <= 32))
+                | (strongly_coloured_product & (refined_value <= 115))
+            )
+            & ~verified_floor_hardware
+        )
+        floor_component_count, floor_labels = cv2.connectedComponents(
+            floor_candidate.astype(np.uint8),
+            8,
+        )
+        for component in range(1, floor_component_count):
+            component_pixels = floor_labels == component
+            if np.any(component_pixels & transparent_neighbour):
+                alpha[component_pixels] = 0
+
     component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
-        (alpha > 64).astype(np.uint8),
+        (alpha > 8).astype(np.uint8),
         8,
     )
     if component_count > 2:
@@ -2047,12 +2191,27 @@ def _prepared_product_cutout(
             if component == largest_component:
                 continue
             component_area = int(component_stats[component, cv2.CC_STAT_AREA])
+            component_left = int(component_stats[component, cv2.CC_STAT_LEFT])
             component_top = int(component_stats[component, cv2.CC_STAT_TOP])
+            component_width = int(component_stats[component, cv2.CC_STAT_WIDTH])
             component_pixels = component_labels == component
+            component_center_x = component_left + component_width / 2
+            component_value = float(np.mean(
+                np.max(cropped_rgb[component_pixels], axis=1)
+            ))
+            central_dark_floor = (
+                not dark_product
+                and component_top >= cropped_mask.shape[0] * 0.90
+                and cropped_mask.shape[1] * 0.20 <= component_center_x <= cropped_mask.shape[1] * 0.80
+                and component_value <= 115
+            )
             if (
                 component_area <= small_component_limit
                 and component_top >= lower_quarter
-                and float(np.mean(cropped_gold_detail[component_pixels])) <= 0.15
+                and (
+                    central_dark_floor
+                    or float(np.mean(cropped_gold_protection[component_pixels])) <= 0.15
+                )
             ):
                 alpha[component_pixels] = 0
 
@@ -2827,7 +2986,7 @@ def _info_page(
         y += 96
 
     normalized = _normalize_adjustment(adjustment)
-    base_body = (384.0, 286.0, 594.0, 462.0)
+    base_body = (332.0, 242.0, 647.0, 506.0)
     body = base_body
     if product_image is not None:
         if _has_manual_layout_adjustment(adjustment):
@@ -2940,12 +3099,10 @@ def _detail_showcase_page(source: Image.Image, adjustment: dict[str, Any] | None
     title_box = draw.textbbox((0, 0), title, font=title_font)
     draw.text(((750 - (title_box[2] - title_box[0])) / 2, 70), title, font=title_font, fill="#c4c4c4")
     box = (52, 181, 695, 704)
-    if _has_manual_layout_adjustment(adjustment):
-        clip_box = (30, 135, 720, 720)
-    elif _has_light_studio_border(source):
-        clip_box = _expanded_safe_box(box, canvas.size)
-    else:
-        clip_box = None
+    # Keep automatic output and every zoom level on one fixed clipping canvas.
+    # Switching clip bounds after the first zoom made 604/605 appear to grow
+    # from alternating sides and could differ after saving.
+    clip_box = (30, 135, 720, 720)
     _paste_detail_layer(
         canvas,
         source,
@@ -3481,6 +3638,43 @@ def _jd_aligned_phone_top(
     return round((body_top + body_bottom - phone_height) / 2)
 
 
+def _jd_comparison_product_layout(
+    cutout: Image.Image,
+    body_bbox: tuple[int, int, int, int],
+    size: tuple[int, int],
+    product_info: dict[str, str],
+    adjustment: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep every manual transform anchored to the automatic JD5 layout."""
+    base_layout = _jd_size_product_layout(cutout, body_bbox, size, product_info, None)
+    if not _has_manual_layout_adjustment(adjustment):
+        return base_layout, base_layout
+
+    layout = _jd_size_product_layout(
+        cutout,
+        body_bbox,
+        size,
+        product_info,
+        adjustment,
+        enforce_logo_clearance=False,
+        clamp_to_safe=False,
+    )
+    width, height = size
+    base_body = base_layout["body_box"]
+    baseline_shift_x = round((base_body[0] + base_body[2]) / 2 - width * 0.34)
+    baseline_shift_y = round(base_body[3] - height * (0.70 if height > width else 0.73))
+    shifted_body = tuple(
+        value + (baseline_shift_x if index % 2 == 0 else baseline_shift_y)
+        for index, value in enumerate(layout["body_box"])
+    )
+    return {
+        **layout,
+        "paste_x": layout["paste_x"] + baseline_shift_x,
+        "paste_y": layout["paste_y"] + baseline_shift_y,
+        "body_box": shifted_body,
+    }, base_layout
+
+
 def _jd_size_comparison_page(
     source: Image.Image,
     size: tuple[int, int],
@@ -3494,17 +3688,13 @@ def _jd_size_comparison_page(
     normalized = _normalize_adjustment(adjustment)
     cutout = _product_cutout(_crop_source(source, adjustment))
     body_bbox = _jd_product_body_bbox(cutout)
-    has_manual_product_layout = _has_manual_layout_adjustment(adjustment)
-    layout = _jd_size_product_layout(
+    layout, base_layout = _jd_comparison_product_layout(
         cutout,
         body_bbox,
         size,
         product_info,
         adjustment,
-        enforce_logo_clearance=not has_manual_product_layout,
-        clamp_to_safe=not has_manual_product_layout,
     )
-    base_layout = _jd_size_product_layout(cutout, body_bbox, size, product_info, None)
     resized_width = layout["rendered_width"]
     resized_height = layout["rendered_height"]
     cutout = cutout.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
@@ -3515,29 +3705,55 @@ def _jd_size_comparison_page(
     rendered_body = layout["body_box"]
     draw = ImageDraw.Draw(canvas)
     rendered_pixels_per_mm = layout["base_body_height"] / max(1.0, layout["height_mm"])
+    base_phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm)
+    base_phone_height = max(round(height * 0.095), min(round(height * 0.46), base_phone_height))
     phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm * normalized["phone_scale"])
     phone_height = max(round(height * 0.095), min(round(height * 0.46), phone_height))
-    phone_center_x = width * 0.75 + normalized["phone_offset_x"] * width * 0.18
-    phone_top = _jd_aligned_phone_top(base_layout["body_box"], phone_height, normalized["phone_alignment"])
-    phone_top += round(normalized["phone_offset_y"] * height * 0.18)
     reference = _jd_phone_reference_layer()
-    phone_width = max(
-        42,
-        round(phone_height * reference.width / reference.height) if reference is not None else round(phone_height * 0.83),
-    )
-    phone_left = round(phone_center_x - phone_width / 2)
+    reference_ratio = reference.width / reference.height if reference is not None else 0.83
+    base_phone_width = max(42, round(base_phone_height * reference_ratio))
+    phone_width = max(42, round(phone_height * reference_ratio))
     phone_ruler_gap = max(22, round(width * 0.035))
     phone_label_clearance = max(40, round(width * 0.05))
     phone_right_allowance = phone_ruler_gap + phone_label_clearance if normalized["phone_show_ruler"] else 8
     phone_bottom_allowance = max(28, round(height * 0.055))
-    has_manual_phone_layout = (
-        abs(normalized["phone_scale"] - 1.0) > 0.0001
-        or abs(normalized["phone_offset_x"]) > 0.0001
-        or abs(normalized["phone_offset_y"]) > 0.0001
+    base_phone_left = round(width * 0.75 - base_phone_width / 2)
+    base_phone_top = _jd_aligned_phone_top(
+        base_layout["body_box"],
+        base_phone_height,
+        normalized["phone_alignment"],
     )
-    if not has_manual_phone_layout:
-        phone_left = min(max(safe_left, phone_left), max(safe_left, safe_right - phone_width - phone_right_allowance))
-        phone_top = min(max(safe_top, phone_top), max(safe_top, safe_bottom - phone_height - phone_bottom_allowance))
+    base_phone_left = min(
+        max(safe_left, base_phone_left),
+        max(safe_left, safe_right - base_phone_width - phone_right_allowance),
+    )
+    base_phone_top = min(
+        max(safe_top, base_phone_top),
+        max(safe_top, safe_bottom - base_phone_height - phone_bottom_allowance),
+    )
+    # Scale around the already-clamped automatic phone anchor. Previously the
+    # 100% phone used a clamped position while 102% switched to an unclamped
+    # position, causing a visible jump on the first zoom step.
+    base_phone_center_x = base_phone_left + base_phone_width / 2
+    phone_left = round(
+        base_phone_center_x
+        + normalized["phone_offset_x"] * width * 0.18
+        - phone_width / 2
+    )
+    if normalized["phone_alignment"] == "bottom":
+        base_phone_anchor_y = base_phone_top + base_phone_height
+        phone_top = round(
+            base_phone_anchor_y
+            + normalized["phone_offset_y"] * height * 0.18
+            - phone_height
+        )
+    else:
+        base_phone_anchor_y = base_phone_top + base_phone_height / 2
+        phone_top = round(
+            base_phone_anchor_y
+            + normalized["phone_offset_y"] * height * 0.18
+            - phone_height / 2
+        )
     phone_center_x = phone_left + phone_width / 2
     phone_box = _draw_jd_phone_reference(
         canvas,
@@ -3596,24 +3812,6 @@ def _jd_size_comparison_page(
     if normalized["phone_show_ruler"] or phone_is_at_baseline:
         phone_ruler_box = phone_box
     else:
-        base_phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm)
-        base_phone_height = max(round(height * 0.095), min(round(height * 0.46), base_phone_height))
-        base_phone_width = max(
-            42,
-            round(base_phone_height * reference.width / reference.height)
-            if reference is not None
-            else round(base_phone_height * 0.83),
-        )
-        base_phone_left = round(width * 0.75 - base_phone_width / 2)
-        base_phone_top = _jd_aligned_phone_top(base_layout["body_box"], base_phone_height, normalized["phone_alignment"])
-        base_phone_left = min(
-            max(safe_left, base_phone_left),
-            max(safe_left, safe_right - base_phone_width - phone_right_allowance),
-        )
-        base_phone_top = min(
-            max(safe_top, base_phone_top),
-            max(safe_top, safe_bottom - base_phone_height - phone_bottom_allowance),
-        )
         phone_ruler_box = (
             base_phone_left,
             base_phone_top,

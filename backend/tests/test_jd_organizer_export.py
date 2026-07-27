@@ -425,6 +425,13 @@ def test_vip_info_centers_the_bag_body_instead_of_the_handle_layer():
     assert abs((body[1] + body[3]) / 2 - (top + bottom) / 2) <= 1
 
 
+def test_vip_info_template_box_is_fifty_percent_larger():
+    left, top, right, bottom = service.INFO_PRODUCT_BOX
+
+    assert right - left == round(262 * 1.5)
+    assert bottom - top == round(182 * 1.5)
+
+
 def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
     info = {"product_length": "195", "product_width": "55", "product_height": "140"}
     source = _vip_info_test_source()
@@ -461,6 +468,30 @@ def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
         assert zoomed["base_body_height"] == base["base_body_height"]
         assert zoomed["body_box"][2] - zoomed["body_box"][0] > base["body_box"][2] - base["body_box"][0]
         assert zoomed["body_box"][3] - zoomed["body_box"][1] > base["body_box"][3] - base["body_box"][1]
+
+
+def test_jd_comparison_product_first_zoom_step_keeps_automatic_anchor():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
+    body_box = service._jd_product_body_bbox(source)
+    info = {"product_length": "200", "product_height": "140"}
+
+    base, _ = service._jd_comparison_product_layout(source, body_box, (800, 800), info, None)
+    zoomed, _ = service._jd_comparison_product_layout(
+        source,
+        body_box,
+        (800, 800),
+        info,
+        {"zoom": 1.02},
+    )
+    base_body = base["body_box"]
+    zoomed_body = zoomed["body_box"]
+
+    assert abs((base_body[0] + base_body[2]) / 2 - (zoomed_body[0] + zoomed_body[2]) / 2) <= 1
+    assert abs(base_body[3] - zoomed_body[3]) <= 1
+    assert zoomed_body[2] - zoomed_body[0] > base_body[2] - base_body[0]
 
 
 def test_jd_phone_alignment_uses_current_rendered_body():
@@ -619,6 +650,42 @@ def test_jd_phone_alignment_uses_the_same_automatic_product_baseline():
     )
     assert phone_positions[0][1] == bottom_top
     assert phone_positions[1][1] == center_top
+
+
+def test_jd_phone_first_zoom_step_keeps_the_automatic_anchor():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
+    info = {"product_length": "200", "product_height": "140"}
+
+    for alignment in ("bottom", "center"):
+        phone_positions: list[tuple[int, int, int, int]] = []
+
+        def capture_phone(_canvas, center_x, top, phone_height):
+            reference = service._jd_phone_reference_layer()
+            ratio = reference.width / reference.height if reference is not None else 0.83
+            phone_width = max(42, round(phone_height * ratio))
+            left = round(center_x - phone_width / 2)
+            phone_positions.append((left, round(top), phone_width, round(phone_height)))
+            return left, round(top), left + phone_width, round(top + phone_height)
+
+        with patch.object(service, "_draw_jd_phone_reference", side_effect=capture_phone):
+            service._jd_size_comparison_page(source, (800, 800), info, {
+                "phone_alignment": alignment,
+                "phone_scale": 1.0,
+            })
+            service._jd_size_comparison_page(source, (800, 800), info, {
+                "phone_alignment": alignment,
+                "phone_scale": 1.02,
+            })
+
+        base, zoomed = phone_positions
+        assert abs((base[0] + base[2] / 2) - (zoomed[0] + zoomed[2] / 2)) <= 1
+        if alignment == "bottom":
+            assert abs((base[1] + base[3]) - (zoomed[1] + zoomed[3])) <= 1
+        else:
+            assert abs((base[1] + base[3] / 2) - (zoomed[1] + zoomed[3] / 2)) <= 1
 
 
 def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
@@ -826,6 +893,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_zoom_uses_one_baseline_transform(self):
         test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape()
 
+    def test_product_first_zoom_step_keeps_anchor(self):
+        test_jd_comparison_product_first_zoom_step_keeps_automatic_anchor()
+
     def test_phone_alignment_tracks_rendered_body(self):
         test_jd_phone_alignment_uses_current_rendered_body()
 
@@ -840,6 +910,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_phone_alignment_uses_automatic_product_baseline(self):
         test_jd_phone_alignment_uses_the_same_automatic_product_baseline()
+
+    def test_phone_first_zoom_step_keeps_anchor(self):
+        test_jd_phone_first_zoom_step_keeps_the_automatic_anchor()
 
     def test_jd_object_only_modes_keep_rulers_visible(self):
         test_jd_size_rulers_stay_visible_when_adjusting_objects_only()
@@ -882,6 +955,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_vip_info_centers_bag_body(self):
         test_vip_info_centers_the_bag_body_instead_of_the_handle_layer()
+
+    def test_vip_info_template_box_is_larger(self):
+        test_vip_info_template_box_is_fifty_percent_larger()
 
     def test_vip_info_rulers_stay_visible(self):
         test_vip_info_rulers_remain_visible_in_both_adjustment_modes()

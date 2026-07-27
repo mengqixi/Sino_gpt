@@ -186,6 +186,38 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_ruler_offset_y: 0
 };
 
+const VIP_INFO_PRODUCT_BOX = { left: 294, top: 238, right: 687, bottom: 511 } as const;
+
+function slotDisplayTitle(platform: OrganizerPlatform, fileName: string, fallback: string) {
+  const vipTitles: Record<string, string> = {
+    "1.jpg": "模特主图",
+    "2.jpg": "半侧/全侧图",
+    "3.jpg": "背面图",
+    "4.jpg": "Logo图",
+    "15.jpg": "内里图",
+    "30.png": "透明图",
+    "50.jpg": "模特竖图",
+    "401.jpg": "产品信息",
+    "601.jpg": "模特展示1",
+    "602.jpg": "模特展示2",
+    "603.jpg": "模特展示3",
+    "604.jpg": "内里细节",
+    "605.jpg": "Logo/五金细节",
+    "606.jpg": "多角度图",
+    "801.jpg": "吊牌图"
+  };
+  const jdTitles: Record<string, string> = {
+    "0-无logo.jpg": "模特主图（无Logo）",
+    "1.jpg": "模特主图",
+    "2.jpg": "半侧产品图",
+    "3.jpg": "Logo图",
+    "4.jpg": "内里图",
+    "5.jpg": "尺寸对比图",
+    "透明.png": "透明图"
+  };
+  return (platform === "jd" ? jdTitles : vipTitles)[fileName] || fallback;
+}
+
 function normalizeAdjustment(value?: Partial<ImageAdjustment>): ImageAdjustment {
   return { ...DEFAULT_ADJUSTMENT, ...(value || {}) };
 }
@@ -321,7 +353,13 @@ function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex:
     return { x: 0, y: 0, width: 1, height: 1, mode: "cover" as const };
   }
   if (slot.file_name === "401.jpg") {
-    return { x: 359 / 750, y: 283 / 665, width: 262 / 750, height: 182 / 665, mode: "contain" as const };
+    return {
+      x: VIP_INFO_PRODUCT_BOX.left / 750,
+      y: VIP_INFO_PRODUCT_BOX.top / 665,
+      width: (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left) / 750,
+      height: (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top) / 665,
+      mode: "contain" as const
+    };
   }
   if (slot.file_name === "606.jpg") {
     const positions = [
@@ -504,6 +542,7 @@ function SlotSafeAreaOverlay({ slot, platform, sourceIndex, targetFolder }: {
   const labelY = y > 24 ? y - 8 : y + 20;
   const templateDiffers = Math.abs(template.x - area.x) + Math.abs(template.y - area.y)
     + Math.abs(template.width - area.width) + Math.abs(template.height - area.height) > 0.001;
+  const showTemplate = templateDiffers && !(platform === "vip" && slot.file_name === "401.jpg");
 
   return <svg
     className="slot-safe-area-overlay"
@@ -511,7 +550,7 @@ function SlotSafeAreaOverlay({ slot, platform, sourceIndex, targetFolder }: {
     preserveAspectRatio="xMidYMid meet"
     aria-hidden="true"
   >
-    {templateDiffers && <>
+    {showTemplate && <>
       <rect className="template-area" x={template.x * output.width} y={template.y * output.height} width={template.width * output.width} height={template.height * output.height} />
       <text className="template-label" x={template.x * output.width + 8} y={template.y * output.height + 20}>模板区域</text>
     </>}
@@ -1022,7 +1061,12 @@ function liveInfoProductBody(
   draft: ImageAdjustment
 ): PixelBounds {
   const output = { width: 750, height: 665 };
-  const area = { x: 359 / 750, y: 283 / 665, width: 262 / 750, height: 182 / 665 };
+  const area = {
+    x: VIP_INFO_PRODUCT_BOX.left / 750,
+    y: VIP_INFO_PRODUCT_BOX.top / 665,
+    width: (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left) / 750,
+    height: (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top) / 665
+  };
   const areaX = area.x * output.width;
   const areaY = area.y * output.height;
   const areaWidth = area.width * output.width;
@@ -1168,6 +1212,47 @@ function jdProductGeometry(
   };
 }
 
+function jdComparisonProductGeometry(
+  output: { width: number; height: number },
+  layer: LiveProductLayer,
+  draft: ImageAdjustment,
+  productInfo: Record<string, string>
+) {
+  const hasManualLayout = draft.crop_x > 0.0001
+    || draft.crop_y > 0.0001
+    || draft.crop_width < 0.9999
+    || draft.crop_height < 0.9999
+    || Math.abs(draft.zoom - 1) > 0.0001
+    || Math.abs(draft.offset_x) > 0.0001
+    || Math.abs(draft.offset_y) > 0.0001;
+  const baseGeometry = jdProductGeometry(output, layer, {
+    ...draft,
+    zoom: 1,
+    offset_x: 0,
+    offset_y: 0
+  }, productInfo);
+  if (!hasManualLayout) return { geometry: baseGeometry, baseGeometry };
+
+  const rawGeometry = jdProductGeometry(output, layer, draft, productInfo, false, false);
+  const baselineShiftX = (baseGeometry.body.left + baseGeometry.body.right) / 2 - output.width * 0.34;
+  const baselineShiftY = baseGeometry.body.bottom
+    - output.height * (output.height > output.width ? 0.70 : 0.73);
+  return {
+    geometry: {
+      ...rawGeometry,
+      x: rawGeometry.x + baselineShiftX,
+      y: rawGeometry.y + baselineShiftY,
+      body: {
+        left: rawGeometry.body.left + baselineShiftX,
+        top: rawGeometry.body.top + baselineShiftY,
+        right: rawGeometry.body.right + baselineShiftX,
+        bottom: rawGeometry.body.bottom + baselineShiftY
+      }
+    },
+    baseGeometry
+  };
+}
+
 function drawAdjustmentGuide(
   context: CanvasRenderingContext2D,
   output: { width: number; height: number },
@@ -1248,27 +1333,7 @@ function drawJdComparisonPreview(
   productInfo: Record<string, string>
 ) {
   const layer = liveJdProductLayer(sourceUrl, image, draft);
-  const hasManualProductLayout = draft.crop_x > 0.0001
-    || draft.crop_y > 0.0001
-    || draft.crop_width < 0.9999
-    || draft.crop_height < 0.9999
-    || Math.abs(draft.zoom - 1) > 0.0001
-    || Math.abs(draft.offset_x) > 0.0001
-    || Math.abs(draft.offset_y) > 0.0001;
-  const geometry = jdProductGeometry(
-    output,
-    layer,
-    draft,
-    productInfo,
-    !hasManualProductLayout,
-    !hasManualProductLayout
-  );
-  const baseGeometry = jdProductGeometry(output, layer, {
-    ...draft,
-    zoom: 1,
-    offset_x: 0,
-    offset_y: 0
-  }, productInfo);
+  const { geometry, baseGeometry } = jdComparisonProductGeometry(output, layer, draft, productInfo);
   context.fillStyle = "#f3f3f3";
   context.fillRect(0, 0, output.width, output.height);
   if (logoReference?.complete && logoReference.naturalWidth) {
@@ -1319,26 +1384,31 @@ function drawJdComparisonPreview(
   const phoneLabelClearance = Math.max(40, output.width * 0.05);
   const phoneRightAllowance = draft.phone_show_ruler !== false ? phoneRulerGap + phoneLabelClearance : 8;
   const phoneBottomAllowance = Math.max(28, output.height * 0.055);
-  const placePhone = (scale: number, offsetX: number, offsetY: number) => {
-    const height = Math.max(
+  const phoneHeightForScale = (scale: number) => Math.max(
       output.height * 0.095,
       Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * scale)
     );
-    const width = phoneReference?.naturalWidth && phoneReference.naturalHeight
-      ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
-      : height * 0.78;
-    let left = output.width * 0.75 + offsetX * output.width * 0.18 - width / 2;
-    let top = (draft.phone_alignment || "bottom") === "bottom"
-      ? baseGeometry.body.bottom - height
-      : (baseGeometry.body.top + baseGeometry.body.bottom - height) / 2;
-    top += offsetY * output.height * 0.18;
-    const hasManualPhoneLayout = Math.abs(scale - 1) > 0.0001
-      || Math.abs(offsetX) > 0.0001
-      || Math.abs(offsetY) > 0.0001;
-    if (!hasManualPhoneLayout) {
-      left = Math.max(geometry.safe.left, Math.min(left, geometry.safe.right - width - phoneRightAllowance));
-      top = Math.max(geometry.safe.top, Math.min(top, geometry.safe.bottom - height - phoneBottomAllowance));
-    }
+  const phoneWidthForHeight = (height: number) => phoneReference?.naturalWidth && phoneReference.naturalHeight
+    ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
+    : height * 0.78;
+  const basePhoneHeight = phoneHeightForScale(1);
+  const basePhoneWidth = phoneWidthForHeight(basePhoneHeight);
+  let basePhoneLeft = output.width * 0.75 - basePhoneWidth / 2;
+  let basePhoneTop = (draft.phone_alignment || "bottom") === "bottom"
+    ? baseGeometry.body.bottom - basePhoneHeight
+    : (baseGeometry.body.top + baseGeometry.body.bottom - basePhoneHeight) / 2;
+  basePhoneLeft = Math.max(geometry.safe.left, Math.min(basePhoneLeft, geometry.safe.right - basePhoneWidth - phoneRightAllowance));
+  basePhoneTop = Math.max(geometry.safe.top, Math.min(basePhoneTop, geometry.safe.bottom - basePhoneHeight - phoneBottomAllowance));
+  const basePhoneCenterX = basePhoneLeft + basePhoneWidth / 2;
+  const basePhoneAnchorY = (draft.phone_alignment || "bottom") === "bottom"
+    ? basePhoneTop + basePhoneHeight
+    : basePhoneTop + basePhoneHeight / 2;
+  const placePhone = (scale: number, offsetX: number, offsetY: number) => {
+    const height = phoneHeightForScale(scale);
+    const width = phoneWidthForHeight(height);
+    const left = basePhoneCenterX + offsetX * output.width * 0.18 - width / 2;
+    const top = basePhoneAnchorY + offsetY * output.height * 0.18
+      - ((draft.phone_alignment || "bottom") === "bottom" ? height : height / 2);
     return { left, top, width, height };
   };
   const phone = placePhone(draft.phone_scale || 1, draft.phone_offset_x || 0, draft.phone_offset_y || 0);
@@ -1873,21 +1943,7 @@ function SlotAdjustmentEditor({
     const output = slotCanvasSize(slot.size, platform, targetFolder);
     const layer = liveJdProductLayer(sourceUrl, sourceImageRef.current, nextDraft);
     if (isPhoneComparison) {
-      const hasManualLayout = nextDraft.crop_x > 0.0001
-        || nextDraft.crop_y > 0.0001
-        || nextDraft.crop_width < 0.9999
-        || nextDraft.crop_height < 0.9999
-        || Math.abs(nextDraft.zoom - 1) > 0.0001
-        || Math.abs(nextDraft.offset_x) > 0.0001
-        || Math.abs(nextDraft.offset_y) > 0.0001;
-      const geometry = jdProductGeometry(
-        output,
-        layer,
-        nextDraft,
-        productInfo,
-        !hasManualLayout,
-        !hasManualLayout
-      );
+      const { geometry } = jdComparisonProductGeometry(output, layer, nextDraft, productInfo);
       return geometry.body;
     }
     return liveInfoProductBody(sourceUrl, sourceImageRef.current, nextDraft);
@@ -1911,15 +1967,17 @@ function SlotAdjustmentEditor({
         x: output.width * 0.34 + current.offset_x * output.width * 0.18,
         y: output.height * (output.height > output.width ? 0.70 : 0.73) + current.offset_y * output.height * 0.18
       } : {
-        x: (359 + 621) / 2 + current.offset_x * (621 - 359),
-        y: (283 + 465) / 2 + current.offset_y * (465 - 283)
+        x: (VIP_INFO_PRODUCT_BOX.left + VIP_INFO_PRODUCT_BOX.right) / 2
+          + current.offset_x * (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left),
+        y: (VIP_INFO_PRODUCT_BOX.top + VIP_INFO_PRODUCT_BOX.bottom) / 2
+          + current.offset_y * (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top)
       };
       const moveX = isPhoneComparison
         ? (nextDraft.offset_x - current.offset_x) * output.width * 0.18
-        : (nextDraft.offset_x - current.offset_x) * (621 - 359);
+        : (nextDraft.offset_x - current.offset_x) * (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left);
       const moveY = isPhoneComparison
         ? (nextDraft.offset_y - current.offset_y) * output.height * 0.18
-        : (nextDraft.offset_y - current.offset_y) * (465 - 283);
+        : (nextDraft.offset_y - current.offset_y) * (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top);
       const transformX = (value: number) => currentAnchor.x + (value - currentAnchor.x) * ratio + moveX;
       const transformY = (value: number) => currentAnchor.y + (value - currentAnchor.y) * ratio + moveY;
       return {
@@ -3671,7 +3729,7 @@ export default function VipOrganizer() {
                         : <div className="generated-placeholder"><FileImage size={30} /><span>{!outputReady ? "请先填写商品长和高" : previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                     </div>
                     <div className="organizer-slot-body">
-                      <div className="organizer-slot-title"><strong>{slot.file_name}</strong><span>{slot.title}</span><small>{outputSize.width}×{outputSize.height}</small></div>
+                      <div className="organizer-slot-title"><strong>{slot.file_name}</strong><span title={slot.title}>{slotDisplayTitle(platform, slot.file_name, slot.title)}</span><small>{outputSize.width}×{outputSize.height}</small></div>
                       {count === 1 && platform === "jd" && slot.file_name === "5.jpg" ? <div className="organizer-object-adjustments" role="group" aria-label="尺寸对比图调整对象">
                         <button
                           type="button"
