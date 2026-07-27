@@ -93,6 +93,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload)
     }),
+  prewarmHeavyTask: (feature: "cutout" | "organizer" | "recolor") =>
+    request<{ feature: string; status: string }>(`/api/heavy-tasks/prewarm/${feature}`, { method: "POST" }),
   deleteProductSources: (taskId: string) =>
     request<any>(`/api/product-images/tasks/${taskId}/sources/cleanup`, { method: "POST" }),
   analyzeVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/analyze", { method: "POST", body: JSON.stringify(payload) }),

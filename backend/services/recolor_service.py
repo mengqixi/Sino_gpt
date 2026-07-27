@@ -14,6 +14,7 @@ from PIL import Image, ImageFilter
 
 from ..config import RESULT_DIR
 from .file_service import public_url_for
+from .heavy_task_service import run_heavy_task
 
 
 SEGMENTATION_BACKEND = "opencv"
@@ -363,7 +364,7 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
     return Image.fromarray(clean, mode="L").filter(ImageFilter.GaussianBlur(0.8))
 
 
-def analyze_recolor_masks(image_path: str) -> dict:
+def _analyze_recolor_masks(image_path: str) -> dict:
     with _recolor_job_slot():
         image = _load_rgb(image_path)
         working = image.copy()
@@ -467,7 +468,7 @@ def _local_selection_mask(image: Image.Image, box: tuple[int, int, int, int]) ->
     return Image.fromarray(selected, mode="L")
 
 
-def select_hardware_region(
+def _select_hardware_region(
     image_path: str,
     protect_mask: str,
     box: tuple[int, int, int, int],
@@ -514,19 +515,87 @@ def render_recolor_image(image_path: str, target_color: str, subject_mask: str, 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), mode="RGB")
 
 
-def preview_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> dict:
+def _preview_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> dict:
     with _recolor_job_slot():
         result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
         return {"preview_image": _image_to_data_url(result_image)}
 
 
-def apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
+def _apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
     with _recolor_job_slot():
         result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
         RESULT_DIR.mkdir(parents=True, exist_ok=True)
         output = RESULT_DIR / f"recolor_{uuid.uuid4().hex[:12]}.png"
         result_image.save(output)
         return str(output)
+
+
+def analyze_recolor_masks(image_path: str) -> dict:
+    return run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "analyze",
+            "image_path": image_path,
+        },
+        timeout=300,
+    )
+
+
+def select_hardware_region(
+    image_path: str,
+    protect_mask: str,
+    box: tuple[int, int, int, int],
+    action: str = "add",
+) -> dict:
+    return run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "select",
+            "image_path": image_path,
+            "protect_mask": protect_mask,
+            "box": list(box),
+            "action": action,
+        },
+        timeout=300,
+    )
+
+
+def preview_recolor(
+    image_path: str,
+    target_color: str,
+    subject_mask: str,
+    protect_mask: str,
+) -> dict:
+    return run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "preview",
+            "image_path": image_path,
+            "target_color": target_color,
+            "subject_mask": subject_mask,
+            "protect_mask": protect_mask,
+        },
+        timeout=300,
+    )
+
+
+def apply_recolor(
+    image_path: str,
+    target_color: str,
+    subject_mask: str,
+    protect_mask: str,
+) -> str:
+    return str(run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "apply",
+            "image_path": image_path,
+            "target_color": target_color,
+            "subject_mask": subject_mask,
+            "protect_mask": protect_mask,
+        },
+        timeout=300,
+    ))
 
 
 def result_payload(path: str) -> dict:

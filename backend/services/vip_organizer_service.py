@@ -18,7 +18,7 @@ import zipfile
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock, Semaphore
+from threading import Lock
 from typing import Any
 
 import cv2
@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 from ..config import ALLOWED_IMAGE_EXTENSIONS, DATA_DIR
 from ..database import db_session, now_iso
 from .api_config_service import TEXT_API_TYPE, get_config, get_default_config, mask_api_key, require_config_type
+from .heavy_task_service import run_heavy_task
 from .json_path_service import json_path_get
 
 
@@ -47,8 +48,6 @@ U2NETP_MODEL_PATH = Path(__file__).resolve().parents[1] / "assets" / "models" / 
 CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py")
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-_CUTOUT_SEMAPHORE = Semaphore(3)
-_CUTOUT_INFERENCE_SEMAPHORE = Semaphore(1)
 PREVIEW_RENDER_VERSION = 20
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
@@ -1117,24 +1116,17 @@ def prepare_product_cutout(session_id: str, file: UploadFile) -> dict[str, str]:
             shutil.copyfileobj(file.file, output, length=UPLOAD_COPY_BUFFER_SIZE)
         with Image.open(source_path) as source_image:
             source_image.verify()
-        with Image.open(source_path) as source_image:
-            source = ImageOps.exif_transpose(source_image)
-            source.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-            source = source.convert("RGBA")
-        with _CUTOUT_SEMAPHORE:
-            with _CUTOUT_INFERENCE_SEMAPHORE:
-                model_matte = _predict_product_matte(source)
-            cutout = _prepared_product_cutout(source, model_matte=model_matte)
-        transparent = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
-        rendered = ImageOps.contain(cutout, (704, 704), Image.Resampling.LANCZOS)
-        transparent.alpha_composite(
-            rendered,
-            ((transparent.width - rendered.width) // 2, (transparent.height - rendered.height) // 2),
+        run_heavy_task(
+            "backend.services.cutout_pipeline_worker",
+            {
+                "source_path": str(source_path),
+                "transparent_path": str(transparent_path),
+                "gray_path": str(gray_path),
+            },
+            timeout=600,
         )
-        transparent.save(transparent_path, format="PNG", optimize=True)
-        gray = Image.new("RGB", transparent.size, "#969895")
-        gray.paste(transparent.convert("RGB"), (0, 0), transparent.getchannel("A"))
-        gray.save(gray_path, format="PNG", optimize=True)
+        if not transparent_path.is_file() or not gray_path.is_file():
+            raise ValueError("抠图结果生成失败")
         source_path.unlink(missing_ok=True)
         with db_session() as conn:
             conn.execute(
@@ -4182,11 +4174,44 @@ def render_previews(
     platform: str = "vip",
     target_folder: str = "800",
 ) -> dict[str, Any]:
-    with _preview_lock(session_id):
-        return _render_previews(session_id, slots, product_info, platform, target_folder)
+    return run_heavy_task(
+        "backend.services.organizer_render_worker",
+        {
+            "operation": "preview",
+            "session_id": session_id,
+            "slots": slots,
+            "product_info": product_info,
+            "platform": platform,
+            "target_folder": target_folder,
+        },
+        timeout=600,
+    )
 
 
 def render_slot_preview(
+    session_id: str,
+    slots: list[dict[str, Any]],
+    product_info: dict[str, str],
+    file_name: str,
+    platform: str = "vip",
+    target_folder: str = "800",
+) -> dict[str, str]:
+    return run_heavy_task(
+        "backend.services.organizer_render_worker",
+        {
+            "operation": "preview_slot",
+            "session_id": session_id,
+            "slots": slots,
+            "product_info": product_info,
+            "file_name": file_name,
+            "platform": platform,
+            "target_folder": target_folder,
+        },
+        timeout=600,
+    )
+
+
+def _render_slot_preview(
     session_id: str,
     slots: list[dict[str, Any]],
     product_info: dict[str, str],
@@ -4261,6 +4286,25 @@ def _render_previews(
 
 
 def export_package(
+    session_id: str,
+    slots: list[dict[str, Any]],
+    product_info: dict[str, str],
+    platform: str = "vip",
+) -> dict[str, Any]:
+    return run_heavy_task(
+        "backend.services.organizer_render_worker",
+        {
+            "operation": "export",
+            "session_id": session_id,
+            "slots": slots,
+            "product_info": product_info,
+            "platform": platform,
+        },
+        timeout=900,
+    )
+
+
+def _export_package(
     session_id: str,
     slots: list[dict[str, Any]],
     product_info: dict[str, str],

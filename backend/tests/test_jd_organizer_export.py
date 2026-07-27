@@ -22,7 +22,7 @@ def test_jd_export_uses_separate_800_and_750_folders(tmp_path, monkeypatch):
         for file_name, *_ in service.JD_SLOT_DEFINITIONS
     ]
     session_id = "a" * 32
-    result = service.export_package(session_id, slots, {}, "jd")
+    result = service._export_package(session_id, slots, {}, "jd")
     export_id = result["download_url"].split("/")[-2]
     zip_path = service.export_zip(session_id, export_id)
 

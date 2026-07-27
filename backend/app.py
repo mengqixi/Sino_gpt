@@ -6,10 +6,11 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import ASSET_DIR, PROJECT_DIR, RESULT_DIR, UPLOAD_DIR
 from .database import init_db
-from .routers import api_configs, ecommerce, generate, history, product_images, prompts, recolor, upload, vip_organizer
+from .routers import api_configs, ecommerce, generate, heavy_tasks, history, product_images, prompts, recolor, upload, vip_organizer
 from .seed_prompts import seed_prompt_templates
 from .services.product_image_service import cleanup_expired_sources
 from .services.product_image_worker import recover_interrupted_calls
+from .services.heavy_task_service import stop_prewarmer
 
 
 mimetypes.add_type("image/webp", ".webp")
@@ -48,6 +49,11 @@ def startup() -> None:
     cleanup_expired_sources()
 
 
+@app.on_event("shutdown")
+def shutdown() -> None:
+    stop_prewarmer()
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -57,6 +63,7 @@ app.include_router(upload.router)
 app.include_router(prompts.router)
 app.include_router(api_configs.router)
 app.include_router(generate.router)
+app.include_router(heavy_tasks.router)
 app.include_router(history.router)
 app.include_router(recolor.router)
 app.include_router(ecommerce.router)

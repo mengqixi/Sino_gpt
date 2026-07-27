@@ -88,10 +88,13 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
   const [busy, setBusy] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [uploadDragging, setUploadDragging] = useState(false);
+  const [brushCursor, setBrushCursor] = useState<{ x: number; y: number } | null>(null);
   const [message, setMessage] = useState("");
   const imageRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
   const drawingRef = useRef(false);
+  const lastPaintPointRef = useRef<{ x: number; y: number } | null>(null);
   const selectionStartRef = useRef<{ x: number; y: number; action: "add" | "remove" } | null>(null);
   const previewTimerRef = useRef<number | null>(null);
   const previewInFlightRef = useRef(false);
@@ -100,8 +103,22 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
   previewInputsRef.current = { uploaded, subjectMask, protectMask, targetColor };
 
   useEffect(() => {
+    void api.prewarmHeavyTask("recolor").catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
     drawProtectMask();
   }, [uploaded, protectMask]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const frame = window.requestAnimationFrame(() => {
+      viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
+      viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [zoom, uploaded?.image_id]);
 
   useEffect(() => {
     if (!uploaded || !subjectMask || !protectMask || !/^#[0-9a-fA-F]{6}$/.test(targetColor)) return;
@@ -164,6 +181,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
       throw new Error("请先上传一张女包原图");
     }
     const data = await api.analyzeRecolor({ uploaded_image_id: uploaded.image_id });
+    void api.prewarmHeavyTask("recolor").catch(() => undefined);
     setSubjectMask(data.subject_mask);
     setProtectMask(data.protect_mask);
     setInitialProtectMask(data.protect_mask);
@@ -207,12 +225,18 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
   async function analyze() {
     setBusy(true);
     try {
-      await analyzeMasks();
+      const data = await analyzeMasks();
+      previewInputsRef.current = {
+        uploaded,
+        subjectMask: data.subject_mask,
+        protectMask: data.protect_mask,
+        targetColor
+      };
       setPreviewImage("");
       setShowOriginal(false);
       setShowProtection(true);
       setMode("smart");
-      setMessage("已识别保护区。蓝色区域会保持原色；确认后选择颜色开始预览。");
+      await refreshPreview(data.protect_mask);
     } catch (error: any) {
       setMessage(explainError(error));
     } finally {
@@ -236,6 +260,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
         subject_mask: inputs.subjectMask,
         protect_mask: protectOverride || exportProtectMask() || inputs.protectMask
       });
+      void api.prewarmHeavyTask("recolor").catch(() => undefined);
       setPreviewImage(data.preview_image);
       setShowOriginal(false);
       setShowProtection(false);
@@ -315,16 +340,37 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
 
   function paint(event: React.PointerEvent<HTMLCanvasElement>) {
     if (mode === "smart" || !drawingRef.current || !canvasRef.current) return;
-    const context = canvasRef.current.getContext("2d");
+    const canvas = canvasRef.current;
+    const context = canvas.getContext("2d");
     if (!context) return;
     const point = pointerPosition(event);
+    const rect = canvas.getBoundingClientRect();
+    const diameter = brushSize * (canvas.width / Math.max(1, rect.width));
+    const previous = lastPaintPointRef.current || point;
     context.save();
     context.globalCompositeOperation = mode === "protect" ? "source-over" : "destination-out";
+    context.strokeStyle = "rgba(0, 180, 255, 0.92)";
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    context.lineWidth = diameter;
+    context.beginPath();
+    context.moveTo(previous.x, previous.y);
+    context.lineTo(point.x, point.y);
+    context.stroke();
     context.fillStyle = "rgba(0, 180, 255, 0.92)";
     context.beginPath();
-    context.arc(point.x, point.y, brushSize, 0, Math.PI * 2);
+    context.arc(point.x, point.y, diameter / 2, 0, Math.PI * 2);
     context.fill();
     context.restore();
+    lastPaintPointRef.current = point;
+  }
+
+  function updateBrushCursor(event: React.PointerEvent<HTMLCanvasElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setBrushCursor({
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top
+    });
   }
 
   function resetMask() {
@@ -339,6 +385,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
   function finishPaint() {
     if (!drawingRef.current) return;
     drawingRef.current = false;
+    lastPaintPointRef.current = null;
     const updatedMask = exportProtectMask();
     if (updatedMask) setProtectMask(updatedMask);
     if (previewImage) {
@@ -348,7 +395,10 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
 
   function startCanvasAction(event: React.PointerEvent<HTMLCanvasElement>) {
     if (mode !== "smart") {
+      event.currentTarget.setPointerCapture(event.pointerId);
       drawingRef.current = true;
+      lastPaintPointRef.current = pointerPosition(event);
+      updateBrushCursor(event);
       paint(event);
       return;
     }
@@ -365,6 +415,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
 
   function moveCanvasAction(event: React.PointerEvent<HTMLCanvasElement>) {
     if (mode !== "smart") {
+      updateBrushCursor(event);
       paint(event);
       return;
     }
@@ -412,6 +463,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
       setShowOriginal(false);
       setShowProtection(true);
       setMessage(box.action === "add" ? "已添加智能框选区域。可继续框选其他五金。" : "已排除智能框选区域。");
+      void api.prewarmHeavyTask("recolor").catch(() => undefined);
       if (previewImage) await refreshPreview(data.protect_mask);
     } catch (error: any) {
       setMessage(explainError(error));
@@ -545,7 +597,7 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
                 <span>{Math.round(zoom * 100)}%</span>
                 <button onClick={() => setZoom(1)}>100%</button>
               </div>
-              <div className="mask-viewport" onWheel={wheelZoom}>
+              <div className="mask-viewport" ref={viewportRef} onWheel={wheelZoom}>
                 <div className="mask-canvas-wrap" style={{ width: `${zoom * 100}%` }}>
                   <img ref={imageRef} src={showOriginal || !previewImage ? uploaded.preview_url : previewImage} onLoad={drawProtectMask} />
                   <canvas
@@ -557,11 +609,15 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
                     onPointerMove={moveCanvasAction}
                     onPointerUp={finishCanvasAction}
                     onPointerLeave={() => {
-                      if (mode !== "smart") finishPaint();
+                      if (mode !== "smart") {
+                        setBrushCursor(null);
+                        finishPaint();
+                      }
                     }}
                     onPointerCancel={() => {
                       selectionStartRef.current = null;
                       setSelectionBox(null);
+                      setBrushCursor(null);
                       finishPaint();
                     }}
                   />
@@ -573,6 +629,17 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
                         top: `${(selectionBox.top / canvasRef.current.height) * 100}%`,
                         width: `${((selectionBox.right - selectionBox.left) / canvasRef.current.width) * 100}%`,
                         height: `${((selectionBox.bottom - selectionBox.top) / canvasRef.current.height) * 100}%`
+                      }}
+                    />
+                  )}
+                  {mode !== "smart" && brushCursor && !showOriginal && showProtection && (
+                    <div
+                      className="recolor-brush-cursor"
+                      style={{
+                        left: `${brushCursor.x}px`,
+                        top: `${brushCursor.y}px`,
+                        width: `${brushSize}px`,
+                        height: `${brushSize}px`
                       }}
                     />
                   )}

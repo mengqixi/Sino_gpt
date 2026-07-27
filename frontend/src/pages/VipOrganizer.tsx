@@ -1,46 +1,7 @@
 import { CheckCircle2, Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { ClipboardEvent, DragEvent } from "react";
+import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
-
-const ORGANIZER_BROWSER_IMAGE_MAX_EDGE = 2400;
-const ORGANIZER_BROWSER_JPEG_QUALITY = 0.88;
-const ORGANIZER_BROWSER_PHOTO = /\.(?:jpe?g|webp)$/i;
-
-function canvasJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob | null> {
-  return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
-}
-
-async function prepareOrganizerPhoto(file: File): Promise<File> {
-  if (!ORGANIZER_BROWSER_PHOTO.test(file.name) || typeof window.createImageBitmap !== "function") return file;
-  let bitmap: ImageBitmap | null = null;
-  try {
-    bitmap = await window.createImageBitmap(file, { imageOrientation: "from-image" });
-    const longest = Math.max(bitmap.width, bitmap.height);
-    if (longest <= ORGANIZER_BROWSER_IMAGE_MAX_EDGE && file.size <= 6 * 1024 * 1024) return file;
-    const scale = Math.min(1, ORGANIZER_BROWSER_IMAGE_MAX_EDGE / longest);
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-    const context = canvas.getContext("2d", { alpha: false });
-    if (!context) return file;
-    context.imageSmoothingEnabled = true;
-    context.imageSmoothingQuality = "high";
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    const blob = await canvasJpeg(canvas, ORGANIZER_BROWSER_JPEG_QUALITY);
-    canvas.width = 1;
-    canvas.height = 1;
-    if (!blob || blob.size >= file.size) return file;
-    const stem = file.name.replace(/\.[^.]+$/, "").slice(0, 120) || "image";
-    return new File([blob], `${stem}.jpg`, { type: "image/jpeg", lastModified: file.lastModified });
-  } catch {
-    return file;
-  } finally {
-    bitmap?.close();
-  }
-}
 
 type UploadItem = {
   image_id: number;
@@ -49,14 +10,6 @@ type UploadItem = {
   original_url?: string;
   width: number;
   height: number;
-};
-
-type PreparedCutout = {
-  prepared_id: string;
-  transparent_url: string;
-  gray_preview_url: string;
-  download_url: string;
-  file_name: string;
 };
 
 type LogoColor = "black" | "white";
@@ -2560,7 +2513,13 @@ function SlotAdjustmentEditor({
   );
 }
 
-export default function VipOrganizer() {
+type VipOrganizerProps = {
+  active: boolean;
+  initialProductFile?: File | null;
+  onInitialProductFileConsumed?: () => void;
+};
+
+export default function VipOrganizer({ active, initialProductFile, onInitialProductFileConsumed }: VipOrganizerProps) {
   const sessionStorageKey = "vip-organizer-session-id";
   const [sessionId, setSessionId] = useState("");
   const sessionIdRef = useRef("");
@@ -2583,9 +2542,6 @@ export default function VipOrganizer() {
   const [analysisConfigs, setAnalysisConfigs] = useState<any[]>([]);
   const [analysisConfigId, setAnalysisConfigId] = useState<number | "">("");
   const [busy, setBusy] = useState(false);
-  const [cutoutBusy, setCutoutBusy] = useState(false);
-  const [cutoutDragging, setCutoutDragging] = useState(false);
-  const [preparedCutout, setPreparedCutout] = useState<PreparedCutout | null>(null);
   const [message, setMessage] = useState("");
   const [slotPreviews, setSlotPreviews] = useState<Record<string, string>>({});
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -2623,6 +2579,16 @@ export default function VipOrganizer() {
   });
 
   const allAssets = useMemo(() => [...(assets.product || []), ...(assets.model || []), ...(assets.tag || [])], [assets]);
+
+  useEffect(() => {
+    if (active) void api.prewarmHeavyTask("organizer").catch(() => undefined);
+  }, [active]);
+
+  useEffect(() => {
+    if (!initialProductFile) return;
+    onInitialProductFileConsumed?.();
+    void upload("product", [initialProductFile]);
+  }, [initialProductFile]);
 
   useEffect(() => {
     slotsRef.current = slots;
@@ -2931,7 +2897,6 @@ export default function VipOrganizer() {
       reanalyzeTimerRef.current = null;
     }
     setAdjustmentEditor(null);
-    setPreparedCutout(null);
   }
 
   async function ensureSession() {
@@ -3012,59 +2977,6 @@ export default function VipOrganizer() {
     }
   }
 
-  async function prepareCutout(files: FileList | File[] | null) {
-    const file = files?.[0];
-    if (!file) return;
-    if (!SUPPORTED_IMAGE_NAME.test(file.name)) {
-      setMessage("请上传 JPG、PNG 或 WebP 图片");
-      return;
-    }
-    setCutoutBusy(true);
-    setMessage("正在生成透明图和灰底检查图……");
-    try {
-      const currentSession = await ensureSession();
-      const preparedFile = await prepareOrganizerPhoto(file);
-      const result = await api.prepareVipOrganizerCutout(currentSession, preparedFile);
-      setPreparedCutout(result);
-      setMessage("抠图已完成，可以先用灰底图检查边缘，再导出或加入商品原图。");
-    } catch (error: any) {
-      setMessage(error.message || "抠图失败");
-    } finally {
-      setCutoutBusy(false);
-    }
-  }
-
-  function handleCutoutDrop(event: DragEvent<HTMLElement>) {
-    event.preventDefault();
-    setCutoutDragging(false);
-    if (cutoutBusy || busy) return;
-    void prepareCutout(event.dataTransfer.files);
-  }
-
-  function handleCutoutPaste(event: ClipboardEvent<HTMLElement>) {
-    const images = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
-    if (!images.length || cutoutBusy || busy) return;
-    event.preventDefault();
-    void prepareCutout(images);
-  }
-
-  async function usePreparedCutout() {
-    if (!preparedCutout) return;
-    setCutoutBusy(true);
-    try {
-      const response = await fetch(preparedCutout.transparent_url, { cache: "no-store" });
-      if (!response.ok) throw new Error("透明图读取失败");
-      const blob = await response.blob();
-      const file = new File([blob], preparedCutout.file_name, { type: "image/png" });
-      await upload("product", [file]);
-      setMessage("透明图已加入“1. 上传素材”的商品原图。");
-    } catch (error: any) {
-      setMessage(error.message || "加入商品原图失败");
-    } finally {
-      setCutoutBusy(false);
-    }
-  }
-
   async function analyze(
     rolesOverride?: Record<number, string>,
     platformOverride: OrganizerPlatform = platform,
@@ -3081,6 +2993,7 @@ export default function VipOrganizer() {
     if (manageBusy) setBusy(true);
     setMessage("");
     try {
+      void api.prewarmHeavyTask("organizer").catch(() => undefined);
       const result = await api.analyzeVipOrganizer({
         session_id: sessionIdRef.current || sessionId,
         product_image_ids: productItems.map((item) => item.image_id),
@@ -3522,51 +3435,6 @@ export default function VipOrganizer() {
       <header className="page-header">
         <h1>自动化整理</h1>
       </header>
-
-      <section
-        className={`panel organizer-preparation-panel${cutoutDragging ? " is-dragging" : ""}`}
-        tabIndex={0}
-        aria-label="正面主图抠图上传区"
-        onPaste={handleCutoutPaste}
-        onDragEnter={(event) => { event.preventDefault(); if (!cutoutBusy && !busy) setCutoutDragging(true); }}
-        onDragOver={(event) => {
-          event.preventDefault();
-          event.dataTransfer.dropEffect = cutoutBusy || busy ? "none" : "copy";
-          if (!cutoutBusy && !busy) setCutoutDragging(true);
-        }}
-        onDragLeave={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setCutoutDragging(false);
-        }}
-        onDrop={handleCutoutDrop}
-      >
-        <div className="section-title-row">
-          <div><h2>准备区（可选）· 正面主图抠图</h2><p>不使用也不会影响后续功能。可拖入、点击选择，或点击此区域后按 Ctrl+V 粘贴正面主图。</p></div>
-          <label className="organizer-prepare-upload">
-            {cutoutBusy ? <LoaderCircle className="spin" size={18} /> : <UploadCloud size={18} />}
-            {cutoutBusy ? "正在精细抠图" : cutoutDragging ? "松开即可抠图" : "选择正面主图"}
-            <input type="file" accept="image/*" disabled={cutoutBusy || busy} onChange={(event) => {
-              void prepareCutout(event.target.files);
-              event.currentTarget.value = "";
-            }} />
-          </label>
-        </div>
-        {preparedCutout ? <div className="organizer-cutout-results">
-          <figure className="transparent-checker">
-            <img src={preparedCutout.transparent_url} alt="透明 PNG 结果" />
-            <button className="organizer-cutout-view" type="button" title="查看透明 PNG 大图" aria-label="放大查看透明 PNG" onClick={() => setPreview(preparedCutout.transparent_url)}><Eye size={18} /></button>
-            <figcaption>透明 PNG</figcaption>
-          </figure>
-          <figure>
-            <img src={preparedCutout.gray_preview_url} alt="灰底边缘检查图" />
-            <button className="organizer-cutout-view" type="button" title="查看灰底边缘检查大图" aria-label="放大查看灰底边缘检查图" onClick={() => setPreview(preparedCutout.gray_preview_url)}><Eye size={18} /></button>
-            <figcaption>灰底边缘检查</figcaption>
-          </figure>
-          <div className="organizer-cutout-actions">
-            <a className="button-link" href={preparedCutout.download_url} download={preparedCutout.file_name}><Download size={18} />导出透明 PNG</a>
-            <button type="button" className="primary" disabled={cutoutBusy || busy} onClick={() => void usePreparedCutout()}><FileImage size={18} />用于功能 1 的商品原图</button>
-          </div>
-        </div> : <div className="organizer-preparation-empty"><FileImage size={28} /><span>尚未生成；可直接跳过，从下方“1. 上传素材”开始。</span></div>}
-      </section>
 
       <section className="panel organizer-source-panel">
         <div className="section-title-row">

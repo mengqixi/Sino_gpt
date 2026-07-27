@@ -98,10 +98,17 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
         source.save(payload, format="JPEG", quality=95)
         payload.seek(0)
 
-        result = service.prepare_product_cutout(
-            session_id,
-            UploadFile(filename="front.jpg", file=payload),
-        )
+        from backend.services.cutout_pipeline_worker import _handle as run_cutout_inline
+
+        with patch.object(
+            service,
+            "run_heavy_task",
+            side_effect=lambda _module, worker_payload, **_kwargs: run_cutout_inline(worker_payload),
+        ):
+            result = service.prepare_product_cutout(
+                session_id,
+                UploadFile(filename="front.jpg", file=payload),
+            )
 
         transparent = service.prepared_cutout_file(session_id, result["prepared_id"], "transparent")
         gray = service.prepared_cutout_file(session_id, result["prepared_id"], "gray")
