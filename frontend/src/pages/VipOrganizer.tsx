@@ -3551,8 +3551,16 @@ export default function VipOrganizer() {
           </label>
         </div>
         {preparedCutout ? <div className="organizer-cutout-results">
-          <figure className="transparent-checker"><img src={preparedCutout.transparent_url} alt="透明 PNG 结果" /><figcaption>透明 PNG</figcaption></figure>
-          <figure><img src={preparedCutout.gray_preview_url} alt="灰底边缘检查图" /><figcaption>灰底边缘检查</figcaption></figure>
+          <figure className="transparent-checker">
+            <img src={preparedCutout.transparent_url} alt="透明 PNG 结果" />
+            <button className="organizer-cutout-view" type="button" title="查看透明 PNG 大图" aria-label="放大查看透明 PNG" onClick={() => setPreview(preparedCutout.transparent_url)}><Eye size={18} /></button>
+            <figcaption>透明 PNG</figcaption>
+          </figure>
+          <figure>
+            <img src={preparedCutout.gray_preview_url} alt="灰底边缘检查图" />
+            <button className="organizer-cutout-view" type="button" title="查看灰底边缘检查大图" aria-label="放大查看灰底边缘检查图" onClick={() => setPreview(preparedCutout.gray_preview_url)}><Eye size={18} /></button>
+            <figcaption>灰底边缘检查</figcaption>
+          </figure>
           <div className="organizer-cutout-actions">
             <a className="button-link" href={preparedCutout.download_url} download={preparedCutout.file_name}><Download size={18} />导出透明 PNG</a>
             <button type="button" className="primary" disabled={cutoutBusy || busy} onClick={() => void usePreparedCutout()}><FileImage size={18} />用于功能 1 的商品原图</button>
@@ -3729,7 +3737,10 @@ export default function VipOrganizer() {
                         : <div className="generated-placeholder"><FileImage size={30} /><span>{!outputReady ? "请先填写商品长和高" : previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                     </div>
                     <div className="organizer-slot-body">
-                      <div className="organizer-slot-title"><strong>{slot.file_name}</strong><span title={slot.title}>{slotDisplayTitle(platform, slot.file_name, slot.title)}</span><small>{outputSize.width}×{outputSize.height}</small></div>
+                      <div className="organizer-slot-title">
+                        <span className="organizer-slot-title-text"><strong>{slot.file_name}</strong><span title={slot.title}>{slotDisplayTitle(platform, slot.file_name, slot.title)}</span></span>
+                        <small>{outputSize.width}×{outputSize.height}</small>
+                      </div>
                       {count === 1 && platform === "jd" && slot.file_name === "5.jpg" ? <div className="organizer-object-adjustments" role="group" aria-label="尺寸对比图调整对象">
                         <button
                           type="button"

@@ -87,12 +87,17 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
   const [zoom, setZoom] = useState(1);
   const [busy, setBusy] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [uploadDragging, setUploadDragging] = useState(false);
   const [message, setMessage] = useState("");
   const imageRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawingRef = useRef(false);
   const selectionStartRef = useRef<{ x: number; y: number; action: "add" | "remove" } | null>(null);
   const previewTimerRef = useRef<number | null>(null);
+  const previewInFlightRef = useRef(false);
+  const queuedPreviewMaskRef = useRef<string | null | undefined>(undefined);
+  const previewInputsRef = useRef({ uploaded, subjectMask, protectMask, targetColor });
+  previewInputsRef.current = { uploaded, subjectMask, protectMask, targetColor };
 
   useEffect(() => {
     drawProtectMask();
@@ -130,6 +135,20 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
     } catch (error: any) {
       setMessage(error.message);
     }
+  }
+
+  function acceptDroppedImage(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setUploadDragging(false);
+    const file = Array.from(event.dataTransfer.files).find((item) => item.type.startsWith("image/"));
+    if (file) void upload(file);
+  }
+
+  function acceptPastedImage(event: React.ClipboardEvent<HTMLDivElement>) {
+    const file = Array.from(event.clipboardData.files).find((item) => item.type.startsWith("image/"));
+    if (!file) return;
+    event.preventDefault();
+    void upload(file);
   }
 
   function explainError(error: any) {
@@ -202,17 +221,20 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
   }
 
   async function refreshPreview(protectOverride?: string) {
-    if (!uploaded) {
+    if (previewInFlightRef.current) {
+      queuedPreviewMaskRef.current = protectOverride ?? null;
       return;
     }
+    const inputs = previewInputsRef.current;
+    if (!inputs.uploaded || !inputs.subjectMask || !inputs.protectMask) return;
+    previewInFlightRef.current = true;
     setPreviewBusy(true);
     try {
-      const masks = await ensureMasks(protectOverride);
       const data = await api.previewRecolor({
-        uploaded_image_id: uploaded.image_id,
-        target_color: targetColor,
-        subject_mask: masks.subject_mask,
-        protect_mask: masks.protect_mask
+        uploaded_image_id: inputs.uploaded.image_id,
+        target_color: inputs.targetColor,
+        subject_mask: inputs.subjectMask,
+        protect_mask: protectOverride || exportProtectMask() || inputs.protectMask
       });
       setPreviewImage(data.preview_image);
       setShowOriginal(false);
@@ -221,7 +243,13 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
     } catch (error: any) {
       setMessage(explainError(error));
     } finally {
+      previewInFlightRef.current = false;
       setPreviewBusy(false);
+      const queuedMask = queuedPreviewMaskRef.current;
+      queuedPreviewMaskRef.current = undefined;
+      if (queuedMask !== undefined) {
+        window.setTimeout(() => void refreshPreview(queuedMask || undefined), 0);
+      }
     }
   }
 
@@ -423,14 +451,9 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
 
   function chooseColor(color: string) {
     const normalized = color.trim();
-    const isSameColor = normalized.toLowerCase() === targetColor.toLowerCase();
     setTargetColor(normalized);
     if (!subjectMask || !protectMask) {
       setMessage("请先点击“自动识别”，确认五金保护区后再调色。");
-      return;
-    }
-    if (isSameColor && subjectMask && protectMask && /^#[0-9a-fA-F]{6}$/.test(normalized)) {
-      refreshPreview();
     }
   }
 
@@ -479,12 +502,29 @@ export default function RecolorPanel({ onUseAsSource, onSendOriginalToAi }: Prop
       )}
 
       <div className="recolor-layout">
-        <div className="recolor-stage">
+        <div
+          className={`recolor-stage ${uploadDragging ? "is-dragging" : ""}`}
+          tabIndex={0}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setUploadDragging(true);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+            setUploadDragging(true);
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setUploadDragging(false);
+          }}
+          onDrop={acceptDroppedImage}
+          onPaste={acceptPastedImage}
+        >
           {!uploaded && (
             <label className="upload-box recolor-upload">
               <UploadCloud size={28} />
               <input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => upload(event.target.files?.[0])} />
-              <span>上传一张用于调色的女包图</span>
+              <span>点击、拖入或粘贴一张用于调色的女包图</span>
             </label>
           )}
           {uploaded && (

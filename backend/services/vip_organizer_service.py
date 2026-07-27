@@ -1610,6 +1610,43 @@ def _predict_product_matte(source: Image.Image) -> np.ndarray | None:
             return None
 
 
+def _prepared_product_cutout_from_model(
+    source: Image.Image,
+    model_matte: np.ndarray,
+) -> Image.Image:
+    """Restore the original model matte without geometry-based trimming."""
+    image = ImageOps.exif_transpose(source).convert("RGBA")
+    rgba = np.asarray(image).copy()
+    rgb = rgba[:, :, :3]
+    source_alpha = rgba[:, :, 3]
+    height, width = rgb.shape[:2]
+    matte = cv2.resize(
+        np.asarray(model_matte, dtype=np.float32),
+        (width, height),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    matte = np.clip(matte, 0.0, 1.0)
+    if float(np.mean(source_alpha < 250)) > 0.01:
+        matte *= source_alpha.astype(np.float32) / 255.0
+
+    alpha = np.clip(matte * 255.0, 0, 255).astype(np.uint8)
+    ys, xs = np.where(alpha > 1)
+    if not len(xs):
+        return _product_cutout(image)
+
+    object_width = int(xs.max() - xs.min() + 1)
+    object_height = int(ys.max() - ys.min() + 1)
+    padding = max(12, int(max(object_width, object_height) * 0.012))
+    left = max(0, int(xs.min()) - padding)
+    top = max(0, int(ys.min()) - padding)
+    right = min(width, int(xs.max()) + padding + 1)
+    bottom = min(height, int(ys.max()) + padding + 1)
+
+    result = Image.fromarray(rgb[top:bottom, left:right], "RGB").convert("RGBA")
+    result.putalpha(Image.fromarray(alpha[top:bottom, left:right], "L"))
+    return result
+
+
 def _prepared_product_cutout(
     source: Image.Image,
     model_matte: np.ndarray | None = None,
@@ -1619,6 +1656,24 @@ def _prepared_product_cutout(
     This stricter path is intentionally limited to the optional preparation
     tool. Existing organizer templates keep their established cutout behavior.
     """
+    if model_matte is not None:
+        # Restore the model output for coloured products, where later
+        # geometry-based shadow rules caused the reported hardware/body cuts.
+        # Keep the established white/dark-bag path that was already producing
+        # clean results for those two cases.
+        model_image = ImageOps.exif_transpose(source).convert("RGB")
+        model_rgb = np.asarray(model_image)
+        resized_matte = cv2.resize(
+            np.asarray(model_matte, dtype=np.float32),
+            model_image.size,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        model_hsv = cv2.cvtColor(model_rgb, cv2.COLOR_RGB2HSV)
+        confident_subject = resized_matte >= 0.90
+        subject_saturation = model_hsv[:, :, 1][confident_subject]
+        if subject_saturation.size and float(np.median(subject_saturation)) >= 25:
+            return _prepared_product_cutout_from_model(source, model_matte)
+
     image = ImageOps.exif_transpose(source).convert("RGBA")
     if max(image.size) > 1600:
         image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)

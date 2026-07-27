@@ -68,10 +68,12 @@
 .organizer-prepare-upload { display: inline-flex; min-height: 42px; align-items: center; gap: 7px; padding: 9px 13px; border: 1px solid #b7cbc3; border-radius: 5px; color: #1f5a4b; background: #fff; cursor: pointer; white-space: nowrap; }
 .organizer-prepare-upload input { display: none; }
 .organizer-cutout-results { display: grid; grid-template-columns: minmax(180px, 270px) minmax(180px, 270px) minmax(220px, 1fr); gap: 14px; align-items: stretch; }
-.organizer-cutout-results figure { display: grid; grid-template-rows: minmax(0, 1fr) auto; margin: 0; overflow: hidden; border: 1px solid #d9e1dd; border-radius: 6px; background: #969895; }
+.organizer-cutout-results figure { position: relative; display: grid; grid-template-rows: minmax(0, 1fr) auto; margin: 0; overflow: hidden; border: 1px solid #d9e1dd; border-radius: 6px; background: #969895; }
 .organizer-cutout-results figure.transparent-checker { background-color: #fff; background-image: linear-gradient(45deg, #d9dddb 25%, transparent 25%), linear-gradient(-45deg, #d9dddb 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d9dddb 75%), linear-gradient(-45deg, transparent 75%, #d9dddb 75%); background-position: 0 0, 0 12px, 12px -12px, -12px 0; background-size: 24px 24px; }
 .organizer-cutout-results img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; }
 .organizer-cutout-results figcaption { padding: 8px 10px; color: #34453e; background: rgba(255,255,255,.94); font-size: 13px; font-weight: 700; }
+.organizer-cutout-view { position: absolute; left: 12px; bottom: 46px; z-index: 2; display: grid; width: 36px; min-width: 36px; height: 36px; min-height: 36px; place-items: center; padding: 0; border: 1px solid rgba(31, 90, 75, .32); border-radius: 50%; color: #174d3f; background: rgba(255, 255, 255, .94); box-shadow: 0 4px 14px rgba(12, 45, 36, .18); }
+.organizer-cutout-view:hover { border-color: #1f5a4b; color: #fff; background: #1f5a4b; }
 .organizer-cutout-actions { display: grid; align-content: center; gap: 10px; padding: 18px; border: 1px solid #dfe5e2; border-radius: 6px; background: #f7f9f8; }
 .organizer-cutout-actions .button-link, .organizer-cutout-actions button { min-height: 42px; }
 .organizer-preparation-empty { display: flex; min-height: 92px; align-items: center; justify-content: center; gap: 10px; border: 1px dashed #b9c9c2; border-radius: 6px; color: #68756f; background: #fafbfa; }
@@ -154,10 +156,11 @@
 .organizer-slot-preview > .organizer-slot-view-preview:hover { border-color: #1f5a4b; color: #fff; background: #1f5a4b; }
 .generated-placeholder { display: grid; height: 100%; min-height: 0; place-content: center; justify-items: center; gap: 6px; color: #738079; }
 .organizer-slot-body { min-width: 0; padding: 12px; }
-.organizer-slot-title { display: flex; align-items: baseline; gap: 7px; margin-bottom: 9px; }
-.organizer-slot-title strong { color: #1f4f43; }
-.organizer-slot-title span { min-width: 0; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; white-space: normal; }
-.organizer-slot-title small { margin-left: auto; color: #748078; white-space: nowrap; }
+.organizer-slot-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 9px; }
+.organizer-slot-title-text { display: inline-flex; min-width: 0; align-items: baseline; gap: 7px; white-space: nowrap; }
+.organizer-slot-title-text strong { flex: none; color: #1f4f43; }
+.organizer-slot-title-text > span { min-width: 0; font-weight: 650; line-height: 1.3; word-break: keep-all; overflow-wrap: normal; }
+.organizer-slot-title small { flex: none; margin-left: auto; color: #748078; white-space: nowrap; }
 .organizer-slot-body label { display: grid; gap: 4px; margin-top: 6px; color: #66716b; font-size: 12px; }
 .organizer-slot-body select { padding: 7px 8px; }
 .organizer-source-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; min-width: 0; gap: 6px; }
@@ -469,10 +472,17 @@ main {
 
 .recolor-stage {
   background: #f2f5f2;
+  border: 1px solid transparent;
   border-radius: 8px;
   min-height: 360px;
   overflow: visible;
   padding: 10px;
+}
+
+.recolor-stage.is-dragging {
+  border-color: #2b7562;
+  background: #edf7f2;
+  box-shadow: inset 0 0 0 2px rgba(43, 117, 98, .14);
 }
 
 .recolor-upload {
@@ -667,6 +677,13 @@ main {
 
 .upload-box input {
   display: none;
+}
+
+.upload-box.is-dragging {
+  border-color: #2b7562;
+  color: #174d3f;
+  background: #edf7f2;
+  box-shadow: inset 0 0 0 2px rgba(43, 117, 98, .14);
 }
 
 .preview {
