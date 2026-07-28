@@ -1623,6 +1623,8 @@ def _prepared_product_cutout(
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
     dark_product = False
+    colourful_product = False
+    elle_hardware_protection = np.zeros((height, width), dtype=bool)
 
     if float(np.mean(source_alpha < 250)) > 0.01:
         mask = source_alpha > 12
@@ -1653,6 +1655,15 @@ def _prepared_product_cutout(
                 interpolation=cv2.INTER_CUBIC,
             )
             model_matte = np.clip(model_matte, 0.0, 1.0)
+            model_subject = model_matte >= 0.82
+            model_subject_saturation = saturation[model_subject]
+            model_subject_value = value[model_subject]
+            colourful_product = bool(
+                model_subject_saturation.size
+                and model_subject_value.size
+                and float(np.median(model_subject_saturation)) >= 30
+                and float(np.median(model_subject_value)) >= 100
+            )
 
         # Flood only light/neutral pixels connected to an outside edge. This
         # removes the studio backdrop without opening holes inside the bag.
@@ -1671,6 +1682,74 @@ def _prepared_product_cutout(
         connected_background = np.isin(background_labels, border_labels)
         initial_foreground = (~connected_background).astype(np.uint8)
 
+        # Detect ELLE's champagne-gold hardware before any foreground cleanup.
+        # Every protected component must contain a clearly gold seed; muted
+        # floor shadows cannot become protected merely because they are warm.
+        # The one-pixel highlight recovery keeps bright metal edges without
+        # filling the white holes between links, letters or clasps.
+        if colourful_product:
+            red = rgb[:, :, 0].astype(np.int16)
+            green = rgb[:, :, 1].astype(np.int16)
+            blue = rgb[:, :, 2].astype(np.int16)
+            gold_seed = (
+                (hue >= 8)
+                & (hue <= 38)
+                & (saturation >= 30)
+                & (value >= 110)
+                & (lab_distance >= 7)
+                & (red >= blue + 10)
+                & (green >= blue + 5)
+                & (gradient >= 8)
+            )
+            gold_region_candidate = (
+                (hue >= 7)
+                & (hue <= 42)
+                & (saturation >= 10)
+                & (value >= 58)
+                & (lab_distance >= 3)
+                & (red >= blue + 5)
+                & (green >= blue + 2)
+                & ((gradient >= 4) | (saturation >= 18))
+            )
+            seeded_gold_neighbourhood = cv2.dilate(
+                gold_seed.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ).astype(bool)
+            gold_component_count, gold_component_labels = cv2.connectedComponents(
+                gold_region_candidate.astype(np.uint8),
+                8,
+            )
+            seeded_component_region = np.zeros((height, width), dtype=bool)
+            if gold_component_count > 1:
+                seeded_gold_labels = np.unique(gold_component_labels[gold_seed])
+                seeded_gold_labels = seeded_gold_labels[seeded_gold_labels > 0]
+                if seeded_gold_labels.size:
+                    seeded_component_region = np.isin(
+                        gold_component_labels,
+                        seeded_gold_labels,
+                    )
+            upper_hardware_region = (
+                seeded_component_region
+                & (np.arange(height)[:, None] < round(height * 0.72))
+            )
+            elle_hardware_protection = (
+                gold_seed
+                | (seeded_gold_neighbourhood & gold_region_candidate)
+                | upper_hardware_region
+            )
+            metal_highlight_neighbour = (
+                cv2.dilate(
+                    elle_hardware_protection.astype(np.uint8),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                    iterations=1,
+                ).astype(bool)
+                & (lab_distance >= 2)
+                & (value <= 252)
+                & (gradient >= 14)
+            )
+            elle_hardware_protection |= metal_highlight_neighbour
+
         # Refine uncertain light edges with GrabCut. Strongly coloured and dark
         # pixels are protected so chains, hardware and pale leather survive.
         grabcut = np.full((height, width), cv2.GC_PR_BGD, dtype=np.uint8)
@@ -1683,6 +1762,7 @@ def _prepared_product_cutout(
             | (saturation >= 48)
             | (value <= 145)
         )
+        sure_foreground |= elle_hardware_protection
         if model_matte is not None:
             sure_foreground |= model_matte >= 0.985
         grabcut[sure_foreground] = cv2.GC_FGD
@@ -1745,6 +1825,10 @@ def _prepared_product_cutout(
                 & ((gradient >= 10) | (lab_distance >= 7) | (value <= 247))
             )
             mask |= edge_protection
+
+        # ELLE plaques, letter logos, charms, links, zips and clasps have the
+        # highest preservation priority throughout all later shadow cleanup.
+        mask |= elle_hardware_protection
 
         mask_u8 = mask.astype(np.uint8)
         mask_u8 = cv2.morphologyEx(
@@ -1851,6 +1935,7 @@ def _prepared_product_cutout(
                 )
             detail_below_body = (
                 gold_detail
+                | elle_hardware_protection
                 | dark_detail
                 | outside_colored_detail
                 | model_detail
@@ -1867,7 +1952,12 @@ def _prepared_product_cutout(
                     & (saturation <= 30)
                     & (value >= 115)
                     & (gradient <= 95)
-                    & ~(gold_detail | dark_detail | outside_colored_detail)
+                    & ~(
+                        gold_detail
+                        | elle_hardware_protection
+                        | dark_detail
+                        | outside_colored_detail
+                    )
                 )
                 mask_u8[connected_floor_shadow] = 0
 
@@ -1944,6 +2034,7 @@ def _prepared_product_cutout(
                         & mask_u8.astype(bool)
                         & ~(
                             gold_detail
+                            | elle_hardware_protection
                             | (dark_product & dark_detail)
                             | outside_colored_detail
                         )
@@ -1963,6 +2054,7 @@ def _prepared_product_cutout(
                     component_width >= max(12, width // 16)
                     and component_height <= max(18, height // 45)
                     and component_area >= max(30, width // 8)
+                    and not np.any(elle_hardware_protection[component_labels == component])
                 ):
                     mask_u8[component_labels == component] = 0
 
@@ -2046,6 +2138,8 @@ def _prepared_product_cutout(
         np.ones((3, 3), dtype=np.uint8),
         iterations=2,
     ).astype(bool)
+    cropped_elle_hardware = elle_hardware_protection[top:bottom, left:right]
+    cropped_gold_protection |= cropped_elle_hardware
     if model_matte is not None and not dark_product:
         cropped_model_matte = model_matte[top:bottom, left:right]
         verified_floor_hardware = cropped_gold_protection & (
@@ -2059,6 +2153,7 @@ def _prepared_product_cutout(
                 )
             )
         )
+        verified_floor_hardware |= cropped_elle_hardware
         cropped_height, cropped_width = alpha.shape
         yy, xx = np.indices(alpha.shape)
         material_sample = (
@@ -2102,11 +2197,16 @@ def _prepared_product_cutout(
             # one global floor line (rather than trimming each column) so the
             # bag silhouette is never reshaped; gold chains and fittings are
             # explicitly retained below the line.
+            median_material_value = (
+                float(np.median(cropped_value[material_sample]))
+                if np.any(material_sample)
+                else 180.0
+            )
             material_value_floor = float(np.clip(
-                float(np.median(cropped_value[material_sample])) * 0.78,
+                median_material_value * 0.78,
                 90,
                 165,
-            )) if np.any(material_sample) else 125.0
+            ))
             central_columns = (
                 (xx >= round(cropped_width * 0.10))
                 & (xx < round(cropped_width * 0.90))
@@ -2140,6 +2240,32 @@ def _prepared_product_cutout(
                     & ~verified_floor_hardware
                 )
                 alpha[shadow_below_floor] = 0
+
+                # Pale coloured bags can cast a darker contact shadow which
+                # remains connected to the bottom seam. Remove only that
+                # sudden value drop at/under the global floor. Hardware uses a
+                # fresh, tight gold-neighbour mask here so an earlier broad
+                # protection cannot accidentally preserve the shadow.
+                if median_material_value >= 185:
+                    authentic_floor_gold = (
+                        (cropped_hue >= 8)
+                        & (cropped_hue <= 38)
+                        & (cropped_saturation >= 25)
+                        & (cropped_value >= 110)
+                    )
+                    tight_floor_hardware = cv2.dilate(
+                        authentic_floor_gold.astype(np.uint8),
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                        iterations=1,
+                    ).astype(bool)
+                    connected_contact_shadow = (
+                        (yy >= material_floor)
+                        & central_columns
+                        & (alpha > 0)
+                        & (refined_value < material_value_floor + 12)
+                        & ~tight_floor_hardware
+                    )
+                    alpha[connected_contact_shadow] = 0
 
         transparent_neighbour = cv2.dilate(
             (alpha == 0).astype(np.uint8),
@@ -2186,10 +2312,22 @@ def _prepared_product_cutout(
             component_left = int(component_stats[component, cv2.CC_STAT_LEFT])
             component_top = int(component_stats[component, cv2.CC_STAT_TOP])
             component_width = int(component_stats[component, cv2.CC_STAT_WIDTH])
+            component_height = int(component_stats[component, cv2.CC_STAT_HEIGHT])
             component_pixels = component_labels == component
             component_center_x = component_left + component_width / 2
             component_value = float(np.mean(
                 np.max(cropped_rgb[component_pixels], axis=1)
+            ))
+            component_gold_fraction = float(np.mean(
+                cropped_gold_protection[component_pixels]
+            ))
+            component_authentic_gold_fraction = float(np.mean(
+                (
+                    (cropped_hue >= 8)
+                    & (cropped_hue <= 38)
+                    & (cropped_saturation >= 25)
+                    & (cropped_value >= 110)
+                )[component_pixels]
             ))
             central_dark_floor = (
                 not dark_product
@@ -2197,12 +2335,22 @@ def _prepared_product_cutout(
                 and cropped_mask.shape[1] * 0.20 <= component_center_x <= cropped_mask.shape[1] * 0.80
                 and component_value <= 115
             )
+            central_shallow_floor = (
+                not dark_product
+                and component_top >= cropped_mask.shape[0] * 0.90
+                and component_height <= max(8, cropped_mask.shape[0] // 55)
+                and cropped_mask.shape[1] * 0.20 <= component_center_x <= cropped_mask.shape[1] * 0.80
+                and component_authentic_gold_fraction < 0.35
+            )
             if (
-                component_area <= small_component_limit
-                and component_top >= lower_quarter
-                and (
-                    central_dark_floor
-                    or float(np.mean(cropped_gold_protection[component_pixels])) <= 0.15
+                central_shallow_floor
+                or (
+                    component_area <= small_component_limit
+                    and component_top >= lower_quarter
+                    and (
+                        central_dark_floor
+                        or component_gold_fraction <= 0.15
+                    )
                 )
             ):
                 alpha[component_pixels] = 0

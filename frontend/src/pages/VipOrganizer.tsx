@@ -1771,7 +1771,10 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
       }}
       onDrop={handleDrop}
     >
-      <div><strong>{title}</strong><span>{hint}</span></div>
+      <div className="organizer-upload-heading">
+        <div><strong>{title}</strong><span>{hint}</span></div>
+        <small>{items.length ? `${items.length} 张` : "尚未上传"}</small>
+      </div>
       <label className="organizer-upload-button">
         <UploadCloud size={22} />
         <span>{dragging ? "松开即可上传" : items.length ? `已上传 ${items.length} 张，可继续拖入或点击添加` : multiple ? "拖入多张图片，或点击选择" : "拖入图片，或点击选择"}</span>
@@ -3432,14 +3435,18 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
 
   return (
     <section className="page organizer-page">
-      <header className="page-header">
+      <header className="page-header organizer-page-header">
         <h1>自动化整理</h1>
+        <p>按流程上传素材、确认分类、填写商品信息并检查平台成品。</p>
       </header>
 
       <section className="panel organizer-source-panel">
-        <div className="section-title-row">
-          <h2>1. 上传素材</h2>
-          <div className="button-row">
+        <div className="organizer-step-header">
+          <div className="organizer-step-heading">
+            <h2>1. 上传素材</h2>
+            <p>先上传商品原图；模特图和吊牌图可按实际需要补充。</p>
+          </div>
+          <div className="button-row organizer-step-actions">
             {sessionId && <button disabled={busy} onClick={startNewSession}><RefreshCw size={18} />开始新一轮</button>}
             <button className="primary" disabled={busy || !products.length} onClick={() => analyze()}>
               {busy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}自动整理初稿
@@ -3455,9 +3462,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
 
       {slots.length > 0 && <>
         <section className="panel organizer-analysis-panel">
-          <div className="organizer-analysis-header">
-            <h2>2. 素材分析</h2>
-            <div className="organizer-analysis-toolbar">
+          <div className="organizer-step-header organizer-analysis-header">
+            <div className="organizer-step-heading">
+              <h2>2. 素材分析</h2>
+              <p>核对自动分类和细节标签，确认后可按最新结果重新整理。</p>
+            </div>
+            <div className="organizer-analysis-toolbar organizer-step-actions">
               <label className="organizer-api-select">
                 <span>图文分析 API</span>
                 <select value={analysisConfigId} onChange={(event) => setAnalysisConfigId(Number(event.target.value) || "")}>
@@ -3513,7 +3523,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         </section>
 
         <section className="panel organizer-info-panel">
-          <div className="section-title-row"><h2>3. 商品信息</h2></div>
+          <div className="organizer-step-header organizer-step-header-simple">
+            <div className="organizer-step-heading">
+              <h2>3. 商品信息</h2>
+              <p>尺寸统一填写毫米（mm），用于产品信息图和尺寸对比图。</p>
+            </div>
+          </div>
           <div className="organizer-info-grid">
             <label>商品名称<input value={info.product_name} onChange={(event) => setInfo({ ...info, product_name: event.target.value })} /></label>
             <label>长（mm）<input inputMode="decimal" placeholder="例如：200" value={info.product_length} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
@@ -3557,7 +3572,13 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
               </button>
             </div>
           </div>
-          <div className="section-title-row"><h2>4. 检查{platform === "jd" ? "京东7个输出位置" : "15个输出位置"}</h2>{(previewBusy || platformSwitching || platformRegenerating) && <span className="organizer-preview-status"><LoaderCircle className="spin" size={16} />{platformSwitching ? "正在切换输出平台" : platformRegenerating ? "正在重新生成当前平台" : "正在更新成品预览"}</span>}</div>
+          <div className="organizer-step-header">
+            <div className="organizer-step-heading">
+              <h2>4. 检查{platform === "jd" ? "京东 7 个" : "15 个"}输出位置</h2>
+              <p>逐项确认成品、来源图片和调整结果后再导出。</p>
+            </div>
+            {(previewBusy || platformSwitching || platformRegenerating) && <span className="organizer-preview-status organizer-step-actions"><LoaderCircle className="spin" size={16} />{platformSwitching ? "正在切换输出平台" : platformRegenerating ? "正在重新生成当前平台" : "正在更新成品预览"}</span>}
+          </div>
           <div className="organizer-preview-groups">
             {previewGroups.map((group) => <section className="organizer-preview-group" key={group.folder}>
               {group.label && <header className="organizer-preview-group-header">
@@ -3669,7 +3690,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         </section>
       </>}
 
-      {message && <div className="alert warning">{message}</div>}
+      {message && <div className="alert warning organizer-status-message" role="status">{message}</div>}
       {preview && <div className="image-modal" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={() => setPreview(null)}>
         <button className="image-modal-close" type="button" onClick={() => setPreview(null)} aria-label="关闭预览"><X size={22} /></button>
         <img src={preview} alt="图片预览" onClick={(event) => event.stopPropagation()} />
