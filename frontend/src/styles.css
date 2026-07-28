@@ -58,7 +58,7 @@
 /* VIP.com deterministic asset organizer */
 .organizer-page { max-width: 1700px; }
 .organizer-page > .page-header h1, .organizer-page .section-title-row > h2, .organizer-analysis-header > h2 { margin-bottom: 0; }
-.organizer-page-header { display: grid; justify-items: center; gap: 6px; text-align: center; }
+.organizer-page-header { display: grid; justify-items: start; gap: 6px; text-align: left; }
 .organizer-page-header p { max-width: 760px; margin: 0; color: #66736e; line-height: 1.55; }
 .organizer-step-header { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 18px; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #e2e7e4; }
 .organizer-step-heading { grid-column: 2; display: grid; justify-items: center; gap: 5px; text-align: center; }
@@ -66,6 +66,9 @@
 .organizer-step-heading p { max-width: 700px; margin: 0; color: #68736d; font-size: 13px; line-height: 1.5; }
 .organizer-step-actions { grid-column: 3; justify-self: end; }
 .organizer-step-header-simple .organizer-step-heading { grid-column: 2; }
+.organizer-source-panel .organizer-step-header { grid-template-columns: minmax(0, 1fr) auto; }
+.organizer-source-panel .organizer-step-heading { grid-column: 1; justify-items: start; text-align: left; }
+.organizer-source-panel .organizer-step-actions { grid-column: 2; }
 .organizer-source-panel > .section-title-row, .organizer-analysis-header { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; }
 .organizer-source-panel > .section-title-row > h2, .organizer-analysis-header > h2 { grid-column: 2; justify-self: center; text-align: center; }
 .organizer-source-panel > .section-title-row > .button-row, .organizer-analysis-toolbar { grid-column: 3; justify-self: end; }
@@ -86,6 +89,10 @@
 .organizer-cutout-actions .button-link, .organizer-cutout-actions button { min-height: 42px; }
 .organizer-preparation-empty { display: flex; min-height: 92px; align-items: center; justify-content: center; gap: 10px; border: 1px dashed #b9c9c2; border-radius: 6px; color: #68756f; background: #fafbfa; }
 .organizer-analysis-header { gap: 22px; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid #e2e7e4; }
+.organizer-analysis-header.organizer-step-header { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.organizer-analysis-header .organizer-step-heading,
+.organizer-analysis-header .organizer-analysis-toolbar { grid-column: 1; }
+.organizer-analysis-header .organizer-analysis-toolbar { justify-self: center; }
 .organizer-analysis-header h2 { margin-bottom: 6px; }
 .organizer-analysis-header p { max-width: 760px; margin: 0; color: #657169; line-height: 1.55; }
 .organizer-analysis-toolbar { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto; align-items: end; gap: 9px; }
@@ -254,7 +261,7 @@
 @media (max-width: 1350px) { .organizer-step-header { grid-template-columns: 1fr; } .organizer-step-heading, .organizer-step-header-simple .organizer-step-heading, .organizer-step-actions { grid-column: 1; } .organizer-step-actions { justify-self: center; } .organizer-analysis-header { grid-template-columns: 1fr; align-items: stretch; } .organizer-analysis-header > h2, .organizer-analysis-toolbar { grid-column: 1; justify-self: stretch; } .organizer-analysis-header > h2 { text-align: center; } .organizer-analysis-toolbar { grid-template-columns: minmax(260px, 1fr) auto auto; } }
 @media (max-width: 1200px) { .organizer-analysis-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .organizer-slot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .organizer-info-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .organizer-info-grid .wide { grid-column: span 3; } }
 @media (max-width: 900px) { .slot-adjustment-modal { padding: 0; } .slot-adjustment-dialog { width: 100vw; max-height: 100vh; height: 100vh; border: 0; border-radius: 0; } .slot-close-confirm { grid-template-columns: 1fr auto 38px; } .slot-adjustment-workspace { grid-template-columns: 1fr; overflow: auto; } .slot-adjustment-source { border-right: 0; border-bottom: 1px solid #dfe5e2; } .slot-source-stage, .slot-result-stage { min-height: 330px; } .slot-adjustment-controls { flex-wrap: wrap; } .slot-adjustment-controls button.primary { margin-left: 0; } }
-@media (max-width: 900px) { .organizer-source-panel > .section-title-row { grid-template-columns: 1fr; } .organizer-source-panel > .section-title-row > h2, .organizer-source-panel > .section-title-row > .button-row { grid-column: 1; justify-self: stretch; } .organizer-source-panel > .section-title-row > h2 { text-align: center; } }
+@media (max-width: 900px) { .organizer-source-panel .organizer-step-header, .organizer-source-panel > .section-title-row { grid-template-columns: 1fr; } .organizer-source-panel .organizer-step-heading, .organizer-source-panel .organizer-step-actions, .organizer-source-panel > .section-title-row > h2, .organizer-source-panel > .section-title-row > .button-row { grid-column: 1; } .organizer-source-panel .organizer-step-actions, .organizer-source-panel > .section-title-row > .button-row { justify-self: stretch; } .organizer-source-panel > .section-title-row > h2 { text-align: center; } }
 @media (max-width: 800px) { .organizer-cutout-results, .organizer-upload-columns, .organizer-analysis-grid, .organizer-slot-grid { grid-template-columns: 1fr; } .organizer-step-header { gap: 13px; } .organizer-step-actions, .organizer-step-actions.button-row { width: 100%; justify-content: center; } .organizer-step-actions.button-row > button { flex: 1; } .organizer-slot.is-composite { grid-column: auto; grid-template-columns: 1fr; } .organizer-info-grid { grid-template-columns: 1fr; } .organizer-info-grid .wide { grid-column: auto; } .organizer-analysis-toolbar { grid-template-columns: 1fr; } .organizer-api-select { width: 100%; min-width: 0; } .organizer-api-select select { width: 100%; min-width: 0; } .organizer-platform-switcher, .organizer-export-bar { align-items: stretch; flex-direction: column; } .organizer-platform-tabs { width: 100%; } .organizer-platform-tabs button { flex: 1; min-width: 0; } }
 
 .image-modal {

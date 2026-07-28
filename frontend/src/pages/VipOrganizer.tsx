@@ -1,4 +1,4 @@
-import { CheckCircle2, Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
+import { Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
 import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
@@ -1206,6 +1206,61 @@ function jdComparisonProductGeometry(
   };
 }
 
+function jdComparisonPhoneLayout(
+  output: { width: number; height: number },
+  geometry: {
+    baseBodyHeight: number;
+    heightMm: number;
+    safe: PixelBounds;
+  },
+  baseGeometry: { body: PixelBounds },
+  draft: ImageAdjustment,
+  phoneReference: HTMLImageElement | null
+) {
+  const phoneRulerGap = Math.max(22, output.width * 0.035);
+  const phoneLabelClearance = Math.max(40, output.width * 0.05);
+  const phoneRightAllowance = phoneRulerGap + phoneLabelClearance;
+  const phoneBottomAllowance = Math.max(28, output.height * 0.055);
+  const phoneHeightForScale = (scale: number) => Math.max(
+    output.height * 0.095,
+    Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * scale)
+  );
+  const phoneWidthForHeight = (height: number) => phoneReference?.naturalWidth && phoneReference.naturalHeight
+    ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
+    : height * 0.78;
+  const basePhoneHeight = phoneHeightForScale(1);
+  const basePhoneWidth = phoneWidthForHeight(basePhoneHeight);
+  let basePhoneLeft = output.width * 0.75 - basePhoneWidth / 2;
+  let basePhoneTop = (draft.phone_alignment || "bottom") === "bottom"
+    ? baseGeometry.body.bottom - basePhoneHeight
+    : (baseGeometry.body.top + baseGeometry.body.bottom - basePhoneHeight) / 2;
+  basePhoneLeft = Math.max(
+    geometry.safe.left,
+    Math.min(basePhoneLeft, geometry.safe.right - basePhoneWidth - phoneRightAllowance)
+  );
+  basePhoneTop = Math.max(
+    geometry.safe.top,
+    Math.min(basePhoneTop, geometry.safe.bottom - basePhoneHeight - phoneBottomAllowance)
+  );
+  const basePhoneCenterX = basePhoneLeft + basePhoneWidth / 2;
+  const basePhoneAnchorY = (draft.phone_alignment || "bottom") === "bottom"
+    ? basePhoneTop + basePhoneHeight
+    : basePhoneTop + basePhoneHeight / 2;
+  const placePhone = (scale: number, offsetX: number, offsetY: number) => {
+    const height = phoneHeightForScale(scale);
+    const width = phoneWidthForHeight(height);
+    const left = basePhoneCenterX + offsetX * output.width * 0.18 - width / 2;
+    const top = basePhoneAnchorY + offsetY * output.height * 0.18
+      - ((draft.phone_alignment || "bottom") === "bottom" ? height : height / 2);
+    return { left, top, width, height };
+  };
+  return {
+    phoneRulerGap,
+    phone: placePhone(draft.phone_scale || 1, draft.phone_offset_x || 0, draft.phone_offset_y || 0),
+    basePhone: placePhone(1, 0, 0)
+  };
+}
+
 function drawAdjustmentGuide(
   context: CanvasRenderingContext2D,
   output: { width: number; height: number },
@@ -1333,43 +1388,22 @@ function drawJdComparisonPreview(
   drawCanvasRuler(context, lengthRuler.start, lengthRuler.end, lengthLabel, output);
   drawCanvasRuler(context, heightRuler.start, heightRuler.end, heightLabel, output, true);
 
-  const phoneRulerGap = Math.max(22, output.width * 0.035);
-  const phoneLabelClearance = Math.max(40, output.width * 0.05);
-  const phoneRightAllowance = draft.phone_show_ruler !== false ? phoneRulerGap + phoneLabelClearance : 8;
-  const phoneBottomAllowance = Math.max(28, output.height * 0.055);
-  const phoneHeightForScale = (scale: number) => Math.max(
-      output.height * 0.095,
-      Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * scale)
-    );
-  const phoneWidthForHeight = (height: number) => phoneReference?.naturalWidth && phoneReference.naturalHeight
-    ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
-    : height * 0.78;
-  const basePhoneHeight = phoneHeightForScale(1);
-  const basePhoneWidth = phoneWidthForHeight(basePhoneHeight);
-  let basePhoneLeft = output.width * 0.75 - basePhoneWidth / 2;
-  let basePhoneTop = (draft.phone_alignment || "bottom") === "bottom"
-    ? baseGeometry.body.bottom - basePhoneHeight
-    : (baseGeometry.body.top + baseGeometry.body.bottom - basePhoneHeight) / 2;
-  basePhoneLeft = Math.max(geometry.safe.left, Math.min(basePhoneLeft, geometry.safe.right - basePhoneWidth - phoneRightAllowance));
-  basePhoneTop = Math.max(geometry.safe.top, Math.min(basePhoneTop, geometry.safe.bottom - basePhoneHeight - phoneBottomAllowance));
-  const basePhoneCenterX = basePhoneLeft + basePhoneWidth / 2;
-  const basePhoneAnchorY = (draft.phone_alignment || "bottom") === "bottom"
-    ? basePhoneTop + basePhoneHeight
-    : basePhoneTop + basePhoneHeight / 2;
-  const placePhone = (scale: number, offsetX: number, offsetY: number) => {
-    const height = phoneHeightForScale(scale);
-    const width = phoneWidthForHeight(height);
-    const left = basePhoneCenterX + offsetX * output.width * 0.18 - width / 2;
-    const top = basePhoneAnchorY + offsetY * output.height * 0.18
-      - ((draft.phone_alignment || "bottom") === "bottom" ? height : height / 2);
-    return { left, top, width, height };
-  };
-  const phone = placePhone(draft.phone_scale || 1, draft.phone_offset_x || 0, draft.phone_offset_y || 0);
+  const phoneLayout = jdComparisonPhoneLayout(
+    output,
+    geometry,
+    baseGeometry,
+    draft,
+    phoneReference
+  );
+  const phone = phoneLayout.phone;
   if (phoneReference?.complete && phoneReference.naturalWidth) {
     context.drawImage(phoneReference, phone.left, phone.top, phone.width, phone.height);
   }
-  const phoneRuler = draft.phone_show_ruler !== false ? phone : placePhone(1, 0, 0);
-  const phoneRulerX = Math.min(geometry.safe.right - 12, phoneRuler.left + phoneRuler.width + phoneRulerGap);
+  const phoneRuler = draft.phone_show_ruler !== false ? phone : phoneLayout.basePhone;
+  const phoneRulerX = Math.min(
+    geometry.safe.right - 12,
+    phoneRuler.left + phoneRuler.width + phoneLayout.phoneRulerGap
+  );
   const phoneRulerSegment = transformCanvasRulerSegment(
     { x: phoneRulerX, y: phoneRuler.top },
     { x: phoneRulerX, y: phoneRuler.top + phoneRuler.height },
@@ -1864,6 +1898,7 @@ function SlotAdjustmentEditor({
   const syncedVersionRef = useRef(initialPreview ? 0 : -1);
   const previewRequestRef = useRef(0);
   const previewAbortRef = useRef<AbortController | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
   const moveTargetRef = useRef<AdjustmentTarget>("product");
   const linkedProductRulersRef = useRef(false);
 
@@ -1892,6 +1927,73 @@ function SlotAdjustmentEditor({
       x,
       y
     );
+  }
+
+  function withPhoneRulerLinkPreservingPosition(
+    current: ImageAdjustment,
+    linked: boolean
+  ): ImageAdjustment {
+    const currentlyLinked = current.phone_show_ruler !== false;
+    if (currentlyLinked === linked) return current;
+    const productImage = livePreviewImage(sourceUrl);
+    const phoneReference = livePreviewImage("/organizer-assets/iphone_reference.png");
+    if (!productImage.complete || !productImage.naturalWidth) {
+      return { ...current, phone_show_ruler: linked };
+    }
+
+    const output = slotCanvasSize(slot.size, platform, targetFolder);
+    const layer = liveJdProductLayer(sourceUrl, productImage, current);
+    const { geometry, baseGeometry } = jdComparisonProductGeometry(
+      output,
+      layer,
+      current,
+      productInfo
+    );
+    const phoneLayout = jdComparisonPhoneLayout(
+      output,
+      geometry,
+      baseGeometry,
+      current,
+      phoneReference
+    );
+    const rawSegment = (useLinkedPhone: boolean) => {
+      const box = useLinkedPhone ? phoneLayout.phone : phoneLayout.basePhone;
+      const x = Math.min(
+        geometry.safe.right - 12,
+        box.left + box.width + phoneLayout.phoneRulerGap
+      );
+      return {
+        start: { x, y: box.top },
+        end: { x, y: box.top + box.height }
+      };
+    };
+    const previousBase = rawSegment(currentlyLinked);
+    const desired = transformCanvasRulerSegment(
+      previousBase.start,
+      previousBase.end,
+      current.phone_ruler_scale || 1,
+      current.phone_ruler_offset_x || 0,
+      current.phone_ruler_offset_y || 0,
+      output
+    );
+    const nextBase = rawSegment(linked);
+    const nextBaseLength = Math.max(1, nextBase.end.y - nextBase.start.y);
+    const desiredLength = Math.max(1, desired.end.y - desired.start.y);
+    const nextBaseCenter = {
+      x: (nextBase.start.x + nextBase.end.x) / 2,
+      y: (nextBase.start.y + nextBase.end.y) / 2
+    };
+    const desiredCenter = {
+      x: (desired.start.x + desired.end.x) / 2,
+      y: (desired.start.y + desired.end.y) / 2
+    };
+    return {
+      ...current,
+      phone_show_ruler: linked,
+      phone_ruler_scale: desiredLength / nextBaseLength,
+      phone_ruler_offset_x: (desiredCenter.x - nextBaseCenter.x) / (output.width * 0.18),
+      phone_ruler_offset_y: (desiredCenter.y - nextBaseCenter.y) / (output.height * 0.18)
+    };
   }
 
   function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
@@ -1968,11 +2070,23 @@ function SlotAdjustmentEditor({
   }
 
   function cancelStalePreview() {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
     if (!previewAbortRef.current) return;
     previewAbortRef.current.abort();
     previewAbortRef.current = null;
     previewRequestRef.current += 1;
     setBusy(false);
+  }
+
+  function scheduleExactPreview(nextDraft: ImageAdjustment, version: number) {
+    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      void refreshPreview(nextDraft, version);
+    }, 320);
   }
 
   function applyDraft(
@@ -1988,6 +2102,7 @@ function SlotAdjustmentEditor({
     draftRef.current = preparedDraft;
     setDraft(preparedDraft);
     setPreviewSynced(false);
+    scheduleExactPreview(preparedDraft, draftVersionRef.current);
   }
 
   function changeLogoColor(nextColor: LogoColor) {
@@ -2023,6 +2138,10 @@ function SlotAdjustmentEditor({
     nextDraft: ImageAdjustment = draftRef.current,
     version = draftVersionRef.current
   ): Promise<string | undefined> {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
     const requestId = ++previewRequestRef.current;
     previewAbortRef.current?.abort();
     const controller = new AbortController();
@@ -2065,6 +2184,7 @@ function SlotAdjustmentEditor({
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = previousOverflow;
+      if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
       previewAbortRef.current?.abort();
       if (moveFrameRef.current !== null) window.cancelAnimationFrame(moveFrameRef.current);
     };
@@ -2210,7 +2330,19 @@ function SlotAdjustmentEditor({
     if (activeMoveTarget !== "product") {
       let next = withTargetScale(draftRef.current, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
       next = withTargetOffset(next, activeMoveTarget, 0, 0);
-      if (activeMoveTarget === "phone") next = { ...next, phone_alignment: "bottom", phone_show_ruler: false };
+      if (activeMoveTarget === "phone") {
+        const keepPhoneRulerLinked = isPhoneObjectEditor && draftRef.current.phone_show_ruler !== false;
+        next = {
+          ...next,
+          phone_alignment: "bottom",
+          phone_show_ruler: keepPhoneRulerLinked,
+          ...(keepPhoneRulerLinked ? {
+            phone_ruler_scale: DEFAULT_ADJUSTMENT.phone_ruler_scale,
+            phone_ruler_offset_x: DEFAULT_ADJUSTMENT.phone_ruler_offset_x,
+            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y
+          } : {})
+        };
+      }
       applyDraft(next);
     } else if (isPhoneComparison || isInfoPage) {
       const resetProduct = {
@@ -2272,6 +2404,10 @@ function SlotAdjustmentEditor({
     flushPendingMove();
     const currentDraft = draftRef.current;
     let previewUrl = renderedPreviewRef.current;
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
     if (syncedVersionRef.current !== draftVersionRef.current) {
       previewUrl = await refreshPreview(currentDraft, draftVersionRef.current) || "";
     }
@@ -2297,7 +2433,7 @@ function SlotAdjustmentEditor({
         <header>
           <div>
             <strong>{slot.file_name} · {slot.title}</strong>
-            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? "手机" : moveTarget === "phone_ruler" ? "手机高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
+            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? (draft.phone_show_ruler !== false ? "手机和高标线" : "手机") : moveTarget === "phone_ruler" ? "高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
           </div>
           <button type="button" className="icon-button" onClick={requestClose} title="关闭"><X size={21} /></button>
         </header>
@@ -2312,7 +2448,7 @@ function SlotAdjustmentEditor({
           <div className="slot-adjustment-source">
             <div className="slot-adjustment-heading">
               <strong>{isPhoneObjectEditor ? "手机参照图" : "原始图片"}</strong>
-              <span>{isPhoneObjectEditor ? "在右侧预览中调整手机或手机高标线" : cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
+              <span>{isPhoneObjectEditor ? "在右侧预览中调整手机或高标线" : cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
             </div>
             <div
               ref={sourceStageRef}
@@ -2367,8 +2503,13 @@ function SlotAdjustmentEditor({
                 const bounds = event.currentTarget.getBoundingClientRect();
                 const output = slotCanvasSize(slot.size, platform, targetFolder);
                 const basis = adjustmentOffsetBasis(slot, platform, sourceIndex, targetFolder, start.target);
-                const canvasDeltaX = (event.clientX - start.x) * output.width / Math.max(1, bounds.width);
-                const canvasDeltaY = (event.clientY - start.y) * output.height / Math.max(1, bounds.height);
+                const dragSensitivity = platform === "jd"
+                  && slot.file_name === "2.jpg"
+                  && start.target === "product"
+                  ? 0.55
+                  : 1;
+                const canvasDeltaX = (event.clientX - start.x) * output.width / Math.max(1, bounds.width) * dragSensitivity;
+                const canvasDeltaY = (event.clientY - start.y) * output.height / Math.max(1, bounds.height) * dragSensitivity;
                 const nextOffsetX = Math.max(-1.5, Math.min(1.5, start.offsetX + canvasDeltaX / basis.x));
                 const nextOffsetY = Math.max(-1.5, Math.min(1.5, start.offsetY + canvasDeltaY / basis.y));
                 pendingMoveRef.current = updateTargetOffset(draftRef.current, start.target, nextOffsetX, nextOffsetY);
@@ -2420,16 +2561,27 @@ function SlotAdjustmentEditor({
           {(isPhoneComparison || isInfoPage) && <div className="slot-phone-controls" role="group" aria-label={isInfoPage ? "产品信息图调整" : "手机对比调整"}>
             <span>调整对象</span>
             {isPhoneObjectEditor ? <>
-              <button type="button" className={moveTarget === "phone" ? "active-tool" : ""} onClick={() => {
+              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler !== false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone");
                 setCropMode(false);
-                if (draftRef.current.phone_show_ruler !== false) applyDraft({ ...draftRef.current, phone_show_ruler: false });
+                if (draftRef.current.phone_show_ruler === false) {
+                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, true));
+                }
+              }}>全部</button>
+              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler === false ? "active-tool" : ""} onClick={() => {
+                setMoveTarget("phone");
+                setCropMode(false);
+                if (draftRef.current.phone_show_ruler !== false) {
+                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, false));
+                }
               }}>手机</button>
               <button type="button" className={moveTarget === "phone_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone_ruler");
                 setCropMode(false);
-                if (draftRef.current.phone_show_ruler !== false) applyDraft({ ...draftRef.current, phone_show_ruler: false });
-              }}>手机高标线</button>
+                if (draftRef.current.phone_show_ruler !== false) {
+                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, false));
+                }
+              }}>高标线</button>
               <span>对齐</span>
               <button type="button" className={draft.phone_alignment === "center" ? "active-tool" : ""} onClick={() => changePhoneAlignment("center")}>中心同高</button>
               <button type="button" className={(draft.phone_alignment || "bottom") === "bottom" ? "active-tool" : ""} onClick={() => changePhoneAlignment("bottom")}>底部齐平</button>
@@ -3275,7 +3427,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       setSlotPreviews((current) => ({ ...current, [previewKey]: previewUrl }));
     }
     setAdjustmentEditor(null);
-    setMessage(`${fileName} 的裁剪、缩放和位置已保存`);
+    setMessage("");
   }
 
   function selectedAsset(id?: number) {
@@ -3437,7 +3589,6 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     <section className="page organizer-page">
       <header className="page-header organizer-page-header">
         <h1>自动化整理</h1>
-        <p>按流程上传素材、确认分类、填写商品信息并检查平台成品。</p>
       </header>
 
       <section className="panel organizer-source-panel">
@@ -3684,7 +3835,6 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
             </section>)}
           </div>
           <div className="organizer-export-bar">
-            <span><CheckCircle2 size={18} />导出前请确认所有低可信度项目</span>
             <button className="primary" disabled={busy || previewBusy} onClick={exportZip}>{busy ? <LoaderCircle className="spin" size={18} /> : <Download size={18} />}下载 ZIP</button>
           </div>
         </section>

@@ -3855,7 +3855,7 @@ def _jd_size_comparison_page(
     phone_width = max(42, round(phone_height * reference_ratio))
     phone_ruler_gap = max(22, round(width * 0.035))
     phone_label_clearance = max(40, round(width * 0.05))
-    phone_right_allowance = phone_ruler_gap + phone_label_clearance if normalized["phone_show_ruler"] else 8
+    phone_right_allowance = phone_ruler_gap + phone_label_clearance
     phone_bottom_allowance = max(28, round(height * 0.055))
     base_phone_left = round(width * 0.75 - base_phone_width / 2)
     base_phone_top = _jd_aligned_phone_top(
