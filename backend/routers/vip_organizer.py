@@ -11,6 +11,7 @@ from ..services.vip_organizer_service import (
     asset_thumbnail,
     analyze_assets,
     analyze_assets_with_api,
+    delete_asset,
     delete_session,
     export_package,
     export_file,
@@ -90,6 +91,15 @@ def upload_assets(
         return save_assets(session_id, asset_type, files)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/assets/{image_id}")
+def remove_asset(image_id: int, session_id: str):
+    try:
+        delete_asset(session_id, image_id)
+        return {"deleted": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/prepare-cutout")

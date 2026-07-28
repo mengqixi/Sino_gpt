@@ -90,6 +90,30 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
             ids = {row["id"] for row in conn.execute("SELECT id FROM vip_organizer_sessions")}
         self.assertEqual(ids, {session_b_next})
 
+    def test_delete_asset_only_deletes_asset_owned_by_session(self):
+        session_a = service.start_session()["session_id"]
+        asset_a = self._add_asset(session_a, "a.jpg")
+        session_b = service.start_session()["session_id"]
+        asset_b = self._add_asset(session_b, "b.jpg")
+        with database.db_session() as conn:
+            asset_a_id = conn.execute(
+                "SELECT id FROM vip_organizer_assets WHERE session_id = ?",
+                (session_a,),
+            ).fetchone()["id"]
+
+        with self.assertRaises(ValueError):
+            service.delete_asset(session_b, asset_a_id)
+        self.assertTrue(asset_a.exists())
+
+        service.delete_asset(session_a, asset_a_id)
+        self.assertFalse(asset_a.exists())
+        self.assertTrue(asset_b.exists())
+        with database.db_session() as conn:
+            remaining = conn.execute(
+                "SELECT session_id FROM vip_organizer_assets"
+            ).fetchall()
+        self.assertEqual([row["session_id"] for row in remaining], [session_b])
+
     def test_prepared_cutout_is_downloadable_without_becoming_an_uploaded_asset(self):
         session_id = service.start_session()["session_id"]
         source = Image.new("RGB", (320, 320), "white")

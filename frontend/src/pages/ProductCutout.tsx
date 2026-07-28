@@ -1,4 +1,4 @@
-import { Download, Eye, FileImage, LoaderCircle, UploadCloud, X } from "lucide-react";
+import { ClipboardPaste, Download, Eye, FileImage, LoaderCircle, RefreshCw, UploadCloud, X } from "lucide-react";
 import type { ClipboardEvent, DragEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
@@ -59,8 +59,10 @@ async function prepareCutoutPhoto(file: File): Promise<File> {
 export default function ProductCutout({ active, onUseAsOrganizerSource }: Props) {
   const sessionRef = useRef("");
   const sessionPromiseRef = useRef<Promise<{ session_id: string }> | null>(null);
+  const pasteButtonRef = useRef<HTMLButtonElement | null>(null);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [prepared, setPrepared] = useState<PreparedCutout | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -93,6 +95,7 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
       setMessage("请上传 JPG、PNG 或 WebP 图片");
       return;
     }
+    setSourceFile(file);
     setBusy(true);
     setMessage("正在生成透明图和灰底检查图……");
     try {
@@ -114,10 +117,48 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
   }
 
   function handlePaste(event: ClipboardEvent<HTMLElement>) {
-    const images = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+    const images = Array.from(event.clipboardData.items).flatMap((item, index) => {
+      if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
+      const file = item.getAsFile();
+      if (!file) return [];
+      return [SUPPORTED_IMAGE_NAME.test(file.name) ? file : namedClipboardFile(file, index)];
+    });
     if (!images.length || busy) return;
     event.preventDefault();
     void prepareCutout(images);
+  }
+
+  function namedClipboardFile(blob: Blob, index = 0) {
+    const extension = blob.type === "image/jpeg"
+      ? "jpg"
+      : blob.type === "image/webp"
+        ? "webp"
+        : "png";
+    return new File([blob], `粘贴图片-${Date.now()}-${index + 1}.${extension}`, { type: blob.type });
+  }
+
+  async function pasteFromClipboard() {
+    if (busy) return;
+    pasteButtonRef.current?.focus();
+    if (!navigator.clipboard?.read) {
+      setMessage("请按 Ctrl+V 粘贴图片");
+      return;
+    }
+    try {
+      const items = await navigator.clipboard.read();
+      const blobs = await Promise.all(items.flatMap((item) => {
+        const imageType = item.types.find((type) => type.startsWith("image/"));
+        return imageType ? [item.getType(imageType)] : [];
+      }));
+      if (!blobs.length) {
+        setMessage("剪贴板中没有图片");
+        return;
+      }
+      await prepareCutout([namedClipboardFile(blobs[0])]);
+    } catch {
+      setMessage("请按 Ctrl+V 粘贴图片");
+      pasteButtonRef.current?.focus();
+    }
   }
 
   async function useAsOrganizerSource() {
@@ -160,14 +201,31 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
       >
         <div className="section-title-row">
           <div><h2>上传白底正面主图</h2><p>可拖入、点击选择，或点击此区域后按 Ctrl+V 粘贴；一次处理一张。</p></div>
-          <label className="organizer-prepare-upload">
-            {busy ? <LoaderCircle className="spin" size={18} /> : <UploadCloud size={18} />}
-            {busy ? "正在精细抠图" : dragging ? "松开即可抠图" : "选择正面主图"}
-            <input type="file" accept="image/*" disabled={busy} onChange={(event) => {
-              void prepareCutout(event.target.files);
-              event.currentTarget.value = "";
-            }} />
-          </label>
+          <div className="button-row organizer-cutout-upload-actions">
+            <button
+              ref={pasteButtonRef}
+              type="button"
+              disabled={busy}
+              onClick={() => void pasteFromClipboard()}
+            >
+              <ClipboardPaste size={18} />粘贴图片
+            </button>
+            <button
+              type="button"
+              disabled={busy || !sourceFile}
+              onClick={() => sourceFile && void prepareCutout([sourceFile])}
+            >
+              <RefreshCw size={18} />重新抠图
+            </button>
+            <label className="organizer-prepare-upload">
+              {busy ? <LoaderCircle className="spin" size={18} /> : <UploadCloud size={18} />}
+              {busy ? "正在精细抠图" : dragging ? "松开即可抠图" : "选择正面主图"}
+              <input type="file" accept="image/*" disabled={busy} onChange={(event) => {
+                void prepareCutout(event.target.files);
+                event.currentTarget.value = "";
+              }} />
+            </label>
+          </div>
         </div>
         {prepared ? <div className="organizer-cutout-results">
           <figure className="transparent-checker">

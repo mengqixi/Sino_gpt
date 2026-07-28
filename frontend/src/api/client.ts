@@ -122,6 +122,10 @@ export const api = {
     files.forEach((file) => form.append("files", file));
     return request<any[]>("/api/vip-organizer/upload", { method: "POST", body: form });
   },
+  deleteVipOrganizerAsset: (sessionId: string, imageId: number) =>
+    request<{ deleted: boolean }>(`/api/vip-organizer/assets/${imageId}?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "DELETE"
+    }),
   prepareVipOrganizerCutout: (sessionId: string, file: File) => {
     const form = new FormData();
     form.append("session_id", sessionId);

@@ -1016,6 +1016,40 @@ def start_session(previous_session_id: str | None = None) -> dict[str, str]:
     return {"session_id": session_id}
 
 
+def delete_asset(session_id: str, image_id: int) -> None:
+    """Delete one uploaded organizer asset owned by the requested session."""
+    if not _valid_session_id(session_id):
+        raise ValueError("整理会话已失效，请重新开始")
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT id, file_path
+            FROM vip_organizer_assets
+            WHERE id = ? AND session_id = ?
+            """,
+            (image_id, session_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("素材不存在或已被删除")
+        conn.execute(
+            "DELETE FROM vip_organizer_assets WHERE id = ? AND session_id = ?",
+            (image_id, session_id),
+        )
+        conn.execute(
+            "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
+            (now_iso(), session_id),
+        )
+
+    organizer_root = ORGANIZER_DATA_DIR.resolve()
+    path = Path(row["file_path"])
+    try:
+        if os.path.commonpath((str(path.resolve()), str(organizer_root))) == str(organizer_root):
+            path.unlink(missing_ok=True)
+            (path.parent / f"thumb_{row['id']}.jpg").unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
 def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> list[dict[str, Any]]:
     if asset_type not in {"product", "model", "tag"}:
         raise ValueError("素材类型不正确")
@@ -2880,15 +2914,14 @@ def _paste_info_product(
 def _info_ruler_geometry(
     body: tuple[float, float, float, float],
 ) -> dict[str, int]:
+    ruler_gap = 34
     body_left, body_top, body_right, body_bottom = body
     line_left = round(body_left + 4)
     line_right = round(body_right - 4)
-    line_width = max(48, line_right - line_left)
     line_bottom = round(body_bottom - 9)
     line_top = round(body_top - 5)
-    line_height = max(1, line_bottom - line_top)
-    vertical_x = max(285, line_left - max(34, round(line_width * 0.205)))
-    horizontal_y = min(535, line_bottom + max(34, round(line_height * 0.19)))
+    vertical_x = max(285, line_left - ruler_gap)
+    horizontal_y = min(535, line_bottom + ruler_gap)
     return {
         "left": line_left,
         "right": line_right,
@@ -2971,22 +3004,41 @@ def _stored_product_ruler_base(
 def _info_width_ruler_geometry(
     base_body: tuple[float, float, float, float],
     adjustment: dict[str, Any] | None = None,
+    *,
+    product_center: tuple[float, float] | None = None,
+    canvas_size: tuple[int, int] = (750, 665),
 ) -> dict[str, Any]:
     normalized = _normalize_adjustment(adjustment)
     _, _, body_right, body_bottom = base_body
-    start = (min(660.0, body_right + 22.0), min(520.0, body_bottom + 18.0))
-    end = (start[0] + 51.0, start[1] - 27.0)
-    center = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
-    scale = normalized["width_ruler_scale"]
-    offset = (
-        normalized["width_ruler_offset_x"] * 750 * 0.18,
-        normalized["width_ruler_offset_y"] * 665 * 0.18,
+    ruler_gap = 34.0
+    anchor_direction = (22.0 ** 2 + 18.0 ** 2) ** 0.5
+    start = (
+        min(660.0, body_right + 22.0 / anchor_direction * ruler_gap),
+        min(520.0, body_bottom + 18.0 / anchor_direction * ruler_gap),
     )
-
-    def transform(point: tuple[float, float]) -> tuple[int, int]:
-        return (
-            round(center[0] + (point[0] - center[0]) * scale + offset[0]),
-            round(center[1] + (point[1] - center[1]) * scale + offset[1]),
+    end = (start[0] + 51.0, start[1] - 27.0)
+    def transform(
+        segment_start: tuple[float, float],
+        segment_end: tuple[float, float],
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        if product_center is not None:
+            return _transform_product_ruler_segment(
+                segment_start,
+                segment_end,
+                product_center,
+                normalized,
+                scale=normalized["width_ruler_scale"],
+                offset_x=normalized["width_ruler_offset_x"],
+                offset_y=normalized["width_ruler_offset_y"],
+                canvas_size=canvas_size,
+            )
+        return _transform_ruler_segment(
+            segment_start,
+            segment_end,
+            scale=normalized["width_ruler_scale"],
+            offset_x=normalized["width_ruler_offset_x"],
+            offset_y=normalized["width_ruler_offset_y"],
+            canvas_size=canvas_size,
         )
 
     delta_x = end[0] - start[0]
@@ -2998,10 +3050,11 @@ def _info_width_ruler_geometry(
         ((start[0] - perpendicular[0], start[1] - perpendicular[1]), (start[0] + perpendicular[0], start[1] + perpendicular[1])),
         ((end[0] - perpendicular[0], end[1] - perpendicular[1]), (end[0] + perpendicular[0], end[1] + perpendicular[1])),
     ]
+    text_point = (start[0] + 8, start[1] + 8)
     return {
-        "segments": [(transform(start), transform(end)) for start, end in segments],
-        "text": transform((start[0] + 8, start[1] + 8)),
-        "scale": scale,
+        "segments": [transform(segment_start, segment_end) for segment_start, segment_end in segments],
+        "text": transform(text_point, text_point)[0],
+        "scale": normalized["width_ruler_scale"],
     }
 
 
@@ -3042,6 +3095,25 @@ def _normalized_product_page(
         auto_tall_handle_drop=auto_tall_handle_drop,
         tall_handle_drop_ratio=tall_handle_drop_ratio,
         auto_offset_y=auto_offset_y,
+    )
+    return canvas
+
+
+def _tag_certificate_page(
+    source: Image.Image,
+    adjustment: dict[str, Any] | None = None,
+) -> Image.Image:
+    """Keep the uploaded tag image intact unless the designer explicitly crops it."""
+    canvas = Image.new("RGB", (750, 750), "white")
+    normalized_source = ImageOps.exif_transpose(source).convert("RGB")
+    layer = _crop_source(normalized_source, adjustment)
+    _paste_layer(
+        canvas,
+        layer,
+        (0, 0, 750, 750),
+        adjustment,
+        mode="contain",
+        clip_box=(0, 0, 750, 750),
     )
     return canvas
 
@@ -3146,10 +3218,15 @@ def _info_page(
             base_body = body
     ruler_body = _stored_product_ruler_base(normalized) or body
     ruler = _info_ruler_geometry(ruler_body)
-    width_ruler = _info_width_ruler_geometry(ruler_body, adjustment)
     product_ruler_center = (
         (INFO_PRODUCT_BOX[0] + INFO_PRODUCT_BOX[2]) / 2,
         (INFO_PRODUCT_BOX[1] + INFO_PRODUCT_BOX[3]) / 2,
+    )
+    width_ruler = _info_width_ruler_geometry(
+        ruler_body,
+        adjustment,
+        product_center=product_ruler_center,
+        canvas_size=image.size,
     )
 
     line_color = "#8a8a8a"
@@ -4038,6 +4115,18 @@ def _slot_map(slots: list[dict[str, Any]], platform: str = "vip") -> dict[str, d
                 _normalize_adjustment(value if isinstance(value, dict) else None)
                 for value in item.get("adjustments", [])
             ],
+            "folder_adjustments": {
+                str(folder): [
+                    _normalize_adjustment(value if isinstance(value, dict) else None)
+                    for value in values
+                ]
+                for folder, values in (
+                    item.get("folder_adjustments", {}).items()
+                    if isinstance(item.get("folder_adjustments"), dict)
+                    else []
+                )
+                if folder in {"800", "750"} and isinstance(values, list)
+            },
             "logo_color": "white" if item.get("logo_color") == "white" else "black",
         }
         for item in slots
@@ -4050,6 +4139,13 @@ def _slot_map(slots: list[dict[str, Any]], platform: str = "vip") -> dict[str, d
         slot_map.setdefault("50.jpg", {"image_ids": [], "adjustments": [], "logo_color": "black"})
         slot_map["50.jpg"]["image_ids"] = list(slot_map["1.jpg"]["image_ids"])
     return slot_map
+
+
+def _slot_adjustments_for_folder(slot: dict[str, Any], target_folder: str) -> list[dict[str, Any]]:
+    folder_adjustments = slot.get("folder_adjustments")
+    if not isinstance(folder_adjustments, dict):
+        return slot.get("adjustments", [])
+    return folder_adjustments.get(target_folder, slot.get("adjustments", []))
 
 
 def _validate_slot_map(session_id: str, slot_map: dict[str, dict[str, Any]], platform: str = "vip") -> None:
@@ -4149,7 +4245,7 @@ def _render_slot_image(
     if file_name in {"604.jpg", "605.jpg"}:
         return _detail_showcase_page(source, adjustment)
     if file_name == "801.jpg":
-        return _normalized_product_page(source, size=(750, 750), box=(90, 105, 660, 665), adjustment=adjustment)
+        return _tag_certificate_page(source, adjustment)
     return _catalog_product_page(source, adjustment)
 
 
@@ -4321,6 +4417,10 @@ def _render_slot_preview(
     slot_map = _slot_map(slots, platform)
     _validate_slot_map(session_id, slot_map, platform)
     slot = slot_map.get(file_name, {"image_ids": [], "adjustments": [], "logo_color": "black"})
+    slot = {
+        **slot,
+        "adjustments": _slot_adjustments_for_folder(slot, target_folder),
+    }
     if platform == "jd" and target_folder not in {"800", "750"}:
         raise ValueError("京东预览目录必须是 800 或 750")
     if platform == "jd" and file_name == "5.jpg" and not _jd_size_dimensions_ready(product_info):
@@ -4361,6 +4461,10 @@ def _render_previews(
 
     for file_name, _, _, _ in slot_definitions:
         slot = slot_map.get(file_name, {"image_ids": [], "adjustments": [], "logo_color": "black"})
+        slot = {
+            **slot,
+            "adjustments": _slot_adjustments_for_folder(slot, target_folder),
+        }
         preview_url = _render_cached_slot_preview(
             session_id,
             file_name,
@@ -4422,11 +4526,12 @@ def _export_package(
             targets = ["800"] if file_name in {"0-无logo.jpg", "透明.png"} else ["800", "750"]
             slot = slot_map.get(file_name, {"image_ids": [], "adjustments": [], "logo_color": "black"})
             for target in targets:
+                target_adjustments = _slot_adjustments_for_folder(slot, target)
                 image = _render_slot_image(
                     file_name,
                     slot["image_ids"],
                     product_info,
-                    slot["adjustments"],
+                    target_adjustments,
                     platform,
                     target,
                     slot["logo_color"],

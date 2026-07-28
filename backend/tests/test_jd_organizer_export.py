@@ -100,6 +100,82 @@ def test_jd_logo_color_is_stored_per_output_slot():
     assert slot_map["2.jpg"]["logo_color"] == "black"
 
 
+def test_jd_folder_adjustments_are_normalized_and_kept_separately():
+    slot_map = service._slot_map(
+        [
+            {
+                "file_name": "2.jpg",
+                "image_ids": [2],
+                "adjustments": [{"zoom": 1.0}],
+                "folder_adjustments": {
+                    "800": [{"zoom": 1.24, "offset_x": 0.12}],
+                    "750": [{"zoom": 0.91, "offset_y": -0.08}],
+                    "unknown": [{"zoom": 9}],
+                },
+            }
+        ],
+        "jd",
+    )
+
+    slot = slot_map["2.jpg"]
+    assert set(slot["folder_adjustments"]) == {"800", "750"}
+    assert service._slot_adjustments_for_folder(slot, "800")[0]["zoom"] == 1.24
+    assert service._slot_adjustments_for_folder(slot, "800")[0]["offset_x"] == 0.12
+    assert service._slot_adjustments_for_folder(slot, "750")[0]["zoom"] == 0.91
+    assert service._slot_adjustments_for_folder(slot, "750")[0]["offset_y"] == -0.08
+
+
+def test_jd_export_uses_the_adjustments_for_each_target_folder(tmp_path, monkeypatch):
+    captured: dict[str, list[dict]] = {}
+    monkeypatch.setattr(service, "_session_result_dir", lambda _session_id: tmp_path)
+    monkeypatch.setattr(service, "_validate_slot_map", lambda *_args, **_kwargs: None)
+
+    def render_slot(
+        file_name,
+        _image_ids,
+        _product_info,
+        adjustments,
+        _platform,
+        target_folder,
+        _logo_color,
+    ):
+        if file_name == "2.jpg":
+            captured[target_folder] = adjustments
+        return Image.new("RGB", (32, 32), "white")
+
+    monkeypatch.setattr(service, "_render_slot_image", render_slot)
+    slots = [
+        {
+            "file_name": file_name,
+            "image_ids": [1],
+            "adjustments": [{"zoom": 1.0}],
+            **(
+                {
+                    "folder_adjustments": {
+                        "800": [{"zoom": 1.28, "offset_x": 0.11}],
+                        "750": [{"zoom": 0.94, "offset_x": -0.07}],
+                    }
+                }
+                if file_name == "2.jpg"
+                else {}
+            ),
+        }
+        for file_name, *_ in service.JD_SLOT_DEFINITIONS
+    ]
+
+    service._export_package(
+        "a" * 32,
+        slots,
+        {"product_length": "200", "product_height": "140"},
+        "jd",
+    )
+
+    assert captured["800"][0]["zoom"] == 1.28
+    assert captured["800"][0]["offset_x"] == 0.11
+    assert captured["750"][0]["zoom"] == 0.94
+    assert captured["750"][0]["offset_x"] == -0.07
+
+
 def test_jd_logo_detail_fills_the_canvas_without_white_border():
     source = Image.new("RGB", (800, 800), (181, 34, 38))
     with patch.object(service, "_load_image", return_value=source):
@@ -341,6 +417,21 @@ def test_vip_info_product_and_rulers_share_zoom_and_movement():
     assert adjusted_width["text"] != base_width["text"]
 
 
+def test_vip_info_rulers_start_with_one_shared_gap():
+    body = (360.0, 280.0, 560.0, 470.0)
+    ruler = service._info_ruler_geometry(body)
+    width_ruler = service._info_width_ruler_geometry(body)
+    width_start = width_ruler["segments"][0][0]
+
+    height_gap = ruler["left"] - ruler["vertical_x"]
+    length_gap = ruler["horizontal_y"] - ruler["bottom"]
+    width_gap = round(((width_start[0] - body[2]) ** 2 + (width_start[1] - body[3]) ** 2) ** 0.5)
+
+    assert height_gap == 34
+    assert length_gap == 34
+    assert width_gap == 34
+
+
 def test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product():
     source = _vip_info_test_source()
     base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
@@ -403,6 +494,22 @@ def test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product():
     assert abs(vertical_start[0] - expected_vertical_x) <= 2
     assert abs(vertical_start[1] - expected_top) <= 2
     assert abs(vertical_end[1] - expected_bottom) <= 2
+
+    base_width = service._info_width_ruler_geometry(base_body)
+    grouped_width = service._info_width_ruler_geometry(
+        base_body,
+        {
+            "product_ruler_group_scale": 1.1,
+            "product_ruler_group_offset_x": product_dx / (750 * 0.18),
+            "product_ruler_group_offset_y": product_dy / (665 * 0.18),
+        },
+        product_center=(origin_x, origin_y),
+    )
+    for base_point, grouped_point in zip(base_width["segments"][0], grouped_width["segments"][0]):
+        expected_x = origin_x + (base_point[0] - origin_x) * 1.1 + product_dx
+        expected_y = origin_y + (base_point[1] - origin_y) * 1.1 + product_dy
+        assert abs(grouped_point[0] - expected_x) <= 2
+        assert abs(grouped_point[1] - expected_y) <= 2
 
 
 def test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size():

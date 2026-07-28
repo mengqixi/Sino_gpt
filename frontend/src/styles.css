@@ -78,6 +78,8 @@
 .organizer-preparation-panel h2, .organizer-source-panel h2, .organizer-analysis-panel h2, .organizer-info-panel h2, .organizer-slots-panel h2 { margin: 0 0 10px; font-size: 20px; }
 .organizer-prepare-upload { display: inline-flex; min-height: 42px; align-items: center; gap: 7px; padding: 9px 13px; border: 1px solid #b7cbc3; border-radius: 5px; color: #1f5a4b; background: #fff; cursor: pointer; white-space: nowrap; }
 .organizer-prepare-upload input { display: none; }
+.organizer-cutout-upload-actions { align-items: center; justify-content: flex-end; }
+.organizer-cutout-upload-actions > button, .organizer-cutout-upload-actions > .organizer-prepare-upload { min-height: 42px; }
 .organizer-cutout-results { display: grid; grid-template-columns: minmax(180px, 270px) minmax(180px, 270px) minmax(220px, 1fr); gap: 14px; align-items: stretch; }
 .organizer-cutout-results figure { position: relative; display: grid; grid-template-rows: minmax(0, 1fr) auto; margin: 0; overflow: hidden; border: 1px solid #d9e1dd; border-radius: 6px; background: #969895; }
 .organizer-cutout-results figure.transparent-checker { background-color: #fff; background-image: linear-gradient(45deg, #d9dddb 25%, transparent 25%), linear-gradient(-45deg, #d9dddb 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d9dddb 75%), linear-gradient(-45deg, transparent 75%, #d9dddb 75%); background-position: 0 0, 0 12px, 12px -12px, -12px 0; background-size: 24px 24px; }
@@ -97,6 +99,11 @@
 .organizer-analysis-header p { max-width: 760px; margin: 0; color: #657169; line-height: 1.55; }
 .organizer-analysis-toolbar { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto; align-items: end; gap: 9px; }
 .organizer-analysis-toolbar > button { height: 42px; white-space: nowrap; }
+.organizer-paste-control { display: flex; min-height: 42px; align-items: center; justify-content: flex-end; gap: 8px; margin: -4px 0 14px; padding: 8px 10px; border: 1px solid #dfe5e2; border-radius: 6px; background: #f7f9f8; }
+.organizer-paste-control label { display: inline-flex; align-items: center; gap: 7px; color: #68736d; font-size: 13px; }
+.organizer-paste-control select { min-width: 118px; padding: 7px 30px 7px 9px; background-color: #fff; }
+.organizer-paste-control button { display: inline-flex; min-height: 34px; align-items: center; gap: 6px; padding: 6px 12px; border-color: #9eb8ad; color: #215446; background: #fff; white-space: nowrap; }
+.organizer-paste-control small { color: #856100; font-size: 12px; white-space: nowrap; }
 .organizer-upload-columns { display: grid; grid-template-columns: 1.2fr 1.2fr .8fr; gap: 12px; }
 .organizer-upload-block { min-width: 0; padding: 14px; border: 1px solid #dfe4e1; border-radius: 6px; background: #fafbfa; transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease; }
 .organizer-upload-block.is-dragging { background: #edf5ef; border-color: #1f5b4c; box-shadow: inset 0 0 0 2px rgba(31, 91, 76, .12); }
@@ -109,8 +116,10 @@
 .organizer-upload-block.is-dragging .organizer-upload-button { border-color: #1f5b4c; color: #17473a; }
 .organizer-upload-button input { display: none; }
 .organizer-thumb-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; margin-top: 12px; }
-.organizer-thumb-row div { min-width: 0; }
-.organizer-thumb-row button { display: block; width: 100%; padding: 0; overflow: hidden; border: 0; background: transparent; cursor: pointer; }
+.organizer-thumb-item { position: relative; min-width: 0; }
+.organizer-thumb-row .organizer-thumb-preview { display: block; width: 100%; padding: 0; overflow: hidden; border: 0; background: transparent; cursor: pointer; }
+.organizer-thumb-row .organizer-thumb-delete { position: absolute; z-index: 2; top: -5px; right: -5px; display: grid; width: 22px; height: 22px; place-items: center; padding: 0; border: 1px solid #d9dedb; border-radius: 50%; background: rgba(255, 255, 255, .96); color: #71352f; box-shadow: 0 2px 6px rgba(35, 52, 45, .16); cursor: pointer; }
+.organizer-thumb-row .organizer-thumb-delete:hover { border-color: #bf6e64; background: #fff5f3; color: #8a2e23; }
 .organizer-thumb-row img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; background: #eef1ef; border-radius: 4px; }
 .organizer-thumb-row small { display: -webkit-box; min-height: 32px; overflow: hidden; margin-top: 5px; color: #68736d; font-size: 11px; line-height: 1.4; text-align: center; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .organizer-analysis-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }

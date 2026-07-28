@@ -25,6 +25,7 @@ from backend.services.vip_organizer_service import (
     _refine_product_classifications,
     _render_slot_image,
     _slot_map,
+    _tag_certificate_page,
     analyze_assets,
 )
 
@@ -811,6 +812,63 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertGreater(adjusted_bbox[2] - adjusted_bbox[0], automatic_bbox[2] - automatic_bbox[0])
         self.assertGreater((adjusted_bbox[0] + adjusted_bbox[2]) / 2, (automatic_bbox[0] + automatic_bbox[2]) / 2)
         self.assertEqual(adjusted.getpixel((400, 400)), (181, 34, 38))
+
+    def test_tag_certificate_keeps_the_complete_original_layout(self):
+        source = Image.new("RGB", (400, 600), "white")
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((150, 30, 250, 65), fill=(180, 20, 30))
+        draw.rectangle((35, 145, 365, 330), fill=(20, 80, 160))
+        draw.rectangle((55, 430, 345, 500), fill=(20, 150, 70))
+        draw.rectangle((130, 545, 270, 575), fill=(180, 20, 170))
+
+        rendered = _tag_certificate_page(source)
+
+        self.assertEqual(rendered.size, (750, 750))
+        # The complete portrait image is scaled as one layer. Its internal
+        # whitespace and every section, including the price, remain intact.
+        pixels = np.asarray(rendered)
+        self.assertGreater(np.count_nonzero((pixels[:, :, 0] > 140) & (pixels[:, :, 1] < 70)), 100)
+        self.assertGreater(np.count_nonzero((pixels[:, :, 2] > 130) & (pixels[:, :, 0] < 80)), 100)
+        non_white = ImageChops.difference(rendered, Image.new("RGB", rendered.size, "white")).getbbox()
+        self.assertIsNotNone(non_white)
+        assert non_white is not None
+        self.assertAlmostEqual(non_white[0], 166, delta=3)
+        self.assertAlmostEqual(non_white[2], 585, delta=3)
+        self.assertLess(non_white[1], 45)
+        self.assertGreater(non_white[3], 715)
+
+    def test_tag_certificate_manual_crop_removes_only_the_selected_price_area(self):
+        source = Image.new("RGB", (400, 600), "white")
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((150, 30, 250, 65), fill=(180, 20, 30))
+        draw.rectangle((35, 145, 365, 330), fill=(20, 80, 160))
+        draw.rectangle((55, 430, 345, 500), fill=(20, 150, 70))
+        draw.rectangle((130, 545, 270, 575), fill=(180, 20, 170))
+        adjustment = {
+            "crop_x": 0,
+            "crop_y": 0,
+            "crop_width": 1,
+            "crop_height": 0.86,
+            "zoom": 1,
+            "offset_x": 0,
+            "offset_y": 0,
+        }
+
+        rendered = _tag_certificate_page(source, adjustment)
+        pixels = np.asarray(rendered)
+
+        title_pixels = (
+            (pixels[:, :, 0] > 140)
+            & (pixels[:, :, 1] < 70)
+            & (pixels[:, :, 2] < 90)
+        )
+        price_pixels = (
+            (pixels[:, :, 0] > 140)
+            & (pixels[:, :, 1] < 80)
+            & (pixels[:, :, 2] > 120)
+        )
+        self.assertGreater(np.count_nonzero(title_pixels), 100)
+        self.assertEqual(np.count_nonzero(price_pixels), 0)
 
     def test_slot_selection_keeps_semi_side_separate_from_front(self):
         samples = [

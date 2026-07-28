@@ -1,5 +1,5 @@
-import { Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { DragEvent } from "react";
+import { ClipboardPaste, Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
+import type { ClipboardEvent, DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -23,6 +23,7 @@ type Slot = {
   confidence: number;
   reason: string;
   adjustments?: ImageAdjustment[];
+  folder_adjustments?: Partial<Record<PreviewFolder, ImageAdjustment[]>>;
   logo_color?: LogoColor;
 };
 
@@ -255,6 +256,7 @@ function mergeAnalyzedSlots(current: Slot[], incoming: Slot[]) {
       ...nextSlot,
       image_ids: imageIds,
       adjustments,
+      folder_adjustments: previous.folder_adjustments,
       logo_color: previous.logo_color || nextSlot.logo_color,
       confidence: preserveManualSources ? previous.confidence : nextSlot.confidence,
       reason: preserveManualSources ? previous.reason : nextSlot.reason
@@ -265,6 +267,27 @@ function mergeAnalyzedSlots(current: Slot[], incoming: Slot[]) {
 function previewFoldersForSlot(slot: Slot, platform: OrganizerPlatform): PreviewFolder[] {
   if (platform !== "jd" || JD_SINGLE_FOLDER_FILES.has(slot.file_name)) return ["800"];
   return ["800", "750"];
+}
+
+function slotForPreviewFolder(
+  slot: Slot,
+  platform: OrganizerPlatform,
+  targetFolder: PreviewFolder
+): Slot {
+  if (platform !== "jd") return slot;
+  const { folder_adjustments: folderAdjustments, ...baseSlot } = slot;
+  return {
+    ...baseSlot,
+    adjustments: folderAdjustments?.[targetFolder] || slot.adjustments
+  };
+}
+
+function slotsForPreviewFolder(
+  slots: Slot[],
+  platform: OrganizerPlatform,
+  targetFolder: PreviewFolder
+) {
+  return slots.map((slot) => slotForPreviewFolder(slot, platform, targetFolder));
 }
 
 function slotPreviewKey(platform: OrganizerPlatform, fileName: string, targetFolder: PreviewFolder = "800") {
@@ -336,7 +359,7 @@ function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex:
     return { x: 52 / 750, y: 181 / 750, width: 643 / 750, height: 523 / 750, mode: "cover" as const };
   }
   if (slot.file_name === "801.jpg") {
-    return { x: 90 / 750, y: 105 / 750, width: 570 / 750, height: 560 / 750, mode: "contain" as const };
+    return { x: 0, y: 0, width: 1, height: 1, mode: "contain" as const };
   }
   return { x: 0.15, y: 0.2125, width: 0.7, height: 0.675, mode: "contain" as const };
 }
@@ -838,19 +861,18 @@ function liveHandleVisualLift(canvas: HTMLCanvasElement) {
 }
 
 function infoRulerGeometry(body: PixelBounds) {
+  const rulerGap = 34;
   const left = Math.round(body.left + 4);
   const right = Math.round(body.right - 4);
-  const width = Math.max(48, right - left);
   const bottom = Math.round(body.bottom - 9);
   const top = Math.round(body.top - 5);
-  const lineHeight = Math.max(1, bottom - top);
   return {
     left,
     right,
     top,
     bottom,
-    verticalX: left - Math.max(34, Math.round(width * 0.205)),
-    horizontalY: bottom + Math.max(34, Math.round(lineHeight * 0.19))
+    verticalX: Math.max(285, left - rulerGap),
+    horizontalY: Math.min(535, bottom + rulerGap)
   };
 }
 
@@ -901,19 +923,32 @@ function transformProductRulerSegment(
   );
 }
 
-function infoWidthRulerGeometry(baseBody: PixelBounds, draft: ImageAdjustment) {
-  const start = { x: baseBody.right + 22, y: baseBody.bottom + 18 };
-  const end = { x: start.x + 51, y: start.y - 27 };
-  const center = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
-  const scale = draft.width_ruler_scale || 1;
-  const offset = {
-    x: (draft.width_ruler_offset_x || 0) * 750 * 0.18,
-    y: (draft.width_ruler_offset_y || 0) * 665 * 0.18
+function infoWidthRulerGeometry(
+  baseBody: PixelBounds,
+  productCenter: { x: number; y: number },
+  draft: ImageAdjustment,
+  output: { width: number; height: number }
+) {
+  const rulerGap = 34;
+  const anchorDirection = Math.hypot(22, 18);
+  const start = {
+    x: baseBody.right + 22 / anchorDirection * rulerGap,
+    y: baseBody.bottom + 18 / anchorDirection * rulerGap
   };
-  const transform = (point: { x: number; y: number }) => ({
-    x: center.x + (point.x - center.x) * scale + offset.x,
-    y: center.y + (point.y - center.y) * scale + offset.y
-  });
+  const end = { x: start.x + 51, y: start.y - 27 };
+  const transform = (
+    segmentStart: { x: number; y: number },
+    segmentEnd: { x: number; y: number }
+  ) => transformProductRulerSegment(
+    segmentStart,
+    segmentEnd,
+    productCenter,
+    draft,
+    draft.width_ruler_scale || 1,
+    draft.width_ruler_offset_x || 0,
+    draft.width_ruler_offset_y || 0,
+    output
+  );
   const deltaX = end.x - start.x;
   const deltaY = end.y - start.y;
   const length = Math.max(1, Math.hypot(deltaX, deltaY));
@@ -929,9 +964,16 @@ function infoWidthRulerGeometry(baseBody: PixelBounds, draft: ImageAdjustment) {
       { x: end.x + perpendicular.x, y: end.y + perpendicular.y }
     ]
   ];
+  const transformedText = transform(
+    { x: start.x + 8, y: start.y + 8 },
+    { x: start.x + 8, y: start.y + 8 }
+  ).start;
   return {
-    segments: segments.map(([start, end]) => [transform(start), transform(end)]),
-    text: transform({ x: start.x + 8, y: start.y + 8 })
+    segments: segments.map(([segmentStart, segmentEnd]) => {
+      const transformed = transform(segmentStart, segmentEnd);
+      return [transformed.start, transformed.end];
+    }),
+    text: transformedText
   };
 }
 
@@ -1357,8 +1399,8 @@ function drawJdComparisonPreview(
   const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue)}mm` : "200mm";
   const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue)}mm` : `${Math.round(geometry.heightMm)}mm`;
   const productRulerBody = storedProductRulerBase(draft) || geometry.body;
-  const horizontalY = Math.min(output.height - 58, productRulerBody.bottom + rulerGap);
-  const verticalX = Math.max(output.width * 0.04, productRulerBody.left - rulerGap);
+  const horizontalY = Math.min(output.height - 70, productRulerBody.bottom + rulerGap);
+  const verticalX = Math.max(30, productRulerBody.left - rulerGap);
   const productRulerCenter = {
     x: (productRulerBody.left + productRulerBody.right) / 2,
     // JD5 keeps the bag body bottom fixed while the product is scaled.
@@ -1502,7 +1544,7 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         && livePreviewHasLightStudioBorder(sourceUrl, image);
       const usesProductCutout = (platform === "jd"
         ? ["2.jpg", "透明.png"].includes(slot.file_name)
-        : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg", "801.jpg"].includes(slot.file_name))
+        : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg"].includes(slot.file_name))
         || usesAutomaticDetailCutout;
       const automaticBounds = usesProductCutout ? livePreviewContentBounds(sourceUrl, image) : {
         left: 0,
@@ -1638,11 +1680,11 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         const storedBaseBody = storedProductRulerBase(draft);
         const baseBody = storedBaseBody || liveInfoProductBody(sourceUrl, image, draft);
         const ruler = infoRulerGeometry(baseBody);
-        const widthRuler = infoWidthRulerGeometry(baseBody, draft);
         const productRulerCenter = {
           x: areaX + areaWidth / 2,
           y: areaY + areaHeight / 2
         };
+        const widthRuler = infoWidthRulerGeometry(baseBody, productRulerCenter, draft, output);
         const lengthRuler = transformProductRulerSegment(
           { x: ruler.left, y: ruler.horizontalY },
           { x: ruler.right, y: ruler.horizontalY },
@@ -1770,13 +1812,109 @@ function jdComparisonDimensionsReady(productInfo: Record<string, string>) {
   return Number.isFinite(length) && length > 0 && Number.isFinite(height) && height > 0;
 }
 
-function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onPreview }: {
+function UploadPasteControl({ disabled = false, onUpload }: {
+  disabled?: boolean;
+  onUpload: (kind: "product" | "model" | "tag", files: File[], skipped?: number) => void;
+}) {
+  const [target, setTarget] = useState<"product" | "model" | "tag">("product");
+  const [pasteHint, setPasteHint] = useState("");
+  const pasteButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  function namedClipboardFile(blob: Blob, index: number) {
+    const extension = blob.type === "image/jpeg"
+      ? "jpg"
+      : blob.type === "image/webp"
+        ? "webp"
+        : "png";
+    return new File([blob], `粘贴图片-${Date.now()}-${index + 1}.${extension}`, { type: blob.type });
+  }
+
+  function acceptFiles(files: File[]) {
+    const supported = files.filter((file) => SUPPORTED_IMAGE_NAME.test(file.name));
+    const selected = target === "tag" ? supported.slice(0, 1) : supported;
+    if (!selected.length) {
+      setPasteHint("剪贴板中没有图片");
+      return;
+    }
+    setPasteHint("");
+    onUpload(target, selected, files.length - selected.length);
+  }
+
+  function handlePaste(event: ClipboardEvent<HTMLElement>) {
+    if (disabled) return;
+    const files = Array.from(event.clipboardData.items).flatMap((item) => {
+      if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
+      const file = item.getAsFile();
+      return file ? [file] : [];
+    });
+    if (!files.length) {
+      setPasteHint("剪贴板中没有图片");
+      return;
+    }
+    event.preventDefault();
+    acceptFiles(files.map((file, index) => (
+      SUPPORTED_IMAGE_NAME.test(file.name) ? file : namedClipboardFile(file, index)
+    )));
+  }
+
+  async function pasteFromClipboard() {
+    if (disabled) return;
+    pasteButtonRef.current?.focus();
+    if (!navigator.clipboard?.read) {
+      setPasteHint("请按 Ctrl+V");
+      return;
+    }
+    try {
+      const items = await navigator.clipboard.read();
+      const blobs = await Promise.all(items.flatMap((item) => {
+        const imageType = item.types.find((type) => type.startsWith("image/"));
+        return imageType ? [item.getType(imageType)] : [];
+      }));
+      acceptFiles(blobs.map(namedClipboardFile));
+    } catch {
+      setPasteHint("请按 Ctrl+V");
+      pasteButtonRef.current?.focus();
+    }
+  }
+
+  return (
+    <div className="organizer-paste-control" onPaste={handlePaste}>
+      <label>
+        <span>粘贴到</span>
+        <select
+          value={target}
+          disabled={disabled}
+          onChange={(event) => {
+            setTarget(event.target.value as "product" | "model" | "tag");
+            setPasteHint("");
+          }}
+        >
+          <option value="product">商品原图</option>
+          <option value="model">模特图</option>
+          <option value="tag">吊牌图</option>
+        </select>
+      </label>
+      <button
+        ref={pasteButtonRef}
+        type="button"
+        disabled={disabled}
+        onClick={() => void pasteFromClipboard()}
+      >
+        <ClipboardPaste size={17} />{pasteHint || "粘贴图片"}
+      </button>
+      {pasteHint === "请按 Ctrl+V" && <small>目标：{target === "product" ? "商品原图" : target === "model" ? "模特图" : "吊牌图"}</small>}
+    </div>
+  );
+}
+
+function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onDelete, onPreview }: {
   title: string;
   hint: string;
   items: UploadItem[];
   multiple?: boolean;
   disabled?: boolean;
   onUpload: (files: FileList | File[] | null, skipped?: number) => void;
+  onDelete: (item: UploadItem) => void;
   onPreview: (url: string) => void;
 }) {
   const [dragging, setDragging] = useState(false);
@@ -1824,9 +1962,19 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
         />
       </label>
       {items.length > 0 && <div className="organizer-thumb-row">{items.map((item) => (
-        <div key={item.image_id} title={item.file_name}>
-          <button type="button" onClick={() => onPreview(item.original_url || item.preview_url)} aria-label={`预览 ${item.file_name}`}>
+        <div className="organizer-thumb-item" key={item.image_id} title={item.file_name}>
+          <button className="organizer-thumb-preview" type="button" onClick={() => onPreview(item.original_url || item.preview_url)} aria-label={`预览 ${item.file_name}`}>
             <img src={item.preview_url} alt={item.file_name} />
+          </button>
+          <button
+            className="organizer-thumb-delete"
+            type="button"
+            disabled={disabled}
+            onClick={() => onDelete(item)}
+            aria-label={`删除 ${item.file_name}`}
+            title={`删除 ${item.file_name}`}
+          >
+            <X size={13} />
           </button>
           <small>{item.file_name}</small>
         </div>
@@ -1862,7 +2010,12 @@ function SlotAdjustmentEditor({
   targetFolder: PreviewFolder;
   initialMoveTarget?: "product" | "phone";
   onClose: () => void;
-  onSave: (adjustment: ImageAdjustment, logoColor: LogoColor, previewUrl?: string) => void;
+  onSave: (
+    adjustment: ImageAdjustment,
+    logoColor: LogoColor,
+    previewUrl?: string,
+    syncJdFolders?: boolean
+  ) => void;
 }) {
   const initial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
   const supportsLogoColor = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name);
@@ -1876,6 +2029,10 @@ function SlotAdjustmentEditor({
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [cropMode, setCropMode] = useState(false);
   const isPhoneComparison = platform === "jd" && slot.file_name === "5.jpg";
+  const supportsJdFolderSync = platform === "jd" && previewFoldersForSlot(slot, platform).length > 1;
+  const [syncJdFolders, setSyncJdFolders] = useState(
+    supportsJdFolderSync && !isPhoneComparison
+  );
   const isPhoneObjectEditor = isPhoneComparison && initialMoveTarget === "phone";
   const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
   const [moveTarget, setMoveTarget] = useState<AdjustmentTarget>(initialMoveTarget);
@@ -2019,35 +2176,29 @@ function SlotAdjustmentEditor({
       || Math.abs(current.product_ruler_group_offset_x || 0) > 0.0001
       || Math.abs(current.product_ruler_group_offset_y || 0) > 0.0001;
     if (currentBody && cropUnchanged && !hasLegacyGroupTransform) {
-      const output = slotCanvasSize(slot.size, platform, targetFolder);
-      const ratio = nextDraft.zoom / Math.max(0.01, current.zoom);
-      const currentAnchor = isPhoneComparison ? {
-        x: output.width * 0.34 + current.offset_x * output.width * 0.18,
-        y: output.height * (output.height > output.width ? 0.70 : 0.73) + current.offset_y * output.height * 0.18
-      } : {
-        x: (VIP_INFO_PRODUCT_BOX.left + VIP_INFO_PRODUCT_BOX.right) / 2
-          + current.offset_x * (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left),
-        y: (VIP_INFO_PRODUCT_BOX.top + VIP_INFO_PRODUCT_BOX.bottom) / 2
-          + current.offset_y * (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top)
-      };
-      const moveX = isPhoneComparison
-        ? (nextDraft.offset_x - current.offset_x) * output.width * 0.18
-        : (nextDraft.offset_x - current.offset_x) * (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left);
-      const moveY = isPhoneComparison
-        ? (nextDraft.offset_y - current.offset_y) * output.height * 0.18
-        : (nextDraft.offset_y - current.offset_y) * (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top);
-      const transformX = (value: number) => currentAnchor.x + (value - currentAnchor.x) * ratio + moveX;
-      const transformY = (value: number) => currentAnchor.y + (value - currentAnchor.y) * ratio + moveY;
-      return {
-        ...nextDraft,
-        product_ruler_base_left: transformX(currentBody.left),
-        product_ruler_base_top: transformY(currentBody.top),
-        product_ruler_base_right: transformX(currentBody.right),
-        product_ruler_base_bottom: transformY(currentBody.bottom),
-        product_ruler_group_scale: 1,
-        product_ruler_group_offset_x: 0,
-        product_ruler_group_offset_y: 0
-      };
+      const currentProductBody = productRulerBodyForDraft(current);
+      const nextProductBody = productRulerBodyForDraft(nextDraft);
+      if (currentProductBody && nextProductBody) {
+        const currentWidth = Math.max(1, currentProductBody.right - currentProductBody.left);
+        const currentHeight = Math.max(1, currentProductBody.bottom - currentProductBody.top);
+        const scaleX = (nextProductBody.right - nextProductBody.left) / currentWidth;
+        const scaleY = (nextProductBody.bottom - nextProductBody.top) / currentHeight;
+        const currentCenterX = (currentProductBody.left + currentProductBody.right) / 2;
+        const nextCenterX = (nextProductBody.left + nextProductBody.right) / 2;
+        const transformX = (value: number) => nextCenterX + (value - currentCenterX) * scaleX;
+        const transformY = (value: number) => nextProductBody.bottom
+          + (value - currentProductBody.bottom) * scaleY;
+        return {
+          ...nextDraft,
+          product_ruler_base_left: transformX(currentBody.left),
+          product_ruler_base_top: transformY(currentBody.top),
+          product_ruler_base_right: transformX(currentBody.right),
+          product_ruler_base_bottom: transformY(currentBody.bottom),
+          product_ruler_group_scale: 1,
+          product_ruler_group_offset_x: 0,
+          product_ruler_group_offset_y: 0
+        };
+      }
     }
     const body = productRulerBodyForDraft(nextDraft);
     return body ? {
@@ -2411,7 +2562,7 @@ function SlotAdjustmentEditor({
     if (syncedVersionRef.current !== draftVersionRef.current) {
       previewUrl = await refreshPreview(currentDraft, draftVersionRef.current) || "";
     }
-    if (previewUrl) onSave(currentDraft, logoColorRef.current, previewUrl);
+    if (previewUrl) onSave(currentDraft, logoColorRef.current, previewUrl, syncJdFolders);
   }
 
   function requestClose() {
@@ -2440,6 +2591,12 @@ function SlotAdjustmentEditor({
 
         {showCloseConfirm && <div className="slot-close-confirm" role="alertdialog" aria-label="未保存调整提示">
           <div><strong>调整尚未保存</strong><span>保存会生成最终预览并退出；右上角 × 会放弃本次调整。</span></div>
+          {supportsJdFolderSync && <button
+            type="button"
+            className={syncJdFolders ? "active-tool" : ""}
+            aria-pressed={syncJdFolders}
+            onClick={() => setSyncJdFolders((current) => !current)}
+          >同步 800/750</button>}
           <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
           <button type="button" className="icon-button" onClick={onClose} aria-label="不保存并退出" title="不保存并退出"><X size={20} /></button>
         </div>}
@@ -2660,6 +2817,13 @@ function SlotAdjustmentEditor({
             Math.round(targetOffset(draft, activeMoveTarget).y * 100)
           }</span>
           {!previewSynced && <span className="slot-preview-pending">保存时会自动生成精确预览</span>}
+          {supportsJdFolderSync && <button
+            type="button"
+            className={syncJdFolders ? "active-tool" : ""}
+            aria-pressed={syncJdFolders}
+            title={syncJdFolders ? "本次调整会同时保存到 800 和 750" : `本次调整只保存到 ${targetFolder}`}
+            onClick={() => setSyncJdFolders((current) => !current)}
+          >同步 800/750</button>}
           <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : "保存并退出"}</button>
         </div>
         {error && <div className="alert warning">{error}</div>}
@@ -2787,7 +2951,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     });
     const signatures = Object.fromEntries(previewTargets.map((target) => [
       target.key,
-      slotPreviewSignature(target.slot, productInfo, platform, target.targetFolder)
+      slotPreviewSignature(
+        slotForPreviewFolder(target.slot, platform, target.targetFolder),
+        productInfo,
+        platform,
+        target.targetFolder
+      )
     ]));
     const changedTargets = previewTargets.filter((target) =>
       !slotPreviews[target.key]
@@ -2809,7 +2978,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           const groupedResults = await Promise.allSettled(folders.map(async (targetFolder) => {
             const result = await api.previewVipOrganizer({
               session_id: sessionId,
-              slots,
+              slots: slotsForPreviewFolder(slots, platform, targetFolder),
               product_info: productInfo,
               platform,
               target_folder: targetFolder
@@ -2854,7 +3023,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           const results = await Promise.allSettled(changedTargets.map(async (target) => {
             const result = await api.previewVipOrganizerSlot({
               session_id: sessionId,
-              slots: [target.slot],
+              slots: [slotForPreviewFolder(target.slot, platform, target.targetFolder)],
               product_info: productInfo,
               file_name: target.slot.file_name,
               platform,
@@ -2955,7 +3124,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         const signatures = Object.fromEntries(backgroundSlots.flatMap((slot: Slot) =>
           previewFoldersForSlot(slot, "jd").map((targetFolder) => [
             slotPreviewKey("jd", slot.file_name, targetFolder),
-            slotPreviewSignature(slot, productInfo, "jd", targetFolder)
+            slotPreviewSignature(
+              slotForPreviewFolder(slot, "jd", targetFolder),
+              productInfo,
+              "jd",
+              targetFolder
+            )
           ])
         ));
         platformWorkspaceRef.current.jd = {
@@ -3129,6 +3303,110 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     } finally {
       pendingUploadsRef.current -= 1;
       if (pendingUploadsRef.current === 0) setBusy(false);
+    }
+  }
+
+  async function deleteUploadedAsset(kind: "product" | "model" | "tag", item: UploadItem) {
+    const currentSession = sessionIdRef.current || sessionId;
+    if (!currentSession) return;
+    setBusy(true);
+    setMessage(`正在删除 ${item.file_name} 并刷新后续成品……`);
+    try {
+      await api.deleteVipOrganizerAsset(currentSession, item.image_id);
+
+      const nextProducts = kind === "product"
+        ? productsRef.current.filter((entry) => entry.image_id !== item.image_id)
+        : productsRef.current;
+      const nextModels = kind === "model"
+        ? modelsRef.current.filter((entry) => entry.image_id !== item.image_id)
+        : modelsRef.current;
+      const nextTags = kind === "tag"
+        ? tagsRef.current.filter((entry) => entry.image_id !== item.image_id)
+        : tagsRef.current;
+      productsRef.current = nextProducts;
+      modelsRef.current = nextModels;
+      tagsRef.current = nextTags;
+      setProducts(nextProducts);
+      setModels(nextModels);
+      setTags(nextTags);
+
+      const nextRoles = { ...assetRolesRef.current };
+      const nextAssetTags = { ...assetTagsRef.current };
+      delete nextRoles[item.image_id];
+      delete nextAssetTags[item.image_id];
+      assetRolesRef.current = nextRoles;
+      assetTagsRef.current = nextAssetTags;
+      setAssetRoles(nextRoles);
+      setAssetTags(nextAssetTags);
+      setManualAssetIds((current) => {
+        const next = new Set(current);
+        next.delete(item.image_id);
+        return next;
+      });
+      setApiRoleNotes((current) => {
+        const next = { ...current };
+        delete next[item.image_id];
+        return next;
+      });
+      setAssets((current) => ({
+        product: (current.product || []).filter((asset: any) => (asset.id ?? asset.image_id) !== item.image_id),
+        model: (current.model || []).filter((asset: any) => (asset.id ?? asset.image_id) !== item.image_id),
+        tag: (current.tag || []).filter((asset: any) => (asset.id ?? asset.image_id) !== item.image_id)
+      }));
+
+      const previousSlots = slotsRef.current;
+      const nextSlotState = previousSlots.map((slot) => {
+        const keptIndexes = slot.image_ids
+          .map((imageId, index) => ({ imageId, index }))
+          .filter(({ imageId }) => imageId !== item.image_id);
+        if (keptIndexes.length === slot.image_ids.length) return slot;
+        return {
+          ...slot,
+          image_ids: keptIndexes.map(({ imageId }) => imageId),
+          adjustments: slot.adjustments
+            ? keptIndexes.map(({ index }) => slot.adjustments?.[index] || { ...DEFAULT_ADJUSTMENT })
+            : undefined
+        };
+      });
+      slotsRef.current = nextSlotState;
+      setSlots(nextSlotState);
+      setAdjustmentEditor((current) => {
+        if (!current) return current;
+        const editedSlot = previousSlots.find((slot) => slot.file_name === current.fileName);
+        return editedSlot?.image_ids[current.sourceIndex] === item.image_id ? null : current;
+      });
+      setPreview((current) => (
+        current === item.preview_url || current === item.original_url ? null : current
+      ));
+
+      previewAbortRef.current?.abort();
+      previewRequestRef.current += 1;
+      clearLivePreviewCaches();
+      setSlotPreviews({});
+      slotPreviewSignaturesRef.current = {};
+      platformWorkspaceRef.current = {};
+      jdBackgroundPreparedRef.current = false;
+
+      if (!nextProducts.length) {
+        slotsRef.current = [];
+        setSlots([]);
+        setAssets({ product: [], model: [], tag: [] });
+        setMessage("商品原图已删除，请重新上传后再自动整理。");
+        return;
+      }
+      await analyze(
+        nextRoles,
+        platform,
+        nextAssetTags,
+        { products: nextProducts, models: nextModels, tags: nextTags },
+        undefined,
+        false,
+        true
+      );
+    } catch (error: any) {
+      setMessage(error.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -3374,6 +3652,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           ...slot,
           image_ids: next.filter(Boolean),
           adjustments,
+          folder_adjustments: undefined,
           confidence: 100,
           reason: linkedModelSlot ? `${linkedNames.join("与")}已同步使用同一张模特图` : "已由设计师人工确认",
         };
@@ -3403,14 +3682,31 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     targetFolder: PreviewFolder,
     adjustment: ImageAdjustment,
     logoColor: LogoColor,
-    previewUrl?: string
+    previewUrl?: string,
+    syncJdFolders = false
   ) {
-    const currentSlot = slots.find((slot) => slot.file_name === fileName);
+    const currentSlot = slotsRef.current.find((slot) => slot.file_name === fileName);
     if (!currentSlot) return;
-    const adjustments = [...(currentSlot.adjustments || [])];
+    const currentFolderSlot = slotForPreviewFolder(currentSlot, platform, targetFolder);
+    const adjustments = [...(currentFolderSlot.adjustments || [])];
     while (adjustments.length <= sourceIndex) adjustments.push({ ...DEFAULT_ADJUSTMENT });
     adjustments[sourceIndex] = normalizeAdjustment(adjustment);
-    const updatedSlot = { ...currentSlot, adjustments, logo_color: logoColor };
+    const normalizedAdjustments = adjustments.map((item) => normalizeAdjustment(item));
+    const foldersToUpdate = platform === "jd" && syncJdFolders
+      ? previewFoldersForSlot(currentSlot, platform)
+      : [targetFolder];
+    const folderAdjustments = { ...(currentSlot.folder_adjustments || {}) };
+    foldersToUpdate.forEach((folder) => {
+      folderAdjustments[folder] = normalizedAdjustments.map((item) => ({ ...item }));
+    });
+    const updatedSlot: Slot = {
+      ...currentSlot,
+      adjustments: targetFolder === "800" || syncJdFolders
+        ? normalizedAdjustments
+        : currentSlot.adjustments,
+      folder_adjustments: platform === "jd" ? folderAdjustments : currentSlot.folder_adjustments,
+      logo_color: logoColor
+    };
     setSlots((current) => {
       const nextSlots = current.map((slot) => slot.file_name === fileName ? updatedSlot : slot);
       slotsRef.current = nextSlots;
@@ -3419,7 +3715,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     if (previewUrl) {
       const previewKey = slotPreviewKey(platform, fileName, targetFolder);
       slotPreviewSignaturesRef.current[previewKey] = slotPreviewSignature(
-        updatedSlot,
+        slotForPreviewFolder(updatedSlot, platform, targetFolder),
         organizerProductInfo(),
         platform,
         targetFolder
@@ -3552,7 +3848,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   }
 
   const activeEditorSlot = adjustmentEditor
-    ? slots.find((slot) => slot.file_name === adjustmentEditor.fileName)
+    ? (() => {
+      const slot = slots.find((item) => item.file_name === adjustmentEditor.fileName);
+      return slot
+        ? slotForPreviewFolder(slot, platform, adjustmentEditor.targetFolder)
+        : undefined;
+    })()
     : undefined;
   const activeEditorAsset = activeEditorSlot && adjustmentEditor
     ? selectedAsset(activeEditorSlot.image_ids[adjustmentEditor.sourceIndex])
@@ -3604,10 +3905,14 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
             </button>
           </div>
         </div>
+        <UploadPasteControl
+          disabled={busy}
+          onUpload={(kind, files, skipped) => upload(kind, files, skipped)}
+        />
         <div className="organizer-upload-columns">
-          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onPreview={setPreview} />
-          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onPreview={setPreview} />
-          <UploadSection title="吊牌图" hint="可选" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onPreview={setPreview} />
+          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
+          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
+          <UploadSection title="吊牌图" hint="可选" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
         </div>
       </section>
 
@@ -3739,9 +4044,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
               <div className="organizer-slot-grid">
                 {group.slots.map((slot) => {
                   const count = slot.file_name === "606.jpg" ? 4 : 1;
-                  const isLockedJdFront = platform === "jd" && slot.file_name === "5.jpg";
                   const isLockedInfoFront = platform === "vip" && slot.file_name === "401.jpg";
-                  const editableSource = !isLockedJdFront && !isLockedInfoFront && slot.kind !== "generated";
+                  const editableSource = !isLockedInfoFront && slot.kind !== "generated";
                   const previewKey = slotPreviewKey(platform, slot.file_name, group.folder);
                   const dimensionsReady = jdComparisonDimensionsReady(organizerProductInfo());
                   const outputReady = !((platform === "jd" && slot.file_name === "5.jpg")
@@ -3800,10 +4104,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                         disabled={!slot.image_ids[0] || !outputReady}
                         onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)}
                       ><Crop size={16} />调整成品</button>}
-                      {(isLockedJdFront || isLockedInfoFront) && <label>来源图片
+                      {isLockedInfoFront && <label>来源图片
                         <span className="organizer-source-picker">
-                          <select value={slot.image_ids[0] || ""} disabled aria-label={isLockedInfoFront ? "401固定优先使用透明正面图" : "京东5固定使用正面主图"}>
-                            <option value={slot.image_ids[0] || ""}>{selectedAsset(slot.image_ids[0]) ? assetOptionLabel(selectedAsset(slot.image_ids[0]), "product") : isLockedInfoFront ? "透明正面图" : "正面主图"}</option>
+                          <select value={slot.image_ids[0] || ""} disabled aria-label="401固定优先使用透明正面图">
+                            <option value={slot.image_ids[0] || ""}>{selectedAsset(slot.image_ids[0]) ? assetOptionLabel(selectedAsset(slot.image_ids[0]), "product") : "透明正面图"}</option>
                           </select>
                         </span>
                       </label>}
@@ -3859,13 +4163,14 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         targetFolder={adjustmentEditor.targetFolder}
         initialMoveTarget={adjustmentEditor.targetObject}
         onClose={() => setAdjustmentEditor(null)}
-        onSave={(adjustment, logoColor, previewUrl) => saveSlotAdjustment(
+        onSave={(adjustment, logoColor, previewUrl, syncJdFolders) => saveSlotAdjustment(
           activeEditorSlot.file_name,
           adjustmentEditor.sourceIndex,
           adjustmentEditor.targetFolder,
           adjustment,
           logoColor,
-          previewUrl
+          previewUrl,
+          syncJdFolders
         )}
       />}
     </section>
