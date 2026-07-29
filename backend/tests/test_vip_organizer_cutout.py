@@ -82,6 +82,75 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertGreater(float(np.median(alpha[body_pixels])), 245.0)
         self.assertLess(float(np.mean(alpha[white_pixels])), 5.0)
 
+    def test_pale_narrow_details_outside_body_run_are_preserved(self):
+        source = Image.new("RGB", (560, 520), "white")
+        draw = ImageDraw.Draw(source)
+        draw.rounded_rectangle((105, 205, 455, 430), radius=38, fill="#f2efe3")
+        draw.arc((150, 35, 410, 335), 180, 360, fill="#eee9dc", width=16)
+        draw.line((95, 250, 58, 390), fill="#ece7da", width=14)
+        draw.ellipse((126, 424, 158, 452), fill="#575550")
+        draw.ellipse((402, 424, 434, 452), fill="#575550")
+
+        model_matte = np.zeros((520, 560), dtype=np.float32)
+        cv2.rectangle(model_matte, (105, 205), (455, 430), 0.995, -1)
+        cv2.ellipse(model_matte, (280, 185), (130, 150), 0, 180, 360, 0.995, 16)
+        cv2.line(model_matte, (95, 250), (58, 390), 0.995, 14)
+        cv2.ellipse(model_matte, (142, 438), (16, 14), 0, 0, 360, 0.995, -1)
+        cv2.ellipse(model_matte, (418, 438), (16, 14), 0, 0, 360, 0.995, -1)
+
+        rgba = np.asarray(service._prepared_product_cutout(source, model_matte))
+        rgb = rgba[:, :, :3]
+        alpha = rgba[:, :, 3]
+        pale_details = (
+            (rgb[:, :, 0] >= 228)
+            & (rgb[:, :, 0] <= 247)
+            & (rgb[:, :, 2] <= 235)
+        )
+        dark_details = (
+            np.max(
+                np.abs(
+                    rgb.astype(np.int16)
+                    - np.array([87, 85, 80], dtype=np.int16)
+                ),
+                axis=2,
+            )
+            <= 12
+        )
+        white_pixels = np.min(rgb, axis=2) >= 252
+
+        self.assertGreater(float(np.median(alpha[pale_details])), 245.0)
+        self.assertGreater(float(np.percentile(alpha[dark_details], 95)), 245.0)
+        self.assertGreater(int(np.count_nonzero(alpha[dark_details] > 245)), 100)
+        self.assertLess(float(np.mean(alpha[white_pixels])), 5.0)
+
+    def test_dark_soft_bag_with_detached_lower_details_uses_defined_cleanup_masks(self):
+        source = Image.new("RGB", (520, 460), "white")
+        draw = ImageDraw.Draw(source)
+        draw.polygon(
+            ((105, 180), (415, 180), (390, 390), (130, 390)),
+            fill="#242323",
+        )
+        draw.arc((150, 45, 370, 285), 180, 360, fill="#292828", width=22)
+        draw.rectangle((72, 352, 88, 374), fill="#252424")
+        draw.rectangle((432, 350, 448, 372), fill="#252424")
+
+        model_matte = np.zeros((460, 520), dtype=np.float32)
+        cv2.fillPoly(
+            model_matte,
+            [np.array(((105, 180), (415, 180), (390, 390), (130, 390)))],
+            0.995,
+        )
+        cv2.ellipse(model_matte, (260, 165), (110, 110), 0, 180, 360, 0.995, 22)
+        model_matte[352:375, 72:89] = 0.995
+        model_matte[350:373, 432:449] = 0.995
+
+        alpha = np.asarray(
+            service._prepared_product_cutout(source, model_matte).getchannel("A")
+        )
+
+        self.assertGreater(int(alpha[250, 260]), 245)
+        self.assertEqual(int(alpha[0, 260]), 0)
+
     def test_coloured_product_does_not_lose_gold_hardware(self):
         source = Image.new("RGB", (520, 420), "white")
         draw = ImageDraw.Draw(source)

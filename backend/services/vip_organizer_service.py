@@ -1972,6 +1972,7 @@ def _prepared_product_cutout(
     hardware_protection = np.zeros((height, width), dtype=bool)
     pale_body_protection = np.zeros((height, width), dtype=bool)
     pale_opening_background = np.zeros((height, width), dtype=bool)
+    model_compact_detail = np.zeros((height, width), dtype=bool)
     use_historical_bottom_pipeline = bool(
         _use_historical_bottom_pipeline
     )
@@ -2115,6 +2116,24 @@ def _prepared_product_cutout(
                         & (source_spread_full <= 12)
                     )
                     pale_body_protection &= ~pale_opening_background
+                # Pale shoulder bags and luggage can have narrow straps,
+                # quilted seams, side gussets, wheels or fittings outside the
+                # broad body run.  A white-background flood may reach those
+                # parts even though the segmentation model is very certain
+                # they are foreground.  Extend protection only where the
+                # source still has measurable material evidence; truly white
+                # openings and chain gaps therefore remain background.
+                pale_detail_protection = (
+                    (model_matte >= 0.90)
+                    & (
+                        (lab_distance >= 4)
+                        | (saturation >= 5)
+                        | (value <= 249)
+                        | (gradient >= 5)
+                    )
+                    & ~pale_opening_background
+                )
+                pale_body_protection |= pale_detail_protection
                 locked_white_background &= ~pale_body_protection
                 locked_white_background |= pale_opening_background
         gold_seed = np.zeros((height, width), dtype=bool)
@@ -2367,6 +2386,7 @@ def _prepared_product_cutout(
         structural_foreground = mask_u8.astype(bool) & (
             (saturation >= 35)
             | (value <= 185)
+            | (pale_product & pale_body_protection)
         )
         structural_rows = structural_foreground.sum(axis=1)
         broad_rows = structural_rows >= max(10, int(structural_rows.max() * 0.55))
@@ -2402,6 +2422,7 @@ def _prepared_product_cutout(
                 (saturation >= 24)
                 | (dark_product & (value <= 130))
                 | ((lab_distance >= 16) & (gradient >= 4))
+                | (pale_product & pale_body_protection)
             )
             material_column_bottoms = []
             for column in range(width // 5, width * 4 // 5):
@@ -2456,6 +2477,7 @@ def _prepared_product_cutout(
                 & (lab_distance >= 14)
             )
             model_detail = np.zeros((height, width), dtype=bool)
+            model_compact_detail.fill(False)
             if model_matte is not None:
                 model_detail = (
                     (model_matte >= 0.82)
@@ -2463,6 +2485,42 @@ def _prepared_product_cutout(
                     & (saturation >= 18)
                     & (value >= 140)
                 )
+                # Wheels, feet and low-hanging fittings are compact/tall
+                # model-supported shapes below the dense body edge.  A floor
+                # shadow is instead wide and shallow.  Protect the former
+                # independent of product colour so mint luggage and dark
+                # rubber wheels do not depend on the pale-bag branch.
+                model_lower_tail = (
+                    (yy > dense_bottom)
+                    & (model_matte >= 0.90)
+                ).astype(np.uint8)
+                (
+                    lower_component_count,
+                    lower_component_labels,
+                    lower_component_stats,
+                    _,
+                ) = cv2.connectedComponentsWithStats(model_lower_tail, 8)
+                for component in range(1, lower_component_count):
+                    component_width = int(
+                        lower_component_stats[component, cv2.CC_STAT_WIDTH]
+                    )
+                    component_height = int(
+                        lower_component_stats[component, cv2.CC_STAT_HEIGHT]
+                    )
+                    component_area = int(
+                        lower_component_stats[component, cv2.CC_STAT_AREA]
+                    )
+                    if (
+                        component_width <= max(18, round(width * 0.18))
+                        and component_height >= max(
+                            7,
+                            round(component_width * 0.32),
+                        )
+                        and component_area >= max(18, width // 25)
+                    ):
+                        model_compact_detail |= (
+                            lower_component_labels == component
+                        )
             detail_below_body = (
                 gold_detail
                 | hardware_protection
@@ -2470,6 +2528,8 @@ def _prepared_product_cutout(
                 | outside_colored_detail
                 | central_colored_detail
                 | model_detail
+                | model_compact_detail
+                | (pale_product & pale_body_protection)
             )
             shadow_tail = (yy > dense_bottom) & ~detail_below_body
             mask_u8[shadow_tail] = 0
@@ -2483,12 +2543,14 @@ def _prepared_product_cutout(
                     & (saturation <= 30)
                     & (value >= 115)
                     & (gradient <= 95)
+                    & ~pale_body_protection
                     & ~(
                         gold_detail
                         | hardware_protection
                         | dark_detail
                         | outside_colored_detail
                         | central_colored_detail
+                        | model_compact_detail
                     )
                 )
                 mask_u8[connected_floor_shadow] = 0
@@ -2604,6 +2666,7 @@ def _prepared_product_cutout(
                                 | hardware_protection
                                 | (dark_product & dark_detail)
                                 | outside_colored_detail
+                                | model_compact_detail
                             )
                         )
                         mask_u8[neutral_column_tail] = 0
@@ -2692,9 +2755,18 @@ def _prepared_product_cutout(
         top:bottom,
         left:right,
     ]
+    cropped_model_compact_detail = model_compact_detail[
+        top:bottom,
+        left:right,
+    ]
     cropped_hardware = cropped_elle_hardware | cropped_silver_hardware
     cropped_gold_protection = cropped_gold_only_protection | cropped_hardware
     cropped_tight_hardware = cropped_strict_hardware.copy()
+    # Dark products intentionally skip the model-assisted coloured-floor
+    # branch below. Keep the later detached-component cleanup well-defined for
+    # that path; no pixels should receive coloured-material protection unless
+    # the model-assisted branch explicitly verifies them.
+    cropped_colored_material = np.zeros(alpha.shape, dtype=bool)
     if model_matte is not None and not dark_product:
         cropped_model_matte = model_matte[top:bottom, left:right]
         tight_gold_core = (
@@ -2907,6 +2979,7 @@ def _prepared_product_cutout(
                 & (cropped_model_matte < 0.95)
                 & ~cropped_hardware
                 & ~cropped_colored_material
+                & ~cropped_model_compact_detail
             )
             alpha[low_confidence_floor_residue] = 0
 
@@ -2959,6 +3032,7 @@ def _prepared_product_cutout(
                 & (alpha > 0)
                 & ~floor_hardware_core
                 & ~cropped_colored_material
+                & ~cropped_model_compact_detail
             )
             alpha[collapsed_floor_residue] = 0
 
@@ -3020,6 +3094,7 @@ def _prepared_product_cutout(
                     & (alpha > 0)
                     & ~verified_floor_hardware
                     & ~cropped_colored_material
+                    & ~cropped_model_compact_detail
                 )
                 alpha[shadow_below_floor] = 0
 
@@ -3047,6 +3122,7 @@ def _prepared_product_cutout(
                         & (refined_value < material_value_floor + 12)
                         & ~tight_floor_hardware
                         & ~cropped_colored_material
+                        & ~cropped_model_compact_detail
                     )
                     alpha[connected_contact_shadow] = 0
 
@@ -3071,6 +3147,7 @@ def _prepared_product_cutout(
             )
             & ~verified_floor_hardware
             & ~cropped_colored_material
+            & ~cropped_model_compact_detail
         )
         floor_component_count, floor_labels = cv2.connectedComponents(
             floor_candidate.astype(np.uint8),
