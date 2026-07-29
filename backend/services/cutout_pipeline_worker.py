@@ -6,7 +6,11 @@ from typing import Any
 from PIL import Image, ImageOps
 
 from .heavy_worker_io import run_worker
-from .vip_organizer_service import _predict_product_matte, _prepared_product_cutout
+from .vip_organizer_service import (
+    _predict_product_matte,
+    _prepared_product_cutout,
+    _remove_detached_floor_fragments,
+)
 
 
 def _handle(payload: dict[str, Any]) -> dict[str, int]:
@@ -30,6 +34,7 @@ def _handle(payload: dict[str, Any]) -> dict[str, int]:
             (transparent.height - rendered.height) // 2,
         ),
     )
+    transparent = _remove_detached_floor_fragments(transparent)
     transparent.save(transparent_path, format="PNG", optimize=True)
     gray = Image.new("RGB", transparent.size, "#969895")
     gray.paste(transparent.convert("RGB"), (0, 0), transparent.getchannel("A"))

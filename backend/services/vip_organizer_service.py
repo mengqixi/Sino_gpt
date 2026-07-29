@@ -1636,9 +1636,314 @@ def _predict_product_matte(source: Image.Image) -> np.ndarray | None:
             return None
 
 
+def _clean_bottom_against_body_contour(
+    alpha: np.ndarray,
+    rgb: np.ndarray,
+    model_matte: np.ndarray,
+    protected_detail: np.ndarray,
+    *,
+    confidence_floor: float = 0.92,
+    contour_mode: str = "smooth",
+) -> np.ndarray:
+    """Clear floor residue below a fitted, high-confidence bag-body edge.
+
+    The caller supplies an already refined alpha.  This pass is deliberately
+    one-way and local: it may clear pixels below the main body's lower contour,
+    but it never changes a pixel above that contour.  Handles, openings and
+    upper-body rules therefore remain byte-for-byte unchanged.  Hardware and
+    chain pixels protected by the regional detector are excluded as well.
+
+    ``contour_mode`` exists so the three inexpensive fits can be compared on
+    real white-studio samples.  Production uses the selected default only.
+    """
+    if (
+        alpha.shape != model_matte.shape
+        or alpha.shape != protected_detail.shape
+        or rgb.shape[:2] != alpha.shape
+    ):
+        return alpha
+    height, width = alpha.shape
+    if height < 40 or width < 40:
+        return alpha
+
+    yy, xx = np.indices(alpha.shape)
+    central_columns = (xx >= round(width * 0.08)) & (xx < round(width * 0.92))
+    high_confidence = (
+        (model_matte >= confidence_floor)
+        & (alpha > 8)
+        & central_columns
+        & ~protected_detail
+    )
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        high_confidence.astype(np.uint8),
+        8,
+    )
+    if component_count <= 1:
+        return alpha
+    largest_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    structure = labels == largest_component
+
+    # Only the broad lower component can define the body edge.  Thin handles
+    # and hanging side chains cannot accumulate enough width in these rows.
+    scan_start = round(height * 0.52)
+    row_widths = np.count_nonzero(structure & central_columns, axis=1)
+    lower_widths = row_widths[scan_start:]
+    widest_lower_row = int(np.max(lower_widths)) if lower_widths.size else 0
+    minimum_body_width = max(20, round(width * 0.18))
+    if widest_lower_row < minimum_body_width:
+        return alpha
+    broad_rows = np.flatnonzero(
+        lower_widths >= max(minimum_body_width, round(widest_lower_row * 0.34))
+    )
+    if not broad_rows.size:
+        return alpha
+    body_scan_top = scan_start + int(broad_rows[0])
+    body_scan_bottom = scan_start + int(broad_rows[-1])
+
+    raw_contour = np.full(width, np.nan, dtype=np.float32)
+    for column in range(round(width * 0.08), round(width * 0.92)):
+        rows = np.flatnonzero(
+            structure[body_scan_top:body_scan_bottom + 1, column]
+        )
+        if rows.size:
+            raw_contour[column] = body_scan_top + float(rows[-1])
+    supported_columns = np.flatnonzero(np.isfinite(raw_contour))
+    if supported_columns.size < max(24, round(width * 0.24)):
+        return alpha
+    body_left = int(supported_columns.min())
+    body_right = int(supported_columns.max())
+    body_columns = np.arange(body_left, body_right + 1)
+    interpolated = np.interp(
+        body_columns,
+        supported_columns,
+        raw_contour[supported_columns],
+    ).astype(np.float32)
+
+    # Bag piping normally continues from both side edges around the bottom in
+    # the same colour.  Use those trusted side-edge colours to extend the raw
+    # contour through a darker/lighter real trim that a high confidence
+    # threshold may miss.  Low-model shadow cannot extend it.  This only moves
+    # the deletion boundary; it never paints or synthesizes edge pixels.
+    structure_inside = cv2.distanceTransform(
+        structure.astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+    )
+    structure_boundary = structure & (structure_inside <= 3.0)
+    side_band = max(3, round((body_right - body_left + 1) * 0.10))
+    side_sample_bottom = body_scan_top + round(
+        (body_scan_bottom - body_scan_top) * 0.76
+    )
+    edge_hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    edge_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edge_gradient = cv2.magnitude(
+        cv2.Sobel(edge_gray, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(edge_gray, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    bright_gold_metal = (
+        (edge_hsv[:, :, 0] >= 5)
+        & (edge_hsv[:, :, 0] <= 40)
+        & (edge_hsv[:, :, 1] >= 25)
+        & (edge_hsv[:, :, 2] >= 155)
+        & (edge_gradient >= 30)
+        & (
+            rgb[:, :, 0].astype(np.int16)
+            >= rgb[:, :, 2].astype(np.int16) + 10
+        )
+    )
+    neutral_metal_highlight = (
+        (edge_hsv[:, :, 1] <= 42)
+        & (edge_hsv[:, :, 2] >= 105)
+        & (edge_hsv[:, :, 2] <= 245)
+        & (edge_gradient >= 38)
+        & (model_matte >= 0.78)
+    )
+    side_metal = bright_gold_metal | neutral_metal_highlight
+    side_edge_zone = (
+        structure_boundary
+        & (yy >= body_scan_top)
+        & (yy <= side_sample_bottom)
+        & (
+            (xx <= body_left + side_band)
+            | (xx >= body_right - side_band)
+        )
+        & ~protected_detail
+        & ~side_metal
+    )
+    edge_lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    side_colours = edge_lab[side_edge_zone]
+    if side_colours.size:
+        if len(side_colours) > 128:
+            sample_indices = np.linspace(
+                0,
+                len(side_colours) - 1,
+                128,
+                dtype=np.int32,
+            )
+            side_colours = side_colours[sample_indices]
+        maximum_extension = max(8, round(height * 0.12))
+        upward_probe = max(6, round(height * 0.025))
+        body_value_sample = edge_hsv[
+            body_scan_top:side_sample_bottom + 1,
+            body_left:body_right + 1,
+            2,
+        ]
+        body_value = float(np.median(body_value_sample))
+        for offset, column in enumerate(body_columns):
+            initial_bottom = int(round(interpolated[offset]))
+            extension_top = max(body_scan_top, initial_bottom - upward_probe)
+            extension_bottom = min(
+                height - 1,
+                initial_bottom + maximum_extension,
+            )
+            candidate_rows = np.arange(
+                extension_top,
+                extension_bottom + 1,
+            )
+            candidate_colours = edge_lab[candidate_rows, column]
+            edge_distance = np.min(
+                np.linalg.norm(
+                    candidate_colours[:, None, :] - side_colours[None, :, :],
+                    axis=2,
+                ),
+                axis=1,
+            )
+            # Establish colour continuity while still safely inside the bag.
+            # The model's last high-confidence row often includes the first
+            # black contact-shadow pixel, so it must not be trusted directly.
+            seed_bottom = min(
+                initial_bottom,
+                extension_top + max(3, upward_probe // 2),
+            )
+            seed_rows = np.arange(extension_top, seed_bottom + 1)
+            seed_valid = (
+                (model_matte[seed_rows, column] >= 0.72)
+                & (alpha[seed_rows, column] > 8)
+                & ~protected_detail[seed_rows, column]
+            )
+            if not np.any(seed_valid):
+                continue
+            rolling_colours = [
+                colour.copy()
+                for colour in edge_lab[seed_rows[seed_valid], column]
+            ]
+            rolling_values = [
+                float(value_item)
+                for value_item in edge_hsv[seed_rows[seed_valid], column, 2]
+            ]
+            last_trusted = int(seed_rows[seed_valid][-1])
+            gap = 0
+            for row_index, row in enumerate(candidate_rows):
+                if row <= last_trusted:
+                    continue
+                local_reference = np.median(
+                    np.asarray(rolling_colours[-5:]),
+                    axis=0,
+                )
+                local_distance = float(np.linalg.norm(
+                    edge_lab[row, column] - local_reference
+                ))
+                locally_non_shadow = (
+                    edge_hsv[row, column, 2]
+                    >= max(58.0, body_value * 0.58)
+                )
+                rolling_value = float(np.median(rolling_values[-5:]))
+                abrupt_dark_drop = (
+                    float(edge_hsv[row, column, 2])
+                    < max(42.0, rolling_value * 0.57)
+                )
+                continuous_edge = (
+                    model_matte[row, column] >= 0.72
+                    and alpha[row, column] > 8
+                    and not protected_detail[row, column]
+                    and not abrupt_dark_drop
+                    and (
+                        edge_distance[row_index] <= 23.0
+                        or (
+                            local_distance <= 16.0
+                            and locally_non_shadow
+                        )
+                    )
+                )
+                if continuous_edge:
+                    last_trusted = int(row)
+                    rolling_colours.append(edge_lab[row, column].copy())
+                    rolling_values.append(float(edge_hsv[row, column, 2]))
+                    gap = 0
+                else:
+                    gap += 1
+                    if gap >= 2:
+                        break
+            interpolated[offset] = float(last_trusted)
+
+    # The observations above only locate the real edge; they are not pixels
+    # to preserve independently. A manufactured bag bottom is one coherent
+    # edge, so fit either a horizontal baseline or a low-curvature quadratic.
+    sample_count = len(interpolated)
+    window = max(7, round(sample_count * 0.045) | 1)
+    padded = np.pad(interpolated, window // 2, mode="edge")
+    observations = np.median(
+        np.lib.stride_tricks.sliding_window_view(padded, window),
+        axis=1,
+    ).astype(np.float32)
+    normalized_x = np.linspace(-1.0, 1.0, sample_count)
+    interior = np.abs(normalized_x) <= 0.84
+    fit_x = normalized_x[interior]
+    fit_y = observations[interior]
+    for _ in range(3):
+        coefficients = np.polyfit(fit_x, fit_y, 2)
+        residual = fit_y - np.polyval(coefficients, fit_x)
+        median_residual = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - median_residual)))
+        keep = np.abs(residual - median_residual) <= max(2.0, 3.5 * mad)
+        if np.count_nonzero(keep) < max(20, round(sample_count * 0.35)):
+            break
+        fit_x = fit_x[keep]
+        fit_y = fit_y[keep]
+
+    spread = float(np.quantile(fit_y, 0.90) - np.quantile(fit_y, 0.10))
+    flat_limit = max(3.0, height * 0.009)
+    if contour_mode == "horizontal" or spread <= flat_limit:
+        level = float(np.quantile(fit_y, 0.58))
+        fitted = np.full(sample_count, level, dtype=np.float32)
+    else:
+        coefficients = np.polyfit(fit_x, fit_y, 2)
+        fitted = np.polyval(coefficients, normalized_x).astype(np.float32)
+        lower = float(np.quantile(fit_y, 0.03) - max(2.0, spread * 0.30))
+        upper = float(np.quantile(fit_y, 0.97) + max(2.0, spread * 0.30))
+        fitted = np.clip(fitted, lower, upper)
+
+    safety_margin = 0.0
+
+    fitted_contour = np.full(width, height, dtype=np.float32)
+    fitted_contour[body_left:body_right + 1] = fitted
+    safe_contour = fitted_contour + safety_margin
+    below_body = yy > safe_contour[None, :]
+    removable = (
+        below_body
+        & (alpha > 0)
+        & ~protected_detail
+    )
+
+    # Contact shadow can touch the last real row and therefore sit inside the
+    # small antialias safety margin.  On non-dark products it is still a sharp
+    # value/chroma departure from the broad bag body.  Clear only low-model
+    # dark or grey contact pixels at/under the fitted edge; high-confidence
+    # coloured trim remains untouched.  This is deletion only—no generated
+    # edge colour or model alpha is written back.
+    if not np.any(removable):
+        return alpha
+    cleaned = alpha.copy()
+    cleaned[removable] = 0
+    return cleaned
+
+
 def _prepared_product_cutout(
     source: Image.Image,
     model_matte: np.ndarray | None = None,
+    *,
+    _bottom_contour_mode: str = "adaptive",
+    _bottom_contour_confidence: float = 0.96,
 ) -> Image.Image:
     """Create a cleaner export cutout for white/light studio product photos.
 
@@ -1658,7 +1963,14 @@ def _prepared_product_cutout(
     value = hsv[:, :, 2]
     dark_product = False
     colourful_product = False
+    pale_product = False
     elle_hardware_protection = np.zeros((height, width), dtype=bool)
+    silver_hardware_protection = np.zeros((height, width), dtype=bool)
+    strict_silver_hardware = np.zeros((height, width), dtype=bool)
+    strict_hardware_protection = np.zeros((height, width), dtype=bool)
+    hardware_protection = np.zeros((height, width), dtype=bool)
+    pale_body_protection = np.zeros((height, width), dtype=bool)
+    pale_opening_background = np.zeros((height, width), dtype=bool)
 
     if float(np.mean(source_alpha < 250)) > 0.01:
         mask = source_alpha > 12
@@ -1692,11 +2004,22 @@ def _prepared_product_cutout(
             model_subject = model_matte >= 0.82
             model_subject_saturation = saturation[model_subject]
             model_subject_value = value[model_subject]
-            colourful_product = bool(
+            model_subject_distance = lab_distance[model_subject]
+            pale_product = bool(
                 model_subject_saturation.size
                 and model_subject_value.size
-                and float(np.median(model_subject_saturation)) >= 30
-                and float(np.median(model_subject_value)) >= 100
+                and model_subject_distance.size
+                and float(np.median(model_subject_saturation)) <= 30
+                and float(np.median(model_subject_value)) >= 170
+                and float(np.median(model_subject_distance)) <= 55
+            )
+            colourful_product = bool(
+                model_subject_saturation.size
+                and not pale_product
+                and (
+                    float(np.median(model_subject_saturation)) >= 15
+                    or float(np.median(model_subject_distance)) >= 28
+                )
             )
 
         # Flood only light/neutral pixels connected to an outside edge. This
@@ -1714,7 +2037,80 @@ def _prepared_product_cutout(
         )))
         border_labels = border_labels[border_labels > 0]
         connected_background = np.isin(background_labels, border_labels)
-        initial_foreground = (~connected_background).astype(np.uint8)
+        # Input to this preparation tool is guaranteed to be a white studio
+        # image. Lock the near-white area that is already connected to the
+        # canvas edge before consulting the segmentation model. The model is
+        # useful for the product silhouette, but it must never pull white gaps
+        # around chains, zips or fittings back into the foreground.
+        locked_white_background = connected_background & (
+            (
+                (lab_distance <= 13)
+                & (saturation <= 20)
+                & (value >= 232)
+            )
+            | (
+                (lab_distance <= 7)
+                & (saturation <= 28)
+                & (value >= 220)
+            )
+        )
+        if pale_product and model_matte is not None:
+            # A pale leather body can be close enough to studio white that the
+            # outside flood reaches through its broad, low-texture panels.  Use
+            # the model only inside the bag-body run; the handle/opening stays
+            # on the stricter white-background path so enclosed white gaps are
+            # still removed.
+            model_geometry = model_matte >= 0.82
+            model_row_widths = np.count_nonzero(model_geometry, axis=1)
+            widest_model_row = int(np.max(model_row_widths))
+            broad_model_rows = np.flatnonzero(
+                model_row_widths >= max(18, round(widest_model_row * 0.42))
+            )
+            if broad_model_rows.size:
+                row_runs = np.split(
+                    broad_model_rows,
+                    np.flatnonzero(np.diff(broad_model_rows) > 1) + 1,
+                )
+                body_run = max(row_runs, key=len)
+                body_top = int(body_run[0])
+                body_bottom = int(body_run[-1])
+                row_grid = np.arange(height)[:, None]
+                pale_body_protection = (
+                    (model_matte >= 0.95)
+                    & (row_grid >= body_top)
+                    & (row_grid <= body_bottom)
+                )
+                body_rows, body_columns = np.where(model_geometry[body_run])
+                if body_columns.size:
+                    body_left = int(body_columns.min())
+                    body_right = int(body_columns.max())
+                    body_span_width = max(1, body_right - body_left + 1)
+                    body_span_height = max(1, body_bottom - body_top + 1)
+                    column_grid = np.arange(width)[None, :]
+                    opening_zone = (
+                        (row_grid >= body_top - round(body_span_height * 0.10))
+                        & (row_grid <= body_top + round(body_span_height * 0.20))
+                        & (column_grid >= body_left + round(body_span_width * 0.22))
+                        & (column_grid <= body_right - round(body_span_width * 0.22))
+                    )
+                    source_min_full = rgb.min(axis=2)
+                    source_spread_full = (
+                        rgb.max(axis=2).astype(np.int16)
+                        - source_min_full.astype(np.int16)
+                    )
+                    pale_opening_background = (
+                        opening_zone
+                        & (source_min_full >= 245)
+                        & (source_spread_full <= 12)
+                    )
+                    pale_body_protection &= ~pale_opening_background
+                locked_white_background &= ~pale_body_protection
+                locked_white_background |= pale_opening_background
+        gold_seed = np.zeros((height, width), dtype=bool)
+        strict_gold_hardware = np.zeros((height, width), dtype=bool)
+        initial_foreground = (
+            (~connected_background) | pale_body_protection
+        ).astype(np.uint8)
 
         # Detect ELLE's champagne-gold hardware before any foreground cleanup.
         # Every protected component must contain a clearly gold seed; muted
@@ -1783,6 +2179,73 @@ def _prepared_product_cutout(
                 & (gradient >= 14)
             )
             elle_hardware_protection |= metal_highlight_neighbour
+            strict_gold_hardware = (
+                gold_seed
+                | (
+                    seeded_gold_neighbourhood
+                    & gold_region_candidate
+                    & (gradient >= 10)
+                )
+            )
+
+        # White-background ELLE photos also use silver chains and fittings.
+        # Protect only high-contrast neutral metal immediately beside the
+        # connected studio background. This avoids treating broad neutral
+        # shadows or pale bag material as hardware, while retaining the thin
+        # dark rim and bright highlight of individual silver links.
+        if model_matte is not None:
+            exterior_neighbour = cv2.dilate(
+                connected_background.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=1,
+            ).astype(bool)
+            local_value_range = (
+                cv2.dilate(value, np.ones((3, 3), dtype=np.uint8))
+                - cv2.erode(value, np.ones((3, 3), dtype=np.uint8))
+            )
+            silver_seed = (
+                exterior_neighbour
+                & (model_matte >= 0.55)
+                & (saturation <= 40)
+                & (value >= 45)
+                & (value <= 225)
+                & (lab_distance >= 7)
+                & (gradient >= 26)
+                & (local_value_range >= 20)
+            )
+            strict_silver_hardware = silver_seed
+            silver_neighbourhood = cv2.dilate(
+                silver_seed.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ).astype(bool)
+            silver_hardware_protection = (
+                silver_seed
+                | (
+                    silver_neighbourhood
+                    & exterior_neighbour
+                    & (model_matte >= 0.40)
+                    & (saturation <= 48)
+                    & (value <= 242)
+                    & (lab_distance >= 5)
+                    & (gradient >= 14)
+                )
+            )
+
+        # The broad hardware mask helps GrabCut retain an entire thin fitting,
+        # while the strict mask contains only pixels supported by a real metal
+        # seed.  Final white-fringe removal must use the strict version: a
+        # dilated metal neighbourhood otherwise protects the white studio
+        # pixels beside a clasp or chain link and creates a visible halo.
+        strict_hardware_protection = (
+            strict_gold_hardware | strict_silver_hardware
+        )
+        strict_hardware_protection &= ~locked_white_background
+
+        hardware_protection = (
+            elle_hardware_protection | silver_hardware_protection
+        )
+        hardware_protection &= ~locked_white_background
 
         # Refine uncertain light edges with GrabCut. Strongly coloured and dark
         # pixels are protected so chains, hardware and pale leather survive.
@@ -1790,13 +2253,14 @@ def _prepared_product_cutout(
         probable_foreground = initial_foreground > 0
         if model_matte is not None:
             probable_foreground |= model_matte >= 0.48
+        probable_foreground &= ~locked_white_background
         grabcut[probable_foreground] = cv2.GC_PR_FGD
         sure_foreground = probable_foreground & (
             (lab_distance >= 66)
             | (saturation >= 48)
             | (value <= 145)
         )
-        sure_foreground |= elle_hardware_protection
+        sure_foreground |= hardware_protection
         if model_matte is not None:
             sure_foreground |= model_matte >= 0.985
         grabcut[sure_foreground] = cv2.GC_FGD
@@ -1809,7 +2273,14 @@ def _prepared_product_cutout(
             & (saturation <= 8)
             & (value >= 248)
         )
-        grabcut[reliable_connected_background | exact_studio_background] = cv2.GC_BGD
+        grabcut[
+            (
+                reliable_connected_background
+                | exact_studio_background
+                | locked_white_background
+            )
+            & ~pale_body_protection
+        ] = cv2.GC_BGD
         try:
             cv2.grabCut(
                 cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
@@ -1829,8 +2300,11 @@ def _prepared_product_cutout(
                 (model_matte >= 0.72)
                 & ((gradient >= 8) | (lab_distance >= 7) | (saturation >= 10))
             )
+            textured_model_foreground |= pale_body_protection
+            mask |= pale_body_protection
             mask[connected_background & ~textured_model_foreground] = False
-            mask[exact_studio_background] = False
+            mask[exact_studio_background & ~pale_body_protection] = False
+            mask[locked_white_background] = False
 
         # GrabCut can shave off pale product edges that are close to a white
         # backdrop. Protect narrow, high-gradient parts already found by the
@@ -1857,12 +2331,14 @@ def _prepared_product_cutout(
                 (legacy_full > 80)
                 & (distance_from_reliable_foreground <= max(4, min(height, width) * 0.007))
                 & ((gradient >= 10) | (lab_distance >= 7) | (value <= 247))
+                & ~locked_white_background
             )
             mask |= edge_protection
 
         # ELLE plaques, letter logos, charms, links, zips and clasps have the
         # highest preservation priority throughout all later shadow cleanup.
-        mask |= elle_hardware_protection
+        mask |= hardware_protection
+        mask[locked_white_background] = False
 
         mask_u8 = mask.astype(np.uint8)
         mask_u8 = cv2.morphologyEx(
@@ -1870,6 +2346,9 @@ def _prepared_product_cutout(
             cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         )
+        # Closing is useful for tiny breaks in straps and chain links, but it
+        # must not paint already-confirmed studio white back into those gaps.
+        mask_u8[locked_white_background] = 0
 
         # A studio floor shadow is normally a sparse neutral tail below the
         # final dense product row. Remove that tail while keeping coloured
@@ -1959,6 +2438,12 @@ def _prepared_product_cutout(
                 & (gradient >= 16)
                 & (saturation >= 28)
             )
+            central_colored_detail = (
+                inside_body_width
+                & mask_u8.astype(bool)
+                & (saturation >= 28)
+                & (lab_distance >= 14)
+            )
             model_detail = np.zeros((height, width), dtype=bool)
             if model_matte is not None:
                 model_detail = (
@@ -1969,9 +2454,10 @@ def _prepared_product_cutout(
                 )
             detail_below_body = (
                 gold_detail
-                | elle_hardware_protection
+                | hardware_protection
                 | dark_detail
                 | outside_colored_detail
+                | central_colored_detail
                 | model_detail
             )
             shadow_tail = (yy > dense_bottom) & ~detail_below_body
@@ -1988,92 +2474,13 @@ def _prepared_product_cutout(
                     & (gradient <= 95)
                     & ~(
                         gold_detail
-                        | elle_hardware_protection
+                        | hardware_protection
                         | dark_detail
                         | outside_colored_detail
+                        | central_colored_detail
                     )
                 )
                 mask_u8[connected_floor_shadow] = 0
-
-                sample_saturation = saturation[
-                    sample_top:sample_bottom,
-                    sample_left:sample_right,
-                ][sample_mask]
-                if sample_saturation.size:
-                    median_saturation = float(np.median(sample_saturation))
-                    median_value = float(np.median(sample_value)) if sample_value.size else 180.0
-                    material_saturation = float(np.clip(
-                        median_saturation * 0.75,
-                        18,
-                        50,
-                    ))
-                    material_value_floor = float(np.clip(
-                        median_value * 0.78,
-                        90,
-                        165,
-                    ))
-                    column_material = mask_u8.astype(bool) & (
-                        (dark_product & (value <= 105))
-                        | gold_detail
-                    )
-                    if median_saturation >= 18:
-                        sample_hue = hue[
-                            sample_top:sample_bottom,
-                            sample_left:sample_right,
-                        ][sample_mask]
-                        sample_hue = sample_hue[sample_saturation >= material_saturation]
-                        if sample_hue.size:
-                            angles = sample_hue.astype(np.float32) * (2 * np.pi / 180.0)
-                            dominant_hue = (
-                                np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
-                                * 180.0 / (2 * np.pi)
-                            ) % 180.0
-                            hue_distance = np.abs(hue.astype(np.float32) - dominant_hue)
-                            hue_distance = np.minimum(hue_distance, 180.0 - hue_distance)
-                            coloured_material = (
-                                (saturation >= material_saturation)
-                                & (hue_distance <= 20)
-                                & (value >= material_value_floor)
-                                & (gradient >= 7)
-                            )
-                            column_material |= mask_u8.astype(bool) & coloured_material
-                    material_rows = np.where(
-                        column_material,
-                        np.arange(height)[:, None],
-                        -1,
-                    )
-                    column_bottoms = material_rows.max(axis=0)
-                    smoothing_width = max(5, min(31, width // 80))
-                    if smoothing_width % 2 == 0:
-                        smoothing_width += 1
-                    padded_bottoms = np.pad(
-                        column_bottoms,
-                        smoothing_width // 2,
-                        mode="edge",
-                    )
-                    column_bottoms = np.median(
-                        np.lib.stride_tricks.sliding_window_view(
-                            padded_bottoms,
-                            smoothing_width,
-                        ),
-                        axis=1,
-                    ).astype(np.int32)
-                    below_column_material = (
-                        (column_bottoms[None, :] >= 0)
-                        & (yy > column_bottoms[None, :] + max(1, height // 800))
-                    )
-                    neutral_column_tail = (
-                        (yy >= floor_start)
-                        & below_column_material
-                        & mask_u8.astype(bool)
-                        & ~(
-                            gold_detail
-                            | elle_hardware_protection
-                            | (dark_product & dark_detail)
-                            | outside_colored_detail
-                        )
-                    )
-                    mask_u8[neutral_column_tail] = 0
 
             # Shadows form broad, shallow islands under the product. Remove
             # those islands while retaining narrow chain/hardware components.
@@ -2084,13 +2491,17 @@ def _prepared_product_cutout(
                 component_width = int(component_stats[component, cv2.CC_STAT_WIDTH])
                 component_height = int(component_stats[component, cv2.CC_STAT_HEIGHT])
                 component_area = int(component_stats[component, cv2.CC_STAT_AREA])
+                component_pixels = component_labels == component
+                protected_detail_area = int(np.count_nonzero(
+                    detail_below_body[component_pixels]
+                ))
                 if (
                     component_width >= max(12, width // 16)
                     and component_height <= max(18, height // 45)
                     and component_area >= max(30, width // 8)
-                    and not np.any(elle_hardware_protection[component_labels == component])
+                    and protected_detail_area < max(6, round(component_area * 0.08))
                 ):
-                    mask_u8[component_labels == component] = 0
+                    mask_u8[component_pixels] = 0
 
         mask = mask_u8 > 0
 
@@ -2117,41 +2528,6 @@ def _prepared_product_cutout(
     cropped_rgb = rgb[top:bottom, left:right].astype(np.float32)
     if float(np.mean(source_alpha < 250)) <= 0.01:
         cropped_lab_distance = lab_distance[top:bottom, left:right]
-        boundary = (inside <= 4.0) & (outside <= 4.0)
-        neutral_fringe = boundary & (cropped_saturation <= 32) & (cropped_value >= 165)
-        fringe_strength = np.clip((cropped_lab_distance - 4.0) / 20.0, 0.0, 1.0)
-        alpha_float = alpha.astype(np.float32)
-        alpha_float[neutral_fringe] *= fringe_strength[neutral_fringe]
-        alpha = alpha_float.astype(np.uint8)
-
-        # Remove the light backdrop mixed into semi-transparent edge pixels.
-        edge_alpha = alpha.astype(np.float32) / 255.0
-        semi = (edge_alpha > 0.04) & (edge_alpha < 0.98)
-        recovered = (
-            cropped_rgb - background_color[None, None, :] * (1.0 - edge_alpha[:, :, None])
-        ) / np.maximum(edge_alpha[:, :, None], 0.08)
-        cropped_rgb[semi] = np.clip(recovered, 0, 255)[semi]
-
-        interior_seed = inside >= 5.0
-        if np.any(interior_seed) and np.any(neutral_fringe):
-            _, nearest_labels = cv2.distanceTransformWithLabels(
-                (~interior_seed).astype(np.uint8),
-                cv2.DIST_L2,
-                5,
-                labelType=cv2.DIST_LABEL_PIXEL,
-            )
-            interior_colors = cropped_rgb[interior_seed]
-            nearest_indices = np.clip(
-                nearest_labels.astype(np.int64) - 1,
-                0,
-                len(interior_colors) - 1,
-            )
-            nearest_colors = interior_colors[nearest_indices]
-            edge_mix = neutral_fringe[:, :, None].astype(np.float32) * 0.72
-            cropped_rgb = (
-                cropped_rgb * (1.0 - edge_mix)
-                + nearest_colors * edge_mix
-            )
 
     # A few dark floor pixels can become detached only after edge decontamination.
     # Remove small lower islands after the final alpha refinement, while keeping
@@ -2167,16 +2543,68 @@ def _prepared_product_cutout(
         & (cropped_rgb_u8[:, :, 0].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 7)
         & (cropped_rgb_u8[:, :, 1].astype(np.int16) >= cropped_rgb_u8[:, :, 2].astype(np.int16) + 10)
     )
-    cropped_gold_protection = cv2.dilate(
+    cropped_gold_only_protection = cv2.dilate(
         cropped_gold_detail.astype(np.uint8),
         np.ones((3, 3), dtype=np.uint8),
         iterations=2,
     ).astype(bool)
     cropped_elle_hardware = elle_hardware_protection[top:bottom, left:right]
-    cropped_gold_protection |= cropped_elle_hardware
+    cropped_silver_hardware = silver_hardware_protection[top:bottom, left:right]
+    cropped_strict_silver_hardware = strict_silver_hardware[
+        top:bottom,
+        left:right,
+    ]
+    cropped_strict_hardware = strict_hardware_protection[
+        top:bottom,
+        left:right,
+    ]
+    cropped_locked_white_background = locked_white_background[
+        top:bottom,
+        left:right,
+    ]
+    cropped_pale_body_protection = pale_body_protection[
+        top:bottom,
+        left:right,
+    ]
+    cropped_hardware = cropped_elle_hardware | cropped_silver_hardware
+    cropped_gold_protection = cropped_gold_only_protection | cropped_hardware
+    cropped_tight_hardware = cropped_strict_hardware.copy()
     if model_matte is not None and not dark_product:
         cropped_model_matte = model_matte[top:bottom, left:right]
-        verified_floor_hardware = cropped_gold_protection & (
+        tight_gold_core = (
+            cropped_gold_detail
+            & (cropped_model_matte >= 0.72)
+        )
+        tight_silver_core = (
+            cropped_strict_silver_hardware
+            & (cropped_model_matte >= 0.78)
+            & (cropped_gradient >= 22)
+        )
+        tight_elle_core = (
+            cropped_elle_hardware
+            & (cropped_model_matte >= 0.72)
+            & (
+                (cropped_saturation >= 22)
+                | (cropped_gradient >= 24)
+            )
+        )
+        metal_core_seed = tight_gold_core | tight_silver_core | tight_elle_core
+        cropped_tight_hardware = metal_core_seed | (
+            cv2.dilate(
+                metal_core_seed.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ).astype(bool)
+            & (cropped_model_matte >= 0.72)
+            & (cropped_lab_distance >= 8)
+        )
+        cropped_colored_material = (
+            (cropped_saturation >= 28)
+            & (cropped_lab_distance >= 14)
+            & (cropped_model_matte >= 0.82)
+            & ~cropped_locked_white_background
+        )
+        verified_floor_hardware = cropped_gold_only_protection & (
             (cropped_model_matte >= 0.80)
             | (
                 (cropped_value >= 170)
@@ -2187,7 +2615,18 @@ def _prepared_product_cutout(
                 )
             )
         )
+        # ELLE gold plaques and charms retain the existing unconditional
+        # protection. Neutral silver links are stricter near the floor so a
+        # thin grey cast shadow cannot masquerade as metal.
         verified_floor_hardware |= cropped_elle_hardware
+        verified_floor_hardware |= (
+            cropped_silver_hardware
+            & (cropped_model_matte >= 0.78)
+            & (cropped_saturation <= 48)
+            & (cropped_value >= 65)
+            & (cropped_value <= 245)
+            & (cropped_gradient >= 22)
+        )
         cropped_height, cropped_width = alpha.shape
         yy, xx = np.indices(alpha.shape)
         material_sample = (
@@ -2220,9 +2659,169 @@ def _prepared_product_cutout(
             (alpha > 0)
             & (source_min >= 235)
             & (source_spread <= 18)
-            & ~cropped_gold_protection
+            & ~cropped_pale_body_protection
+            & ~cropped_tight_hardware
         )
         alpha[white_background] = 0
+
+        # Different parts of a handbag need different cleanup rules.  The
+        # handle/opening and the side-chain lanes often contain disconnected
+        # white pockets which cannot be reached by an outside flood.  The body
+        # itself is not subjected to this broader rule, and pale/white bags
+        # remain on the conservative model path.
+        geometry_structure = (
+            (cropped_model_matte >= 0.82)
+            & (alpha > 0)
+            & ~cropped_locked_white_background
+        )
+        structure_rows, structure_columns = np.where(geometry_structure)
+        if structure_rows.size and structure_columns.size and not pale_product:
+            object_top = int(structure_rows.min())
+            object_bottom = int(structure_rows.max())
+            object_left = int(structure_columns.min())
+            object_right = int(structure_columns.max())
+            object_span_height = max(1, object_bottom - object_top + 1)
+            object_span_width = max(1, object_right - object_left + 1)
+            row_widths = np.count_nonzero(geometry_structure, axis=1)
+            widest_row = int(np.max(row_widths))
+            body_rows = np.flatnonzero(
+                row_widths >= max(18, round(widest_row * 0.42))
+            )
+            body_top = (
+                int(body_rows[0])
+                if body_rows.size
+                else object_top + round(object_span_height * 0.35)
+            )
+            body_bottom = (
+                int(body_rows[-1])
+                if body_rows.size
+                else object_bottom
+            )
+
+            inside_distance = cv2.distanceTransform(
+                (alpha > 0).astype(np.uint8),
+                cv2.DIST_L2,
+                3,
+            )
+            boundary_zone = (alpha > 0) & (inside_distance <= 14.0)
+            handle_zone = (
+                (yy <= body_top + round(object_span_height * 0.04))
+                & (xx >= object_left)
+                & (xx <= object_right)
+            )
+            opening_zone = (
+                (yy >= body_top - round(object_span_height * 0.10))
+                & (yy <= body_top + round(object_span_height * 0.14))
+                & (xx >= object_left)
+                & (xx <= object_right)
+            )
+            side_lane = max(8, round(object_span_width * 0.26))
+            chain_zone = (
+                (yy >= object_top)
+                & (yy <= object_bottom)
+                & (
+                    (xx <= object_left + side_lane)
+                    | (xx >= object_right - side_lane)
+                )
+            )
+            regional_cleanup_zone = (
+                boundary_zone | handle_zone | opening_zone | chain_zone
+            )
+            regional_white = (
+                (
+                    (cropped_lab_distance <= 24)
+                    & (cropped_saturation <= 24)
+                    & (cropped_value >= 224)
+                )
+                | (
+                    (source_min >= 232)
+                    & (source_spread <= 18)
+                )
+            )
+            alpha[
+                regional_cleanup_zone
+                & regional_white
+                & ~cropped_tight_hardware
+            ] = 0
+
+        # Remove only the floor residue below the model's last broad,
+        # high-confidence product row. A single horizontal cutoff preserves
+        # the bag silhouette; unlike per-column trimming it cannot reshape a
+        # curved base. The outer columns and all verified hardware remain
+        # untouched so low-hanging chains and fittings are never clipped.
+        central_model_columns = (
+            (xx >= round(cropped_width * 0.08))
+            & (xx < round(cropped_width * 0.92))
+        )
+        confident_structure = (
+            (cropped_model_matte >= 0.95)
+            & (alpha > 0)
+            & central_model_columns
+            & ~cropped_hardware
+        )
+        model_floor: int | None = None
+        minimum_structure_width = max(12, round(cropped_width * 0.06))
+        for row in range(round(cropped_height * 0.68), cropped_height):
+            if int(np.count_nonzero(confident_structure[row])) >= minimum_structure_width:
+                model_floor = row
+        if model_floor is not None and model_floor < cropped_height - 2:
+            low_confidence_floor_residue = (
+                (yy > model_floor)
+                & central_model_columns
+                & (alpha > 0)
+                & (cropped_model_matte < 0.95)
+                & ~cropped_hardware
+                & ~cropped_colored_material
+            )
+            alpha[low_confidence_floor_residue] = 0
+
+        # The segmentation model can assign very high confidence to a soft
+        # contact shadow, especially below ivory leather and woven straw. Find
+        # the product's last broad, opaque row instead: a real bag bottom stays
+        # horizontally continuous, while its shadow immediately collapses to
+        # a few thin fragments. Use one global floor and never trim individual
+        # columns, so curved and rectangular silhouettes keep their shape.
+        central_opaque_width = np.count_nonzero(
+            (alpha >= 200) & central_model_columns,
+            axis=1,
+        )
+        floor_scan_start = round(cropped_height * 0.60)
+        floor_scan_end = cropped_height
+        scan_widths = central_opaque_width[floor_scan_start:floor_scan_end]
+        broad_width = int(np.max(scan_widths)) if scan_widths.size else 0
+        broad_floor: int | None = None
+        if broad_width >= max(24, round(cropped_width * 0.12)):
+            minimum_broad_width = max(18, round(broad_width * 0.42))
+            minimum_collapse = max(10, round(broad_width * 0.26))
+            for index in range(max(0, scan_widths.size - 1)):
+                current_width = int(scan_widths[index])
+                next_width = int(scan_widths[index + 1])
+                if (
+                    current_width >= minimum_broad_width
+                    and current_width - next_width >= minimum_collapse
+                    and next_width <= round(current_width * 0.48)
+                ):
+                    broad_floor = floor_scan_start + index
+            if broad_floor is None:
+                broad_threshold = max(12, round(broad_width * 0.72))
+                broad_rows = np.flatnonzero(scan_widths >= broad_threshold)
+                if broad_rows.size:
+                    broad_floor = floor_scan_start + int(broad_rows[-1])
+
+        if broad_floor is not None and broad_floor < cropped_height - 1:
+            floor_hardware_core = cv2.dilate(
+                cropped_tight_hardware.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ).astype(bool)
+            collapsed_floor_residue = (
+                (yy > broad_floor)
+                & central_model_columns
+                & (alpha > 0)
+                & ~floor_hardware_core
+                & ~cropped_colored_material
+            )
+            alpha[collapsed_floor_residue] = 0
 
         if strongly_coloured_product:
             # Find the lowest broad row that still has the bag material's
@@ -2235,6 +2834,11 @@ def _prepared_product_cutout(
                 float(np.median(cropped_value[material_sample]))
                 if np.any(material_sample)
                 else 180.0
+            )
+            median_material_saturation = (
+                float(np.median(cropped_saturation[material_sample]))
+                if np.any(material_sample)
+                else 40.0
             )
             material_value_floor = float(np.clip(
                 median_material_value * 0.78,
@@ -2252,6 +2856,10 @@ def _prepared_product_cutout(
                     central_columns[row]
                     & (alpha[row] >= 200)
                     & ~cropped_gold_protection[row]
+                    & (
+                        cropped_saturation[row]
+                        >= max(10.0, median_material_saturation * 0.34)
+                    )
                 )
                 row_values = cropped_value[row][row_material]
                 reliable_row = (
@@ -2272,6 +2880,7 @@ def _prepared_product_cutout(
                     & central_columns
                     & (alpha > 0)
                     & ~verified_floor_hardware
+                    & ~cropped_colored_material
                 )
                 alpha[shadow_below_floor] = 0
 
@@ -2298,6 +2907,7 @@ def _prepared_product_cutout(
                         & (alpha > 0)
                         & (refined_value < material_value_floor + 12)
                         & ~tight_floor_hardware
+                        & ~cropped_colored_material
                     )
                     alpha[connected_contact_shadow] = 0
 
@@ -2321,6 +2931,7 @@ def _prepared_product_cutout(
                 | (strongly_coloured_product & (refined_value <= 115))
             )
             & ~verified_floor_hardware
+            & ~cropped_colored_material
         )
         floor_component_count, floor_labels = cv2.connectedComponents(
             floor_candidate.astype(np.uint8),
@@ -2330,6 +2941,29 @@ def _prepared_product_cutout(
             component_pixels = floor_labels == component
             if np.any(component_pixels & transparent_neighbour):
                 alpha[component_pixels] = 0
+
+        # Preserve the first-version coloured lower edge. It uses model
+        # confidence only as a soft alpha cap and does not invent a new body
+        # contour, which avoids cutting real piping on varied bag shapes.
+        if strongly_coloured_product:
+            coloured_floor_band = (
+                (yy >= round(cropped_height * 0.88))
+                & (cropped_saturation >= 28)
+                & (cropped_lab_distance >= 14)
+                & (alpha > 0)
+                & ~verified_floor_hardware
+            )
+            confidence_alpha = np.round(
+                np.clip(
+                    (cropped_model_matte - 0.80) / 0.10,
+                    0.0,
+                    1.0,
+                ) * 255.0
+            ).astype(np.uint8)
+            alpha[coloured_floor_band] = np.minimum(
+                alpha[coloured_floor_band],
+                confidence_alpha[coloured_floor_band],
+            )
 
     component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
         (alpha > 8).astype(np.uint8),
@@ -2363,6 +2997,9 @@ def _prepared_product_cutout(
                     & (cropped_value >= 110)
                 )[component_pixels]
             ))
+            component_colored_fraction = float(np.mean(
+                cropped_colored_material[component_pixels]
+            ))
             central_dark_floor = (
                 not dark_product
                 and component_top >= cropped_mask.shape[0] * 0.90
@@ -2375,6 +3012,7 @@ def _prepared_product_cutout(
                 and component_height <= max(8, cropped_mask.shape[0] // 55)
                 and cropped_mask.shape[1] * 0.20 <= component_center_x <= cropped_mask.shape[1] * 0.80
                 and component_authentic_gold_fraction < 0.35
+                and component_colored_fraction < 0.20
             )
             if (
                 central_shallow_floor
@@ -2389,8 +3027,640 @@ def _prepared_product_cutout(
             ):
                 alpha[component_pixels] = 0
 
+    if model_matte is not None and not dark_product and strongly_coloured_product:
+        contour_hardware_seed = (
+            (
+                cropped_gold_detail
+                & (cropped_model_matte >= 0.78)
+                & (cropped_value >= 110)
+            )
+            | (
+                cropped_strict_silver_hardware
+                & (cropped_model_matte >= 0.78)
+                & (cropped_value >= 70)
+                & (cropped_gradient >= 22)
+            )
+        )
+        contour_hardware = cv2.dilate(
+            contour_hardware_seed.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        ).astype(bool) & (cropped_model_matte >= 0.72)
+
+        # Chain hardware often has leather or fabric threaded through the
+        # metal links. Protect that narrow, connected material together with
+        # the confirmed metal core. Expansion is geodesic and colour-gated:
+        # it can follow a thin blue/black strap but cannot spread into a broad
+        # neutral floor shadow or across the bag body.
+        chain_material = (
+            (alpha > 8)
+            & (cropped_model_matte >= 0.72)
+            & (cropped_lab_distance >= 12)
+            & (
+                (cropped_saturation >= 26)
+                | (cropped_value <= 175)
+            )
+        )
+        chain_linked_detail = contour_hardware.copy()
+        chain_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        for _ in range(6):
+            expanded_detail = cv2.dilate(
+                chain_linked_detail.astype(np.uint8),
+                chain_kernel,
+                iterations=1,
+            ).astype(bool)
+            next_detail = chain_linked_detail | (expanded_detail & chain_material)
+            if np.array_equal(next_detail, chain_linked_detail):
+                break
+            chain_linked_detail = next_detail
+        contour_hardware = chain_linked_detail
+        contour_central_lane = (
+            (xx >= round(cropped_width * 0.08))
+            & (xx < round(cropped_width * 0.92))
+        )
+        contour_hardware_widths = np.count_nonzero(
+            contour_hardware & contour_central_lane,
+            axis=1,
+        )
+        overbroad_hardware_rows = (
+            (np.arange(cropped_height) >= round(cropped_height * 0.72))
+            & (contour_hardware_widths >= round(cropped_width * 0.50))
+        )
+        if np.any(overbroad_hardware_rows):
+            contour_hardware[
+                overbroad_hardware_rows[:, None] & contour_central_lane
+            ] = False
+        # Keep the contour/hardware analysis available for the final bottom
+        # residue pass, but do not reshape the body here. The historical
+        # global-floor algorithm is materially better for curved and square
+        # coloured bags than a second per-body contour cut.
+
+    if float(np.mean(source_alpha < 250)) <= 0.01:
+        # Later anti-aliasing and floor-shadow passes may give a faint alpha
+        # back to pixels already confirmed as the connected white backdrop.
+        # White-background removal is the first, authoritative stage: keep
+        # those pixels transparent before the established edge algorithm runs.
+        cropped_locked_white_background = locked_white_background[
+            top:bottom,
+            left:right,
+        ]
+        alpha[cropped_locked_white_background] = 0
+
+        # Do this last, after the established silhouette and floor-shadow
+        # rules. JPEG compression and antialiasing mix several rings of studio
+        # white into handles, zips, chains and fittings. Merely lowering their
+        # alpha leaves a visible white outline on a grey/dark preview.
+        #
+        # Estimate the real foreground colour from the nearest source pixel
+        # that is safely different from the white backdrop, then solve
+        #   observed = alpha * foreground + (1-alpha) * background
+        # for alpha. This is deliberately limited to the outer edge band and
+        # can only lower alpha. Ivory/white products have too little colour
+        # separation to satisfy the denominator test, so their structure is
+        # left to the model and the established cutout logic.
+        final_foreground = alpha > 8
+        final_inside = cv2.distanceTransform(
+            final_foreground.astype(np.uint8),
+            cv2.DIST_L2,
+            3,
+        )
+        final_boundary = final_foreground & (final_inside <= 18.0)
+        neutral_white_fringe = (
+            (cropped_lab_distance <= 46)
+            & (cropped_saturation <= 22)
+            & (cropped_value >= 214)
+        )
+        colour_seed = (
+            (alpha >= 200)
+            & (cropped_lab_distance >= 14)
+            & ~neutral_white_fringe
+            & (
+                (cropped_saturation >= 12)
+                | (cropped_value <= 236)
+            )
+        )
+        if np.any(colour_seed) and np.any(final_boundary):
+            _, nearest_labels = cv2.distanceTransformWithLabels(
+                (~colour_seed).astype(np.uint8),
+                cv2.DIST_L2,
+                5,
+                labelType=cv2.DIST_LABEL_PIXEL,
+            )
+            seed_colours = cropped_rgb[colour_seed]
+            nearest_indices = np.clip(
+                nearest_labels.astype(np.int64) - 1,
+                0,
+                len(seed_colours) - 1,
+            )
+            nearest_colours = seed_colours[nearest_indices]
+
+            backdrop = background_color[None, None, :]
+            denominator = backdrop - nearest_colours
+            numerator = backdrop - cropped_rgb
+            valid_channels = denominator >= 8.0
+            channel_alpha = np.divide(
+                numerator,
+                np.maximum(denominator, 1.0),
+                out=np.ones_like(cropped_rgb, dtype=np.float32),
+                where=valid_channels,
+            )
+            channel_alpha = np.clip(channel_alpha, 0.0, 1.0)
+            informative_channels = np.count_nonzero(valid_channels, axis=2)
+            sorted_channel_alpha = np.sort(
+                np.where(valid_channels, channel_alpha, np.nan),
+                axis=2,
+            )
+            estimated_alpha = np.nanmedian(sorted_channel_alpha, axis=2)
+            estimated_alpha = np.nan_to_num(estimated_alpha, nan=1.0)
+            # Specular gold/silver highlights can have only one useful colour
+            # channel. Keep the conservative maximum only on hardware already
+            # verified before background removal; use the median elsewhere so
+            # one contaminated channel cannot preserve a white halo.
+            hardware_channel_alpha = np.max(
+                np.where(valid_channels, channel_alpha, 0.0),
+                axis=2,
+            )
+            estimated_alpha[cropped_tight_hardware] = hardware_channel_alpha[
+                cropped_tight_hardware
+            ]
+            observed_background_distance = np.linalg.norm(
+                cropped_rgb - backdrop,
+                axis=2,
+            )
+            seed_background_distance = np.linalg.norm(
+                nearest_colours - backdrop,
+                axis=2,
+            )
+            white_mixed_edge = (
+                final_boundary
+                & (informative_channels >= 2)
+                & (seed_background_distance >= 14.0)
+                & ~cropped_tight_hardware
+                & (
+                    (observed_background_distance <= seed_background_distance * 0.985)
+                    | (cropped_lab_distance <= 34)
+                )
+            )
+            old_alpha = alpha.astype(np.float32) / 255.0
+            solved_alpha = np.clip(estimated_alpha, 0.0, 1.0)
+            new_alpha = old_alpha.copy()
+            new_alpha[white_mixed_edge] = np.minimum(
+                old_alpha[white_mixed_edge],
+                solved_alpha[white_mixed_edge],
+            )
+
+            # Reconstruct straight (unassociated) edge colour so the grey
+            # checker preview cannot reveal the original white studio fringe.
+            reconstruct = white_mixed_edge & (new_alpha > 0.025)
+            recovered_colour = (
+                cropped_rgb
+                - backdrop * (1.0 - new_alpha[:, :, None])
+            ) / np.maximum(new_alpha[:, :, None], 0.04)
+            recovered_colour = np.clip(recovered_colour, 0, 255)
+            confidence = np.clip(
+                (new_alpha - 0.03) / 0.55,
+                0.0,
+                1.0,
+            )[:, :, None]
+            clean_colour = (
+                nearest_colours * (1.0 - confidence)
+                + recovered_colour * confidence
+            )
+            cropped_rgb[reconstruct] = clean_colour[reconstruct]
+            alpha = np.round(new_alpha * 255.0).astype(np.uint8)
+            alpha[white_mixed_edge & (new_alpha <= 0.025)] = 0
+
+        # A verified silver seed has model support, strong local contrast and
+        # is already excluded from the connected white studio background.
+        # Keep that metal core opaque after floor/fringe cleanup; only the
+        # undilated seed is restored, so neighbouring white pixels stay clear.
+        if model_matte is not None and np.any(cropped_strict_silver_hardware):
+            silver_seed_alpha = np.round(
+                np.clip(model_matte[top:bottom, left:right], 0.0, 1.0) * 255.0
+            ).astype(np.uint8)
+            alpha[cropped_strict_silver_hardware] = np.maximum(
+                alpha[cropped_strict_silver_hardware],
+                silver_seed_alpha[cropped_strict_silver_hardware],
+            )
+
     result = Image.fromarray(np.clip(cropped_rgb, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
     result.putalpha(Image.fromarray(alpha, "L"))
+    return result
+
+
+def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
+    """Remove faint floor slivers created when a cutout is resized for export."""
+    result = image.convert("RGBA").copy()
+    rgba = np.asarray(result).copy()
+    alpha = rgba[:, :, 3]
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (alpha > 8).astype(np.uint8),
+        8,
+    )
+    if component_count <= 1:
+        return result
+    largest_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    main_left = int(stats[largest_component, cv2.CC_STAT_LEFT])
+    main_top = int(stats[largest_component, cv2.CC_STAT_TOP])
+    main_width = int(stats[largest_component, cv2.CC_STAT_WIDTH])
+    main_height = int(stats[largest_component, cv2.CC_STAT_HEIGHT])
+    main_area = int(stats[largest_component, cv2.CC_STAT_AREA])
+    central_left = main_left + round(main_width * 0.12)
+    central_right = main_left + main_width - round(main_width * 0.12)
+    product_span_left = main_left - round(main_width * 0.02)
+    product_span_right = main_left + main_width + round(main_width * 0.02)
+    lower_start = main_top + round(main_height * 0.72)
+    maximum_height = max(5, result.height // 150)
+    maximum_area = max(160, round(main_area * 0.002))
+
+    changed = False
+    for component in range(1, component_count):
+        if component == largest_component:
+            continue
+        left = int(stats[component, cv2.CC_STAT_LEFT])
+        top = int(stats[component, cv2.CC_STAT_TOP])
+        width = int(stats[component, cv2.CC_STAT_WIDTH])
+        height = int(stats[component, cv2.CC_STAT_HEIGHT])
+        area = int(stats[component, cv2.CC_STAT_AREA])
+        center_x = left + width / 2
+        component_pixels = labels == component
+        mean_alpha = float(np.mean(alpha[component_pixels]))
+        if (
+            top >= lower_start
+            and height <= maximum_height
+            and area <= maximum_area
+            and product_span_left <= center_x <= product_span_right
+            and mean_alpha < 190
+        ):
+            alpha[component_pixels] = 0
+            changed = True
+
+    # A large contact shadow can remain attached to a woven or pale bag and is
+    # therefore part of the largest component. Detect the single row where a
+    # broad, opaque product base abruptly collapses into a much narrower floor
+    # strip. Only apply the cut when the removable region is substantial; this
+    # keeps the established pink/blue behaviour, where the few lower pixels
+    # belong to a real chain or antialiased curved base.
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (alpha > 8).astype(np.uint8),
+        8,
+    )
+    if component_count > 1:
+        largest_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        main_left = int(stats[largest_component, cv2.CC_STAT_LEFT])
+        main_top = int(stats[largest_component, cv2.CC_STAT_TOP])
+        main_width = int(stats[largest_component, cv2.CC_STAT_WIDTH])
+        main_height = int(stats[largest_component, cv2.CC_STAT_HEIGHT])
+        main_area = int(stats[largest_component, cv2.CC_STAT_AREA])
+        central_left = main_left + round(main_width * 0.10)
+        central_right = main_left + main_width - round(main_width * 0.10)
+        scan_start = main_top + round(main_height * 0.58)
+        main_pixels = labels == largest_component
+        hsv = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2HSV)
+        yy, xx = np.indices(alpha.shape)
+        material_sample = (
+            main_pixels
+            & (yy >= main_top + round(main_height * 0.30))
+            & (yy <= main_top + round(main_height * 0.72))
+            & (xx >= central_left)
+            & (xx < central_right)
+        )
+        median_material_value = (
+            float(np.median(hsv[:, :, 2][material_sample]))
+            if np.any(material_sample)
+            else 255.0
+        )
+        median_material_saturation = (
+            float(np.median(hsv[:, :, 1][material_sample]))
+            if np.any(material_sample)
+            else 0.0
+        )
+        row_widths = np.count_nonzero(
+            (alpha[:, central_left:central_right] >= 128)
+            & main_pixels[:, central_left:central_right],
+            axis=1,
+        )
+        scan_widths = row_widths[scan_start:main_top + main_height]
+        broad_width = int(np.max(scan_widths)) if scan_widths.size else 0
+        floor_row: int | None = None
+        strongest_width_drop = 0
+        for index in range(max(0, scan_widths.size - 1)):
+            current_width = int(scan_widths[index])
+            next_width = int(scan_widths[index + 1])
+            width_drop = current_width - next_width
+            if (
+                current_width >= max(18, round(broad_width * 0.42))
+                and width_drop >= max(10, round(broad_width * 0.26))
+                and next_width <= round(current_width * 0.48)
+                and width_drop > strongest_width_drop
+            ):
+                floor_row = scan_start + index
+                strongest_width_drop = width_drop
+
+        if floor_row is not None and median_material_value > 105:
+            rgb = rgba[:, :, :3]
+            red = rgb[:, :, 0].astype(np.int16)
+            green = rgb[:, :, 1].astype(np.int16)
+            blue = rgb[:, :, 2].astype(np.int16)
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            gradient = cv2.magnitude(
+                cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+                cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+            )
+            gold_core = (
+                (hsv[:, :, 0] >= 7)
+                & (hsv[:, :, 0] <= 42)
+                & (hsv[:, :, 1] >= 90)
+                & (hsv[:, :, 2] >= 105)
+                & (red >= blue + 10)
+                & (green >= blue + 5)
+            )
+            silver_core = (
+                (hsv[:, :, 1] <= 24)
+                & (hsv[:, :, 2] >= 55)
+                & (hsv[:, :, 2] <= 235)
+                & (gradient >= 45)
+            )
+            lower_hardware_band = (
+                (yy >= floor_row - 12)
+                & (alpha > 8)
+            )
+            hardware_candidate = cv2.dilate(
+                ((gold_core | silver_core) & lower_hardware_band).astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=2,
+            ).astype(bool) & lower_hardware_band
+            hardware_count, hardware_labels = cv2.connectedComponents(
+                hardware_candidate.astype(np.uint8),
+                8,
+            )
+            floor_hardware = np.zeros_like(hardware_candidate)
+            for component in range(1, hardware_count):
+                component_pixels = hardware_labels == component
+                if np.any(
+                    component_pixels
+                    & ((xx < central_left) | (xx >= central_right))
+                ):
+                    floor_hardware |= component_pixels
+
+            connected_floor_residue = (
+                main_pixels
+                & (yy > floor_row)
+                & (xx >= central_left)
+                & (xx < central_right)
+                & ~floor_hardware
+            )
+            minimum_residue_area = max(600, round(main_area * 0.004))
+            if int(np.count_nonzero(connected_floor_residue)) >= minimum_residue_area:
+                # Near the true base, the product's centre run must keep
+                # tapering inward. White-studio shadows often remain as pale
+                # side runs which separate from that centre run, widen again,
+                # or hang below a nearby fitting. Remove only neutral/bright
+                # pixels outside the centre run. This uses the white-background
+                # invariant and silhouette continuity rather than a bag shape,
+                # colour or SKU-specific crop.
+                taper_start = max(
+                    scan_start,
+                    floor_row - max(18, round(main_height * 0.05)),
+                )
+                body_core_envelope = np.zeros_like(main_pixels)
+                lateral_shadow_runs = np.zeros_like(main_pixels)
+                product_center_x = main_left + main_width / 2
+                verified_floor_metal = gold_core | (
+                    silver_core
+                    & (blue >= red - 2)
+                )
+                maximum_shadow_gap = max(12, round(main_width * 0.08))
+                for row in range(taper_start, floor_row + 1):
+                    row_columns = np.flatnonzero(
+                        (alpha[row] >= 128)
+                        & main_pixels[row]
+                        & (xx[row] >= central_left)
+                        & (xx[row] < central_right)
+                    )
+                    if not row_columns.size:
+                        continue
+                    row_runs: list[tuple[int, int]] = []
+                    run_start = previous_column = int(row_columns[0])
+                    for column_value in row_columns[1:]:
+                        column = int(column_value)
+                        if column > previous_column + 1:
+                            row_runs.append((run_start, previous_column))
+                            run_start = column
+                        previous_column = column
+                    row_runs.append((run_start, previous_column))
+                    centre_run = min(
+                        row_runs,
+                        key=lambda run: (
+                            0
+                            if run[0] <= product_center_x <= run[1]
+                            else min(
+                                abs(product_center_x - run[0]),
+                                abs(product_center_x - run[1]),
+                            )
+                        ),
+                    )
+                    body_core_envelope[row, centre_run[0]:centre_run[1] + 1] = True
+                    for run in row_runs:
+                        if run == centre_run:
+                            continue
+                        if run[1] < centre_run[0]:
+                            run_gap = centre_run[0] - run[1] - 1
+                        else:
+                            run_gap = run[0] - centre_run[1] - 1
+                        if run_gap > maximum_shadow_gap:
+                            continue
+                        run_slice = slice(run[0], run[1] + 1)
+                        run_pixels = (
+                            main_pixels[row, run_slice]
+                            & (alpha[row, run_slice] > 8)
+                        )
+                        if not np.any(run_pixels):
+                            continue
+                        median_saturation = float(np.median(
+                            hsv[row, run_slice, 1][run_pixels]
+                        ))
+                        median_value = float(np.median(
+                            hsv[row, run_slice, 2][run_pixels]
+                        ))
+                        metal_fraction = float(np.mean(
+                            verified_floor_metal[row, run_slice][run_pixels]
+                        ))
+                        if (
+                            median_saturation <= 60
+                            and median_value >= 90
+                            and metal_fraction < 0.18
+                        ):
+                            lateral_shadow_runs[row, run_slice] |= run_pixels
+
+                background_like_floor = (
+                    (hsv[:, :, 1] <= 45)
+                    & (hsv[:, :, 2] >= 165)
+                )
+                lateral_floor_residue = (
+                    lateral_shadow_runs
+                    | (
+                        main_pixels
+                        & (yy >= taper_start)
+                        & (yy <= floor_row)
+                        & ~body_core_envelope
+                        & background_like_floor
+                        & ~verified_floor_metal
+                    )
+                )
+                alpha[lateral_floor_residue] = 0
+                alpha[connected_floor_residue] = 0
+                changed = True
+
+        # Dark products need a relative test: their white-studio shadow can be
+        # much brighter than the material even when its absolute value is not
+        # high enough for the pale/colourful branch above. Limit this cleanup
+        # to the detected collapse row and below, and keep saturated gold plus
+        # cool-channel silver cores. No bag class or fixed crop is involved.
+        if floor_row is not None and median_material_value <= 105:
+            rgb = rgba[:, :, :3]
+            red = rgb[:, :, 0].astype(np.int16)
+            green = rgb[:, :, 1].astype(np.int16)
+            blue = rgb[:, :, 2].astype(np.int16)
+            dark_gold_core = (
+                (hsv[:, :, 0] >= 7)
+                & (hsv[:, :, 0] <= 42)
+                & (hsv[:, :, 1] >= 90)
+                & (hsv[:, :, 2] >= 105)
+                & (red >= blue + 10)
+                & (green >= blue + 5)
+            )
+            dark_silver_core = (
+                (hsv[:, :, 1] <= 24)
+                & (hsv[:, :, 2] >= 55)
+                & (hsv[:, :, 2] <= 235)
+                & (blue >= red + 2)
+            )
+            relative_shadow_value = max(
+                75,
+                round(median_material_value * 1.70),
+            )
+            dark_floor_residue = (
+                main_pixels
+                & (yy >= floor_row)
+                & (hsv[:, :, 1] <= 65)
+                & (hsv[:, :, 2] >= relative_shadow_value)
+                & ~dark_gold_core
+                & ~dark_silver_core
+            )
+            minimum_dark_residue = max(100, round(main_area * 0.0005))
+            if int(np.count_nonzero(dark_floor_residue)) >= minimum_dark_residue:
+                alpha[dark_floor_residue] = 0
+                changed = True
+
+        # Confidence feathering can leave colour-cast studio shadow attached
+        # by a one-pixel bridge. On genuinely coloured products, clean the
+        # lowest ten percent using chroma and value relative to that product's
+        # own material sample. Pale/white and dark products do not enter this
+        # rule; verified gold/cool-silver pixels are explicitly retained.
+        if (
+            median_material_value > 105
+            and median_material_saturation >= 28
+        ):
+            rgb = rgba[:, :, :3]
+            red = rgb[:, :, 0].astype(np.int16)
+            green = rgb[:, :, 1].astype(np.int16)
+            blue = rgb[:, :, 2].astype(np.int16)
+            coloured_floor_gold = (
+                (hsv[:, :, 0] >= 7)
+                & (hsv[:, :, 0] <= 42)
+                & (hsv[:, :, 1] >= 90)
+                & (hsv[:, :, 2] >= 105)
+                & (red >= blue + 10)
+                & (green >= blue + 5)
+            )
+            coloured_floor_silver = (
+                (hsv[:, :, 1] <= 24)
+                & (hsv[:, :, 2] >= 55)
+                & (blue >= red + 2)
+            )
+            coloured_floor_hardware = cv2.dilate(
+                (coloured_floor_gold | coloured_floor_silver).astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=1,
+            ).astype(bool)
+
+            # Judge chroma relative to the product itself. A fixed cutoff
+            # mistakes pastel leather for a neutral studio shadow, while a
+            # relative cutoff still removes grey/colour-cast residue from
+            # both strongly coloured fabric and lightly coloured leather.
+            opaque_chroma_limit = float(np.clip(
+                median_material_saturation * 0.58,
+                18,
+                40,
+            ))
+            translucent_chroma_limit = float(np.clip(
+                median_material_saturation * 0.90,
+                24,
+                60,
+            ))
+            cast_shadow_value_limit = median_material_value * 0.76
+            cast_shadow_chroma_limit = float(np.clip(
+                median_material_saturation * 1.35,
+                36,
+                70,
+            ))
+            low_chroma_floor_residue = (
+                main_pixels
+                & (yy >= main_top + round(main_height * 0.90))
+                & (alpha > 8)
+                & (
+                    (
+                        (alpha >= 230)
+                        & (hsv[:, :, 1] <= opaque_chroma_limit)
+                    )
+                    | (
+                        (alpha < 230)
+                        & (hsv[:, :, 1] <= translucent_chroma_limit)
+                    )
+                    | (
+                        (hsv[:, :, 2] <= cast_shadow_value_limit)
+                        & (hsv[:, :, 1] <= cast_shadow_chroma_limit)
+                    )
+                )
+                & ~coloured_floor_hardware
+            )
+            alpha[low_chroma_floor_residue] = 0
+            if np.any(low_chroma_floor_residue):
+                changed = True
+
+    # Removing an attached shadow can expose tiny antialiased islands which
+    # were connected to the product during the first component pass. Run the
+    # same conservative faint-fragment test once more after that separation.
+    if changed:
+        final_component_count, final_labels, final_stats, _ = cv2.connectedComponentsWithStats(
+            (alpha > 8).astype(np.uint8),
+            8,
+        )
+        if final_component_count > 1:
+            final_largest = 1 + int(np.argmax(final_stats[1:, cv2.CC_STAT_AREA]))
+            for component in range(1, final_component_count):
+                if component == final_largest:
+                    continue
+                left = int(final_stats[component, cv2.CC_STAT_LEFT])
+                top = int(final_stats[component, cv2.CC_STAT_TOP])
+                width = int(final_stats[component, cv2.CC_STAT_WIDTH])
+                height = int(final_stats[component, cv2.CC_STAT_HEIGHT])
+                area = int(final_stats[component, cv2.CC_STAT_AREA])
+                center_x = left + width / 2
+                component_pixels = final_labels == component
+                mean_alpha = float(np.mean(alpha[component_pixels]))
+                if (
+                    top >= lower_start
+                    and height <= maximum_height
+                    and area <= maximum_area
+                    and product_span_left <= center_x <= product_span_right
+                    and mean_alpha < 190
+                ):
+                    alpha[component_pixels] = 0
+
+    if changed:
+        result.putalpha(Image.fromarray(alpha, "L"))
     return result
 
 
