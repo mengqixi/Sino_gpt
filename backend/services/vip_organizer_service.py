@@ -1944,6 +1944,7 @@ def _prepared_product_cutout(
     *,
     _bottom_contour_mode: str = "adaptive",
     _bottom_contour_confidence: float = 0.96,
+    _use_historical_bottom_pipeline: bool | None = None,
 ) -> Image.Image:
     """Create a cleaner export cutout for white/light studio product photos.
 
@@ -1971,6 +1972,9 @@ def _prepared_product_cutout(
     hardware_protection = np.zeros((height, width), dtype=bool)
     pale_body_protection = np.zeros((height, width), dtype=bool)
     pale_opening_background = np.zeros((height, width), dtype=bool)
+    use_historical_bottom_pipeline = bool(
+        _use_historical_bottom_pipeline
+    )
 
     if float(np.mean(source_alpha < 250)) > 0.01:
         mask = source_alpha > 12
@@ -2021,6 +2025,13 @@ def _prepared_product_cutout(
                     or float(np.median(model_subject_distance)) >= 28
                 )
             )
+            if _use_historical_bottom_pipeline is None:
+                # The earlier GitHub floor continuation is cleaner on
+                # coloured and dark products, while the newer protection is
+                # safer for pale/white bags. Select between them only after a
+                # model-supported material classification; the upper
+                # silhouette and hardware path remains shared.
+                use_historical_bottom_pipeline = not pale_product
 
         # Flood only light/neutral pixels connected to an outside edge. This
         # removes the studio backdrop without opening holes inside the bag.
@@ -2482,6 +2493,121 @@ def _prepared_product_cutout(
                 )
                 mask_u8[connected_floor_shadow] = 0
 
+                if use_historical_bottom_pipeline:
+                    # The first GitHub version followed the real coloured
+                    # material down each column before removing a neutral
+                    # studio tail.  It was particularly reliable on curved
+                    # blue/pink bags, so keep it available as a bottom-only
+                    # candidate while the current upper silhouette and
+                    # hardware masks remain unchanged.
+                    sample_saturation = saturation[
+                        sample_top:sample_bottom,
+                        sample_left:sample_right,
+                    ][sample_mask]
+                    if sample_saturation.size:
+                        median_saturation = float(np.median(sample_saturation))
+                        median_value = (
+                            float(np.median(sample_value))
+                            if sample_value.size
+                            else 180.0
+                        )
+                        material_saturation = float(np.clip(
+                            median_saturation * 0.75,
+                            18,
+                            50,
+                        ))
+                        material_value_floor = float(np.clip(
+                            median_value * 0.78,
+                            90,
+                            165,
+                        ))
+                        column_material = mask_u8.astype(bool) & (
+                            (dark_product & (value <= 105))
+                            | gold_detail
+                        )
+                        if median_saturation >= 18:
+                            sample_hue = hue[
+                                sample_top:sample_bottom,
+                                sample_left:sample_right,
+                            ][sample_mask]
+                            sample_hue = sample_hue[
+                                sample_saturation >= material_saturation
+                            ]
+                            if sample_hue.size:
+                                angles = (
+                                    sample_hue.astype(np.float32)
+                                    * (2 * np.pi / 180.0)
+                                )
+                                dominant_hue = (
+                                    np.arctan2(
+                                        np.mean(np.sin(angles)),
+                                        np.mean(np.cos(angles)),
+                                    )
+                                    * 180.0
+                                    / (2 * np.pi)
+                                ) % 180.0
+                                hue_distance = np.abs(
+                                    hue.astype(np.float32) - dominant_hue
+                                )
+                                hue_distance = np.minimum(
+                                    hue_distance,
+                                    180.0 - hue_distance,
+                                )
+                                coloured_material = (
+                                    (saturation >= material_saturation)
+                                    & (hue_distance <= 20)
+                                    & (value >= material_value_floor)
+                                    & (gradient >= 7)
+                                )
+                                column_material |= (
+                                    mask_u8.astype(bool) & coloured_material
+                                )
+                        has_column_material = np.any(
+                            column_material,
+                            axis=0,
+                        )
+                        column_bottoms = (
+                            height
+                            - 1
+                            - np.argmax(column_material[::-1], axis=0)
+                        ).astype(np.int32)
+                        column_bottoms[~has_column_material] = -1
+                        smoothing_width = max(5, min(31, width // 80))
+                        if smoothing_width % 2 == 0:
+                            smoothing_width += 1
+                        padded_bottoms = np.pad(
+                            column_bottoms,
+                            smoothing_width // 2,
+                            mode="edge",
+                        )
+                        column_bottoms = np.median(
+                            np.lib.stride_tricks.sliding_window_view(
+                                padded_bottoms,
+                                smoothing_width,
+                            ),
+                            axis=1,
+                        ).astype(np.int32)
+                        below_column_material = (
+                            (column_bottoms[None, :] >= 0)
+                            & (
+                                yy
+                                > column_bottoms[None, :]
+                                + max(1, height // 800)
+                            )
+                        )
+                        neutral_column_tail = (
+                            (yy >= floor_start)
+                            & below_column_material
+                            & mask_u8.astype(bool)
+                            & ~(
+                                gold_detail
+                                | hardware_protection
+                                | (dark_product & dark_detail)
+                                | outside_colored_detail
+                            )
+                        )
+                        mask_u8[neutral_column_tail] = 0
+
             # Shadows form broad, shallow islands under the product. Remove
             # those islands while retaining narrow chain/hardware components.
             tail = mask_u8.copy()
@@ -2675,7 +2801,12 @@ def _prepared_product_cutout(
             & ~cropped_locked_white_background
         )
         structure_rows, structure_columns = np.where(geometry_structure)
-        if structure_rows.size and structure_columns.size and not pale_product:
+        if (
+            structure_rows.size
+            and structure_columns.size
+            and not pale_product
+            and not use_historical_bottom_pipeline
+        ):
             object_top = int(structure_rows.min())
             object_bottom = int(structure_rows.max())
             object_left = int(structure_columns.min())
@@ -2764,7 +2895,11 @@ def _prepared_product_cutout(
         for row in range(round(cropped_height * 0.68), cropped_height):
             if int(np.count_nonzero(confident_structure[row])) >= minimum_structure_width:
                 model_floor = row
-        if model_floor is not None and model_floor < cropped_height - 2:
+        if (
+            not use_historical_bottom_pipeline
+            and model_floor is not None
+            and model_floor < cropped_height - 2
+        ):
             low_confidence_floor_residue = (
                 (yy > model_floor)
                 & central_model_columns
@@ -2808,7 +2943,11 @@ def _prepared_product_cutout(
                 if broad_rows.size:
                     broad_floor = floor_scan_start + int(broad_rows[-1])
 
-        if broad_floor is not None and broad_floor < cropped_height - 1:
+        if (
+            not use_historical_bottom_pipeline
+            and broad_floor is not None
+            and broad_floor < cropped_height - 1
+        ):
             floor_hardware_core = cv2.dilate(
                 cropped_tight_hardware.astype(np.uint8),
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
@@ -3411,7 +3550,18 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 & ~floor_hardware
             )
             minimum_residue_area = max(600, round(main_area * 0.004))
-            if int(np.count_nonzero(connected_floor_residue)) >= minimum_residue_area:
+            has_substantial_floor_residue = (
+                int(np.count_nonzero(connected_floor_residue))
+                >= minimum_residue_area
+            )
+            has_confident_terminal_collapse = (
+                strongest_width_drop
+                >= max(20, round(broad_width * 0.40))
+            )
+            if (
+                has_substantial_floor_residue
+                or has_confident_terminal_collapse
+            ):
                 # Near the true base, the product's centre run must keep
                 # tapering inward. White-studio shadows often remain as pale
                 # side runs which separate from that centre run, widen again,
@@ -3430,13 +3580,12 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     silver_core
                     & (blue >= red - 2)
                 )
-                maximum_shadow_gap = max(12, round(main_width * 0.08))
                 for row in range(taper_start, floor_row + 1):
                     row_columns = np.flatnonzero(
                         (alpha[row] >= 128)
                         & main_pixels[row]
-                        & (xx[row] >= central_left)
-                        & (xx[row] < central_right)
+                        & (xx[row] >= main_left)
+                        & (xx[row] < main_left + main_width)
                     )
                     if not row_columns.size:
                         continue
@@ -3463,12 +3612,6 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     body_core_envelope[row, centre_run[0]:centre_run[1] + 1] = True
                     for run in row_runs:
                         if run == centre_run:
-                            continue
-                        if run[1] < centre_run[0]:
-                            run_gap = centre_run[0] - run[1] - 1
-                        else:
-                            run_gap = run[0] - centre_run[1] - 1
-                        if run_gap > maximum_shadow_gap:
                             continue
                         run_slice = slice(run[0], run[1] + 1)
                         run_pixels = (
@@ -3509,7 +3652,140 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     )
                 )
                 alpha[lateral_floor_residue] = 0
-                alpha[connected_floor_residue] = 0
+                if has_substantial_floor_residue:
+                    alpha[connected_floor_residue] = 0
+
+                # Resampling can leave a dark/neutral one-pixel tail below a
+                # real coloured base or piping. Follow the last trustworthy
+                # material pixel independently in each central column, then
+                # clear only non-material pixels at or below that envelope.
+                # This works for both curved bases and flat bucket-bag piping
+                # without synthesising a new bottom contour.
+                material_chroma_floor = float(np.clip(
+                    median_material_saturation * 0.55,
+                    18,
+                    55,
+                ))
+                material_value_floor = max(
+                    55.0,
+                    median_material_value * 0.35,
+                )
+                lower_material_core = (
+                    main_pixels
+                    & (xx >= central_left)
+                    & (xx < central_right)
+                    & (yy >= main_top + round(main_height * 0.55))
+                    & (hsv[:, :, 1] >= material_chroma_floor)
+                    & (hsv[:, :, 2] >= material_value_floor)
+                )
+                has_lower_material = np.any(
+                    lower_material_core,
+                    axis=0,
+                )
+                material_bottoms = (
+                    alpha.shape[0]
+                    - 1
+                    - np.argmax(lower_material_core[::-1], axis=0)
+                ).astype(np.int32)
+                material_bottoms[~has_lower_material] = -1
+                smoothing_width = max(
+                    5,
+                    min(17, main_width // 45),
+                )
+                if smoothing_width % 2 == 0:
+                    smoothing_width += 1
+                padded_bottoms = np.pad(
+                    material_bottoms,
+                    smoothing_width // 2,
+                    mode="edge",
+                )
+                smoothed_material_bottoms = np.median(
+                    np.lib.stride_tricks.sliding_window_view(
+                        padded_bottoms,
+                        smoothing_width,
+                    ),
+                    axis=1,
+                ).astype(np.int32)
+                below_material_envelope = (
+                    (smoothed_material_bottoms[None, :] >= 0)
+                    & (yy >= smoothed_material_bottoms[None, :])
+                )
+                non_material_shadow = (
+                    main_pixels
+                    & (xx >= central_left)
+                    & (xx < central_right)
+                    & below_material_envelope
+                    & ~lower_material_core
+                    & (
+                        (
+                            hsv[:, :, 1]
+                            < material_chroma_floor * 1.10
+                        )
+                        | (
+                            (hsv[:, :, 2] < median_material_value * 0.50)
+                            & (
+                                hsv[:, :, 1]
+                                < median_material_saturation * 0.90
+                            )
+                        )
+                    )
+                    & ~verified_floor_metal
+                )
+                alpha[non_material_shadow] = 0
+
+                # On a confidently terminated light/coloured base, remove
+                # only the very dark terminal flecks. Preserve a saturated
+                # brown/coloured piping core as well as verified hardware.
+                if (
+                    has_confident_terminal_collapse
+                    and median_material_saturation >= 28
+                ):
+                    tight_terminal_metal = cv2.dilate(
+                        verified_floor_metal.astype(np.uint8),
+                        cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE,
+                            (3, 3),
+                        ),
+                        iterations=1,
+                    ).astype(bool)
+                    side_neutral_shadow = (
+                        main_pixels
+                        & (
+                            yy
+                            >= main_top + round(main_height * 0.90)
+                        )
+                        & (
+                            (xx < central_left)
+                            | (xx >= central_right)
+                        )
+                        & (hsv[:, :, 1] <= 50)
+                        & (hsv[:, :, 2] >= 70)
+                        & ~tight_terminal_metal
+                    )
+                    alpha[side_neutral_shadow] = 0
+
+                    saturated_floor_core = (
+                        (hsv[:, :, 1] >= max(
+                            75.0,
+                            median_material_saturation * 0.85,
+                        ))
+                        & (hsv[:, :, 2] >= 45)
+                    )
+                    terminal_dark_shadow = (
+                        main_pixels
+                        & (
+                            yy
+                            >= floor_row - max(
+                                2,
+                                round(main_height * 0.01),
+                            )
+                        )
+                        & (yy <= floor_row)
+                        & (hsv[:, :, 2] < 55)
+                        & ~saturated_floor_core
+                        & ~verified_floor_metal
+                    )
+                    alpha[terminal_dark_shadow] = 0
                 changed = True
 
         # Dark products need a relative test: their white-studio shadow can be

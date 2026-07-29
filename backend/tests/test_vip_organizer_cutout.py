@@ -371,6 +371,28 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[660, 520, 3]), 0)
         self.assertEqual(int(cleaned[660, 120, 3]), 255)
 
+    def test_export_cleanup_follows_bucket_piping_and_clears_floor_shadow(self):
+        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        # A broad, light woven body ends in saturated brown piping. The
+        # neutral studio shadow is connected and wider than that real base,
+        # so a simple component or last-row crop cannot distinguish them.
+        draw.rectangle((180, 170, 620, 650), fill=(190, 170, 135, 255))
+        draw.rectangle((190, 651, 610, 656), fill=(92, 55, 35, 255))
+        draw.rectangle((150, 657, 650, 663), fill=(38, 35, 34, 210))
+        # Side hardware stays opaque while its neutral cast shadow is removed.
+        draw.line((620, 625, 660, 625), fill=(213, 173, 85, 255), width=5)
+        draw.rectangle((650, 615, 670, 645), fill=(213, 173, 85, 255))
+        draw.rectangle((655, 646, 668, 660), fill=(180, 178, 175, 210))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[645, 400, 3]), 255)
+        self.assertEqual(int(cleaned[653, 400, 3]), 255)
+        self.assertEqual(int(cleaned[660, 400, 3]), 0)
+        self.assertEqual(int(cleaned[630, 660, 3]), 255)
+        self.assertEqual(int(cleaned[655, 660, 3]), 0)
+
     def test_vip_30_export_is_800_square_and_within_required_file_size(self):
         image = Image.new("RGBA", (1100, 900), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
