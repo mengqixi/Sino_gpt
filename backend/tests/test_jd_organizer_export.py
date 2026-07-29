@@ -206,6 +206,22 @@ def test_jd_logo_detail_manual_offset_moves_the_image_horizontally():
     assert _dark_pixel_bbox(moved_right) == (500, 300, 700, 500)
 
 
+def test_jd_model_manual_offset_moves_horizontally_but_keeps_vertical_clamp():
+    source = Image.new("RGB", (800, 800), "white")
+    ImageDraw.Draw(source).rectangle((300, 300, 499, 499), fill="black")
+    with patch.object(service, "_draw_jd_elle_logo"):
+        automatic = service._jd_model_page(source, (800, 800), None, with_logo=True)
+        moved = service._jd_model_page(
+            source,
+            (800, 800),
+            {"offset_x": -0.25, "offset_y": -0.25},
+            with_logo=True,
+        )
+
+    assert _dark_pixel_bbox(automatic) == (300, 300, 500, 500)
+    assert _dark_pixel_bbox(moved) == (100, 300, 300, 500)
+
+
 def test_jd_interior_detail_fills_the_canvas_without_white_border():
     source = Image.new("RGB", (800, 800), (181, 34, 38))
     with patch.object(service, "_load_image", return_value=source):
@@ -430,6 +446,45 @@ def test_vip_info_rulers_start_with_one_shared_gap():
     assert height_gap == 34
     assert length_gap == 34
     assert width_gap == 34
+
+
+def test_vip_info_width_ruler_stays_rigid_after_repeated_adjustments():
+    body = (360.0, 280.0, 560.0, 470.0)
+    geometry = service._info_width_ruler_geometry(
+        body,
+        {
+            "product_ruler_group_scale": 1.18,
+            "product_ruler_group_offset_x": -0.12,
+            "product_ruler_group_offset_y": 0.09,
+            "width_ruler_scale": 1.7,
+            "width_ruler_offset_x": 0.16,
+            "width_ruler_offset_y": -0.11,
+        },
+        product_center=(500.0, 390.0),
+    )
+    main, start_cap, end_cap = geometry["segments"]
+    start_cap_center = (
+        (start_cap[0][0] + start_cap[1][0]) / 2,
+        (start_cap[0][1] + start_cap[1][1]) / 2,
+    )
+    end_cap_center = (
+        (end_cap[0][0] + end_cap[1][0]) / 2,
+        (end_cap[0][1] + end_cap[1][1]) / 2,
+    )
+    main_center = (
+        (main[0][0] + main[1][0]) / 2,
+        (main[0][1] + main[1][1]) / 2,
+    )
+    text_distance = (
+        (geometry["text"][0] - main_center[0]) ** 2
+        + (geometry["text"][1] - main_center[1]) ** 2
+    ) ** 0.5
+
+    assert abs(start_cap_center[0] - main[0][0]) <= 1
+    assert abs(start_cap_center[1] - main[0][1]) <= 1
+    assert abs(end_cap_center[0] - main[1][0]) <= 1
+    assert abs(end_cap_center[1] - main[1][1]) <= 1
+    assert abs(text_distance - 26) <= 1
 
 
 def test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product():
@@ -981,6 +1036,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_jd_logo_detail_manual_horizontal_movement(self):
         test_jd_logo_detail_manual_offset_moves_the_image_horizontally()
+
+    def test_jd_model_manual_horizontal_movement(self):
+        test_jd_model_manual_offset_moves_horizontally_but_keeps_vertical_clamp()
 
     def test_jd_interior_detail_is_full_bleed(self):
         test_jd_interior_detail_fills_the_canvas_without_white_border()

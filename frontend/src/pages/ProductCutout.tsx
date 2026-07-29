@@ -1,5 +1,5 @@
-import { ClipboardPaste, Download, Eye, FileImage, LoaderCircle, RefreshCw, UploadCloud, X } from "lucide-react";
-import type { ClipboardEvent, DragEvent } from "react";
+import { Download, Eye, FileImage, LoaderCircle, RefreshCw, RotateCcw, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
+import type { DragEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -7,6 +7,9 @@ const BROWSER_IMAGE_MAX_EDGE = 2400;
 const BROWSER_JPEG_QUALITY = 0.88;
 const BROWSER_PHOTO = /\.(?:jpe?g|webp)$/i;
 const SUPPORTED_IMAGE_NAME = /\.(?:jpe?g|png|webp)$/i;
+const PREVIEW_ZOOM_MIN = 0.5;
+const PREVIEW_ZOOM_MAX = 5;
+const PREVIEW_ZOOM_STEP = 0.25;
 
 type PreparedCutout = {
   prepared_id: string;
@@ -59,12 +62,13 @@ async function prepareCutoutPhoto(file: File): Promise<File> {
 export default function ProductCutout({ active, onUseAsOrganizerSource }: Props) {
   const sessionRef = useRef("");
   const sessionPromiseRef = useRef<Promise<{ session_id: string }> | null>(null);
-  const pasteButtonRef = useRef<HTMLButtonElement | null>(null);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [prepared, setPrepared] = useState<PreparedCutout | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewBaseSize, setPreviewBaseSize] = useState<{ width: number; height: number } | null>(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -72,13 +76,68 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
   }, [active]);
 
   useEffect(() => {
+    if (!active) return;
+    const pasteScreenshot = (event: globalThis.ClipboardEvent) => {
+      if (busy || !event.clipboardData) return;
+      const images = Array.from(event.clipboardData.items).flatMap((item, index) => {
+        if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
+        const file = item.getAsFile();
+        if (!file) return [];
+        return [SUPPORTED_IMAGE_NAME.test(file.name) ? file : namedClipboardFile(file, index)];
+      });
+      if (!images.length) return;
+      event.preventDefault();
+      void prepareCutout(images);
+    };
+    window.addEventListener("paste", pasteScreenshot);
+    return () => window.removeEventListener("paste", pasteScreenshot);
+  }, [active, busy]);
+
+  useEffect(() => {
     if (!preview) return;
     const closePreview = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setPreview(null);
+      if (event.key === "Escape") closeImagePreview();
+      if (event.key === "+" || event.key === "=") adjustPreviewZoom(PREVIEW_ZOOM_STEP);
+      if (event.key === "-") adjustPreviewZoom(-PREVIEW_ZOOM_STEP);
+      if (event.key === "0") setPreviewZoom(1);
     };
     window.addEventListener("keydown", closePreview);
     return () => window.removeEventListener("keydown", closePreview);
   }, [preview]);
+
+  function clampPreviewZoom(value: number) {
+    return Math.min(PREVIEW_ZOOM_MAX, Math.max(PREVIEW_ZOOM_MIN, value));
+  }
+
+  function adjustPreviewZoom(delta: number) {
+    setPreviewZoom((current) => clampPreviewZoom(Number((current + delta).toFixed(2))));
+  }
+
+  function openImagePreview(url: string) {
+    setPreviewZoom(1);
+    setPreviewBaseSize(null);
+    setPreview(url);
+  }
+
+  function closeImagePreview() {
+    setPreview(null);
+    setPreviewZoom(1);
+    setPreviewBaseSize(null);
+  }
+
+  function measurePreviewImage(image: HTMLImageElement) {
+    const availableWidth = Math.min(window.innerWidth * 0.92, 1600);
+    const availableHeight = Math.max(240, window.innerHeight - 160);
+    const fitScale = Math.min(
+      availableWidth / Math.max(1, image.naturalWidth),
+      availableHeight / Math.max(1, image.naturalHeight),
+      1
+    );
+    setPreviewBaseSize({
+      width: Math.max(1, Math.round(image.naturalWidth * fitScale)),
+      height: Math.max(1, Math.round(image.naturalHeight * fitScale))
+    });
+  }
 
   async function ensureSession() {
     if (sessionRef.current) return sessionRef.current;
@@ -102,7 +161,7 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
       const [sessionId, preparedFile] = await Promise.all([ensureSession(), prepareCutoutPhoto(file)]);
       const result = await api.prepareVipOrganizerCutout(sessionId, preparedFile);
       setPrepared(result);
-      setMessage("抠图已完成，可以先用灰底图检查边缘，再下载或用于自动化整理。");
+      setMessage("抠图已完成，可以先用灰底图检查边缘，再下载或用于自动化整理");
     } catch (error: any) {
       setMessage(error.message || "抠图失败");
     } finally {
@@ -116,18 +175,6 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
     if (!busy) void prepareCutout(event.dataTransfer.files);
   }
 
-  function handlePaste(event: ClipboardEvent<HTMLElement>) {
-    const images = Array.from(event.clipboardData.items).flatMap((item, index) => {
-      if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
-      const file = item.getAsFile();
-      if (!file) return [];
-      return [SUPPORTED_IMAGE_NAME.test(file.name) ? file : namedClipboardFile(file, index)];
-    });
-    if (!images.length || busy) return;
-    event.preventDefault();
-    void prepareCutout(images);
-  }
-
   function namedClipboardFile(blob: Blob, index = 0) {
     const extension = blob.type === "image/jpeg"
       ? "jpg"
@@ -137,27 +184,17 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
     return new File([blob], `粘贴图片-${Date.now()}-${index + 1}.${extension}`, { type: blob.type });
   }
 
-  async function pasteFromClipboard() {
-    if (busy) return;
-    pasteButtonRef.current?.focus();
-    if (!navigator.clipboard?.read) {
-      setMessage("请按 Ctrl+V 粘贴图片");
-      return;
-    }
-    try {
-      const items = await navigator.clipboard.read();
-      const blobs = await Promise.all(items.flatMap((item) => {
-        const imageType = item.types.find((type) => type.startsWith("image/"));
-        return imageType ? [item.getType(imageType)] : [];
-      }));
-      if (!blobs.length) {
-        setMessage("剪贴板中没有图片");
-        return;
-      }
-      await prepareCutout([namedClipboardFile(blobs[0])]);
-    } catch {
-      setMessage("请按 Ctrl+V 粘贴图片");
-      pasteButtonRef.current?.focus();
+  function resetCutout() {
+    const cutoutSessionId = sessionRef.current;
+    sessionRef.current = "";
+    sessionPromiseRef.current = null;
+    setSourceFile(null);
+    setPrepared(null);
+    closeImagePreview();
+    setMessage("");
+    setDragging(false);
+    if (cutoutSessionId) {
+      void api.cleanupVipOrganizerSession(cutoutSessionId).catch(() => undefined);
     }
   }
 
@@ -169,7 +206,7 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
       if (!response.ok) throw new Error("透明图读取失败");
       const blob = await response.blob();
       onUseAsOrganizerSource(new File([blob], prepared.file_name, { type: "image/png" }));
-      setMessage("透明图已带入“自动化整理”的商品原图。");
+      setMessage("透明图已带入“自动化整理”的商品原图");
     } catch (error: any) {
       setMessage(error.message || "透明图读取失败");
     } finally {
@@ -181,13 +218,12 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
     <section className="page organizer-page">
       <header className="page-header">
         <h1>透明图抠图</h1>
-        <p>白底商品图生成透明 PNG；仅进入本功能时预热抠图进程，空闲 3 分钟后自动退出。</p>
+        <p>白底商品图生成透明 PNG；仅进入本功能时预热抠图进程，空闲 3 分钟后自动退出</p>
       </header>
       <section
         className={`panel organizer-preparation-panel${dragging ? " is-dragging" : ""}`}
         tabIndex={0}
         aria-label="正面主图抠图上传区"
-        onPaste={handlePaste}
         onDragEnter={(event) => { event.preventDefault(); if (!busy) setDragging(true); }}
         onDragOver={(event) => {
           event.preventDefault();
@@ -200,22 +236,14 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
         onDrop={handleDrop}
       >
         <div className="section-title-row">
-          <div><h2>上传白底正面主图</h2><p>可拖入、点击选择，或点击此区域后按 Ctrl+V 粘贴；一次处理一张。</p></div>
+          <div><h2>上传白底正面主图</h2><p>拖入或选择图片；复制截图后按 Ctrl+V 可直接抠图</p></div>
           <div className="button-row organizer-cutout-upload-actions">
             <button
-              ref={pasteButtonRef}
               type="button"
-              disabled={busy}
-              onClick={() => void pasteFromClipboard()}
+              disabled={busy || (!sourceFile && !prepared)}
+              onClick={resetCutout}
             >
-              <ClipboardPaste size={18} />粘贴图片
-            </button>
-            <button
-              type="button"
-              disabled={busy || !sourceFile}
-              onClick={() => sourceFile && void prepareCutout([sourceFile])}
-            >
-              <RefreshCw size={18} />重新抠图
+              <RefreshCw size={18} />重新开始
             </button>
             <label className="organizer-prepare-upload">
               {busy ? <LoaderCircle className="spin" size={18} /> : <UploadCloud size={18} />}
@@ -230,24 +258,45 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
         {prepared ? <div className="organizer-cutout-results">
           <figure className="transparent-checker">
             <img src={prepared.transparent_url} alt="透明 PNG 结果" />
-            <button className="organizer-cutout-view" type="button" title="查看透明 PNG 大图" aria-label="放大查看透明 PNG" onClick={() => setPreview(prepared.transparent_url)}><Eye size={18} /></button>
+            <button className="organizer-cutout-view" type="button" title="查看透明 PNG 大图" aria-label="放大查看透明 PNG" onClick={() => openImagePreview(prepared.transparent_url)}><Eye size={18} /></button>
             <figcaption>透明 PNG</figcaption>
           </figure>
           <figure>
             <img src={prepared.gray_preview_url} alt="灰底边缘检查图" />
-            <button className="organizer-cutout-view" type="button" title="查看灰底边缘检查大图" aria-label="放大查看灰底边缘检查图" onClick={() => setPreview(prepared.gray_preview_url)}><Eye size={18} /></button>
+            <button className="organizer-cutout-view" type="button" title="查看灰底边缘检查大图" aria-label="放大查看灰底边缘检查图" onClick={() => openImagePreview(prepared.gray_preview_url)}><Eye size={18} /></button>
             <figcaption>灰底边缘检查</figcaption>
           </figure>
           <div className="organizer-cutout-actions">
             <a className="button-link" href={prepared.download_url} download={prepared.file_name}><Download size={18} />导出透明 PNG</a>
             <button type="button" className="primary" disabled={busy} onClick={() => void useAsOrganizerSource()}><FileImage size={18} />用于功能 1 的商品原图</button>
           </div>
-        </div> : <div className="organizer-preparation-empty"><FileImage size={28} /><span>尚未生成透明图。</span></div>}
+        </div> : <div className="organizer-preparation-empty"><FileImage size={28} /><span>尚未生成透明图</span></div>}
       </section>
       {message && <div className="alert warning">{message}</div>}
-      {preview && <div className="image-modal" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={() => setPreview(null)}>
-        <button className="image-modal-close" type="button" onClick={() => setPreview(null)} aria-label="关闭预览"><X size={22} /></button>
-        <img src={preview} alt="图片预览" onClick={(event) => event.stopPropagation()} />
+      {preview && <div className="image-modal image-modal-zoomable" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={closeImagePreview}>
+        <button className="image-modal-close" type="button" onClick={closeImagePreview} aria-label="关闭预览"><X size={22} /></button>
+        <div className="image-modal-viewport" onClick={(event) => event.stopPropagation()}>
+          <div className="image-modal-canvas">
+            <img
+              className={previewZoom >= PREVIEW_ZOOM_MAX ? "is-max-zoom" : ""}
+              src={preview}
+              alt="图片预览"
+              title={previewZoom < PREVIEW_ZOOM_MAX ? "点击继续放大" : "已放大到最大"}
+              onLoad={(event) => measurePreviewImage(event.currentTarget)}
+              onClick={() => adjustPreviewZoom(PREVIEW_ZOOM_STEP)}
+              style={previewBaseSize ? {
+                width: `${Math.round(previewBaseSize.width * previewZoom)}px`,
+                height: `${Math.round(previewBaseSize.height * previewZoom)}px`
+              } : undefined}
+            />
+          </div>
+        </div>
+        <div className="image-modal-zoom-controls" role="group" aria-label="图片缩放" onClick={(event) => event.stopPropagation()}>
+          <button type="button" disabled={previewZoom <= PREVIEW_ZOOM_MIN} onClick={(event) => { event.stopPropagation(); adjustPreviewZoom(-PREVIEW_ZOOM_STEP); }} aria-label="缩小图片"><ZoomOut size={20} /></button>
+          <output aria-live="polite">{Math.round(previewZoom * 100)}%</output>
+          <button type="button" disabled={previewZoom >= PREVIEW_ZOOM_MAX} onClick={(event) => { event.stopPropagation(); adjustPreviewZoom(PREVIEW_ZOOM_STEP); }} aria-label="放大图片"><ZoomIn size={20} /></button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); setPreviewZoom(1); }} aria-label="恢复原始缩放" title="恢复 100%"><RotateCcw size={18} /></button>
+        </div>
       </div>}
     </section>
   );

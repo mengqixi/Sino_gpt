@@ -115,6 +115,11 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ previous_session_id: previousSessionId || null })
   }),
+  cleanupVipOrganizerSession: (sessionId: string) =>
+    request<{ deleted: boolean }>("/api/vip-organizer/session/cleanup", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId })
+    }),
   uploadVipOrganizerAssets: (sessionId: string, assetType: string, files: File[]) => {
     const form = new FormData();
     form.append("session_id", sessionId);

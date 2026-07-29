@@ -3805,6 +3805,7 @@ def _paste_layer(
     minimum_top: int | None = None,
     maximum_bottom: int | None = None,
     allow_free_position: bool = False,
+    allow_free_x_position: bool = False,
 ) -> None:
     left, top, right, bottom = box
     box_width = max(1, right - left)
@@ -3825,8 +3826,9 @@ def _paste_layer(
     rendered = layer.resize(rendered_size, Image.Resampling.LANCZOS)
     global_x = left + (box_width - rendered.width) // 2 + int(round(normalized["offset_x"] * box_width))
     global_y = top + (box_height - rendered.height) // 2 + int(round(normalized["offset_y"] * box_height))
-    if not allow_free_position:
+    if not allow_free_position and not allow_free_x_position:
         global_x = _clamp_layer_origin(global_x, rendered.width, clip_left, clip_right)
+    if not allow_free_position:
         global_y = _clamp_layer_origin(global_y, rendered.height, clip_top, clip_bottom)
     if minimum_top is not None:
         global_y = max(minimum_top, global_y)
@@ -4287,43 +4289,65 @@ def _info_width_ruler_geometry(
         min(520.0, body_bottom + 18.0 / anchor_direction * ruler_gap),
     )
     end = (start[0] + 51.0, start[1] - 27.0)
-    def transform(
-        segment_start: tuple[float, float],
-        segment_end: tuple[float, float],
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        if product_center is not None:
-            return _transform_product_ruler_segment(
+    delta_x = end[0] - start[0]
+    delta_y = end[1] - start[1]
+    length = max(1.0, (delta_x ** 2 + delta_y ** 2) ** 0.5)
+    perpendicular = (-delta_y / length * 9.0, delta_x / length * 9.0)
+    raw_segments = [
+        (start, end),
+        ((start[0] - perpendicular[0], start[1] - perpendicular[1]), (start[0] + perpendicular[0], start[1] + perpendicular[1])),
+        ((end[0] - perpendicular[0], end[1] - perpendicular[1]), (end[0] + perpendicular[0], end[1] + perpendicular[1])),
+    ]
+    if product_center is not None:
+        grouped_segments = [
+            _transform_ruler_segment(
                 segment_start,
                 segment_end,
-                product_center,
-                normalized,
-                scale=normalized["width_ruler_scale"],
-                offset_x=normalized["width_ruler_offset_x"],
-                offset_y=normalized["width_ruler_offset_y"],
+                scale=normalized["product_ruler_group_scale"],
+                offset_x=normalized["product_ruler_group_offset_x"],
+                offset_y=normalized["product_ruler_group_offset_y"],
                 canvas_size=canvas_size,
+                origin=product_center,
             )
-        return _transform_ruler_segment(
+            for segment_start, segment_end in raw_segments
+        ]
+    else:
+        grouped_segments = raw_segments
+    grouped_main = grouped_segments[0]
+    width_origin = (
+        (grouped_main[0][0] + grouped_main[1][0]) / 2,
+        (grouped_main[0][1] + grouped_main[1][1]) / 2,
+    )
+    segments = [
+        _transform_ruler_segment(
             segment_start,
             segment_end,
             scale=normalized["width_ruler_scale"],
             offset_x=normalized["width_ruler_offset_x"],
             offset_y=normalized["width_ruler_offset_y"],
             canvas_size=canvas_size,
+            origin=width_origin,
         )
-
-    delta_x = end[0] - start[0]
-    delta_y = end[1] - start[1]
-    length = max(1.0, (delta_x ** 2 + delta_y ** 2) ** 0.5)
-    perpendicular = (-delta_y / length * 9.0, delta_x / length * 9.0)
-    segments = [
-        (start, end),
-        ((start[0] - perpendicular[0], start[1] - perpendicular[1]), (start[0] + perpendicular[0], start[1] + perpendicular[1])),
-        ((end[0] - perpendicular[0], end[1] - perpendicular[1]), (end[0] + perpendicular[0], end[1] + perpendicular[1])),
+        for segment_start, segment_end in grouped_segments
     ]
-    text_point = (start[0] + 8, start[1] + 8)
+    main_start, main_end = segments[0]
+    transformed_delta_x = main_end[0] - main_start[0]
+    transformed_delta_y = main_end[1] - main_start[1]
+    transformed_length = max(
+        1.0,
+        (transformed_delta_x ** 2 + transformed_delta_y ** 2) ** 0.5,
+    )
+    label_normal = (
+        -transformed_delta_y / transformed_length,
+        transformed_delta_x / transformed_length,
+    )
+    text_center = (
+        round((main_start[0] + main_end[0]) / 2 + label_normal[0] * 26),
+        round((main_start[1] + main_end[1]) / 2 + label_normal[1] * 26),
+    )
     return {
-        "segments": [transform(segment_start, segment_end) for segment_start, segment_end in segments],
-        "text": transform(text_point, text_point)[0],
+        "segments": segments,
+        "text": text_center,
         "scale": normalized["width_ruler_scale"],
     }
 
@@ -4445,6 +4469,24 @@ def _draw_rotated_text(canvas: Image.Image, text: str, xy: tuple[int, int], angl
     canvas.paste(rotated, xy, rotated)
 
 
+def _draw_rotated_text_centered(
+    canvas: Image.Image,
+    text: str,
+    center: tuple[int, int],
+    angle: float,
+    font: ImageFont.ImageFont,
+) -> None:
+    box = font.getbbox(text)
+    layer = Image.new("RGBA", (max(1, box[2] - box[0] + 12), max(1, box[3] - box[1] + 12)), (255, 255, 255, 0))
+    ImageDraw.Draw(layer).text((6 - box[0], 6 - box[1]), text, font=font, fill="#555555")
+    rotated = layer.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+    xy = (
+        round(center[0] - rotated.width / 2),
+        round(center[1] - rotated.height / 2),
+    )
+    canvas.paste(rotated, xy, rotated)
+
+
 def _info_page(
     info: dict[str, str],
     product_image: Image.Image | None = None,
@@ -4550,7 +4592,7 @@ def _info_page(
         )
     ruler_layer = ruler_layer.resize(image.size, Image.Resampling.LANCZOS)
     image.paste(ruler_layer, (0, 0), ruler_layer)
-    _draw_rotated_text(
+    _draw_rotated_text_centered(
         image,
         _dimension_mm(info.get("product_width") or ""),
         width_ruler["text"],
@@ -4721,6 +4763,7 @@ def _jd_model_page(
         (0, 0, *size),
         adjustment,
         mode=_crop_aware_mode(adjustment, "cover"),
+        allow_free_x_position=_has_manual_layout_adjustment(adjustment),
     )
     if with_logo:
         _draw_jd_elle_logo(canvas, size, logo_color)

@@ -1,5 +1,5 @@
-import { ClipboardPaste, Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { ClipboardEvent, DragEvent } from "react";
+import { Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
+import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -936,24 +936,11 @@ function infoWidthRulerGeometry(
     y: baseBody.bottom + 18 / anchorDirection * rulerGap
   };
   const end = { x: start.x + 51, y: start.y - 27 };
-  const transform = (
-    segmentStart: { x: number; y: number },
-    segmentEnd: { x: number; y: number }
-  ) => transformProductRulerSegment(
-    segmentStart,
-    segmentEnd,
-    productCenter,
-    draft,
-    draft.width_ruler_scale || 1,
-    draft.width_ruler_offset_x || 0,
-    draft.width_ruler_offset_y || 0,
-    output
-  );
   const deltaX = end.x - start.x;
   const deltaY = end.y - start.y;
   const length = Math.max(1, Math.hypot(deltaX, deltaY));
   const perpendicular = { x: -deltaY / length * 9, y: deltaX / length * 9 };
-  const segments = [
+  const rawSegments = [
     [start, end],
     [
       { x: start.x - perpendicular.x, y: start.y - perpendicular.y },
@@ -964,16 +951,50 @@ function infoWidthRulerGeometry(
       { x: end.x + perpendicular.x, y: end.y + perpendicular.y }
     ]
   ];
-  const transformedText = transform(
-    { x: start.x + 8, y: start.y + 8 },
-    { x: start.x + 8, y: start.y + 8 }
-  ).start;
+  const groupedSegments = rawSegments.map(([segmentStart, segmentEnd]) => {
+    const grouped = transformCanvasRulerSegment(
+      segmentStart,
+      segmentEnd,
+      draft.product_ruler_group_scale || 1,
+      draft.product_ruler_group_offset_x || 0,
+      draft.product_ruler_group_offset_y || 0,
+      output,
+      productCenter
+    );
+    return [grouped.start, grouped.end] as const;
+  });
+  const groupedMain = groupedSegments[0];
+  const widthOrigin = {
+    x: (groupedMain[0].x + groupedMain[1].x) / 2,
+    y: (groupedMain[0].y + groupedMain[1].y) / 2
+  };
+  const segments = groupedSegments.map(([segmentStart, segmentEnd]) => {
+    const transformed = transformCanvasRulerSegment(
+      segmentStart,
+      segmentEnd,
+      draft.width_ruler_scale || 1,
+      draft.width_ruler_offset_x || 0,
+      draft.width_ruler_offset_y || 0,
+      output,
+      widthOrigin
+    );
+    return [transformed.start, transformed.end] as const;
+  });
+  const transformedMain = segments[0];
+  const transformedDeltaX = transformedMain[1].x - transformedMain[0].x;
+  const transformedDeltaY = transformedMain[1].y - transformedMain[0].y;
+  const transformedLength = Math.max(1, Math.hypot(transformedDeltaX, transformedDeltaY));
+  const labelNormal = {
+    x: -transformedDeltaY / transformedLength,
+    y: transformedDeltaX / transformedLength
+  };
+  const text = {
+    x: (transformedMain[0].x + transformedMain[1].x) / 2 + labelNormal.x * 26,
+    y: (transformedMain[0].y + transformedMain[1].y) / 2 + labelNormal.y * 26
+  };
   return {
-    segments: segments.map(([segmentStart, segmentEnd]) => {
-      const transformed = transform(segmentStart, segmentEnd);
-      return [transformed.start, transformed.end];
-    }),
-    text: transformedText
+    segments,
+    text
   };
 }
 
@@ -1632,8 +1653,13 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         (platform === "vip" && slot.file_name === "401.jpg")
         || (platform === "jd" && slot.file_name === "3.jpg")
       );
-      if (!allowFreeMovement) {
+      const allowFreeHorizontalMovement = hasManualLayout
+        && platform === "jd"
+        && ["0-无logo.jpg", "1.jpg"].includes(slot.file_name);
+      if (!allowFreeMovement && !allowFreeHorizontalMovement) {
         drawX = clampLayerOrigin(drawX, drawWidth, safeLeft, safeRight);
+      }
+      if (!allowFreeMovement) {
         drawY = clampLayerOrigin(drawY, drawHeight, safeTop, safeBottom);
       }
       if (platform === "jd" && slot.file_name === "2.jpg" && !hasManualLayout) {
@@ -1742,6 +1768,7 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         context.save();
         context.translate(widthRuler.text.x * scaleX, widthRuler.text.y * scaleY);
         context.rotate(-26 * Math.PI / 180);
+        context.textBaseline = "middle";
         context.fillText(dimensionLabel(widthValue), 0, 0);
         context.restore();
         context.restore();
@@ -1812,101 +1839,6 @@ function jdComparisonDimensionsReady(productInfo: Record<string, string>) {
   return Number.isFinite(length) && length > 0 && Number.isFinite(height) && height > 0;
 }
 
-function UploadPasteControl({ disabled = false, onUpload }: {
-  disabled?: boolean;
-  onUpload: (kind: "product" | "model" | "tag", files: File[], skipped?: number) => void;
-}) {
-  const [target, setTarget] = useState<"product" | "model" | "tag">("product");
-  const [pasteHint, setPasteHint] = useState("");
-  const pasteButtonRef = useRef<HTMLButtonElement | null>(null);
-
-  function namedClipboardFile(blob: Blob, index: number) {
-    const extension = blob.type === "image/jpeg"
-      ? "jpg"
-      : blob.type === "image/webp"
-        ? "webp"
-        : "png";
-    return new File([blob], `粘贴图片-${Date.now()}-${index + 1}.${extension}`, { type: blob.type });
-  }
-
-  function acceptFiles(files: File[]) {
-    const supported = files.filter((file) => SUPPORTED_IMAGE_NAME.test(file.name));
-    const selected = target === "tag" ? supported.slice(0, 1) : supported;
-    if (!selected.length) {
-      setPasteHint("剪贴板中没有图片");
-      return;
-    }
-    setPasteHint("");
-    onUpload(target, selected, files.length - selected.length);
-  }
-
-  function handlePaste(event: ClipboardEvent<HTMLElement>) {
-    if (disabled) return;
-    const files = Array.from(event.clipboardData.items).flatMap((item) => {
-      if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
-      const file = item.getAsFile();
-      return file ? [file] : [];
-    });
-    if (!files.length) {
-      setPasteHint("剪贴板中没有图片");
-      return;
-    }
-    event.preventDefault();
-    acceptFiles(files.map((file, index) => (
-      SUPPORTED_IMAGE_NAME.test(file.name) ? file : namedClipboardFile(file, index)
-    )));
-  }
-
-  async function pasteFromClipboard() {
-    if (disabled) return;
-    pasteButtonRef.current?.focus();
-    if (!navigator.clipboard?.read) {
-      setPasteHint("请按 Ctrl+V");
-      return;
-    }
-    try {
-      const items = await navigator.clipboard.read();
-      const blobs = await Promise.all(items.flatMap((item) => {
-        const imageType = item.types.find((type) => type.startsWith("image/"));
-        return imageType ? [item.getType(imageType)] : [];
-      }));
-      acceptFiles(blobs.map(namedClipboardFile));
-    } catch {
-      setPasteHint("请按 Ctrl+V");
-      pasteButtonRef.current?.focus();
-    }
-  }
-
-  return (
-    <div className="organizer-paste-control" onPaste={handlePaste}>
-      <label>
-        <span>粘贴到</span>
-        <select
-          value={target}
-          disabled={disabled}
-          onChange={(event) => {
-            setTarget(event.target.value as "product" | "model" | "tag");
-            setPasteHint("");
-          }}
-        >
-          <option value="product">商品原图</option>
-          <option value="model">模特图</option>
-          <option value="tag">吊牌图</option>
-        </select>
-      </label>
-      <button
-        ref={pasteButtonRef}
-        type="button"
-        disabled={disabled}
-        onClick={() => void pasteFromClipboard()}
-      >
-        <ClipboardPaste size={17} />{pasteHint || "粘贴图片"}
-      </button>
-      {pasteHint === "请按 Ctrl+V" && <small>目标：{target === "product" ? "商品原图" : target === "model" ? "模特图" : "吊牌图"}</small>}
-    </div>
-  );
-}
-
 function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onDelete, onPreview }: {
   title: string;
   hint: string;
@@ -1923,6 +1855,7 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
     const incoming = Array.from(files);
     const supported = incoming.filter((file) => SUPPORTED_IMAGE_NAME.test(file.name));
     const selected = multiple ? supported : supported.slice(0, 1);
+    if (!selected.length) return;
     onUpload(selected, incoming.length - selected.length);
   }
 
@@ -2590,14 +2523,18 @@ function SlotAdjustmentEditor({
         </header>
 
         {showCloseConfirm && <div className="slot-close-confirm" role="alertdialog" aria-label="未保存调整提示">
-          <div><strong>调整尚未保存</strong><span>保存会生成最终预览并退出；右上角 × 会放弃本次调整。</span></div>
-          {supportsJdFolderSync && <button
-            type="button"
-            className={syncJdFolders ? "active-tool" : ""}
-            aria-pressed={syncJdFolders}
-            onClick={() => setSyncJdFolders((current) => !current)}
-          >同步 800/750</button>}
-          <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
+          <div><strong>调整尚未保存</strong><span>保存会生成最终预览并退出；右上角 × 会放弃本次调整</span></div>
+          <div className="slot-save-actions">
+            {supportsJdFolderSync && <label className="slot-sync-toggle">
+              <input
+                type="checkbox"
+                checked={syncJdFolders}
+                onChange={(event) => setSyncJdFolders(event.target.checked)}
+              />
+              <span>同步 800/750</span>
+            </label>}
+            <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
+          </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="不保存并退出" title="不保存并退出"><X size={20} /></button>
         </div>}
 
@@ -2817,14 +2754,20 @@ function SlotAdjustmentEditor({
             Math.round(targetOffset(draft, activeMoveTarget).y * 100)
           }</span>
           {!previewSynced && <span className="slot-preview-pending">保存时会自动生成精确预览</span>}
-          {supportsJdFolderSync && <button
-            type="button"
-            className={syncJdFolders ? "active-tool" : ""}
-            aria-pressed={syncJdFolders}
-            title={syncJdFolders ? "本次调整会同时保存到 800 和 750" : `本次调整只保存到 ${targetFolder}`}
-            onClick={() => setSyncJdFolders((current) => !current)}
-          >同步 800/750</button>}
-          <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : "保存并退出"}</button>
+          <div className="slot-save-actions">
+            {supportsJdFolderSync && <label
+              className="slot-sync-toggle"
+              title={syncJdFolders ? "本次调整会同时保存到 800 和 750" : `本次调整只保存到 ${targetFolder}`}
+            >
+              <input
+                type="checkbox"
+                checked={syncJdFolders}
+                onChange={(event) => setSyncJdFolders(event.target.checked)}
+              />
+              <span>同步 800/750</span>
+            </label>}
+            <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : "保存并退出"}</button>
+          </div>
         </div>
         {error && <div className="alert warning">{error}</div>}
       </section>
@@ -2902,6 +2845,25 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   useEffect(() => {
     if (active) void api.prewarmHeavyTask("organizer").catch(() => undefined);
   }, [active]);
+
+  useEffect(() => {
+    if (!active) return;
+    const pasteTagScreenshot = (event: globalThis.ClipboardEvent) => {
+      if (busy || !event.clipboardData) return;
+      const images = Array.from(event.clipboardData.items).flatMap((item, index) => {
+        if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
+        const blob = item.getAsFile();
+        if (!blob) return [];
+        const extension = blob.type === "image/jpeg" ? "jpg" : blob.type === "image/webp" ? "webp" : "png";
+        return [new File([blob], `粘贴吊牌-${Date.now()}-${index + 1}.${extension}`, { type: blob.type })];
+      });
+      if (!images.length) return;
+      event.preventDefault();
+      void upload("tag", images.slice(0, 1));
+    };
+    window.addEventListener("paste", pasteTagScreenshot);
+    return () => window.removeEventListener("paste", pasteTagScreenshot);
+  }, [active, busy]);
 
   useEffect(() => {
     if (!initialProductFile) return;
@@ -3247,7 +3209,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     try {
       const session = await api.startVipOrganizerSession(sessionIdRef.current || undefined);
       applyNewSession(session.session_id);
-      setMessage("已开始新一轮，上一轮自动化整理素材和ZIP已删除。AI生成记录不受影响。");
+      setMessage("已开始新一轮，上一轮自动化整理素材和 ZIP 已删除；AI 生成记录不受影响");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -3258,7 +3220,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   async function upload(kind: "product" | "model" | "tag", files: FileList | File[] | null, preSkipped = 0) {
     const fileItems = Array.from(files || []);
     if (!fileItems.length) {
-      if (preSkipped) setMessage(`已跳过 ${preSkipped} 个不支持或未导入的文件。`);
+      if (preSkipped) setMessage(`已跳过 ${preSkipped} 个不支持或未导入的文件`);
       return;
     }
     pendingUploadsRef.current += 1;
@@ -3296,7 +3258,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           false
         );
       } else {
-        setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件。` : `已上传 ${uploaded.length} 张图片。`);
+        setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件` : `已上传 ${uploaded.length} 张图片`);
       }
     } catch (error: any) {
       setMessage(error.message);
@@ -3391,7 +3353,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         slotsRef.current = [];
         setSlots([]);
         setAssets({ product: [], model: [], tag: [] });
-        setMessage("商品原图已删除，请重新上传后再自动整理。");
+        setMessage("商品原图已删除，请重新上传后再自动整理");
         return;
       }
       await analyze(
@@ -3474,7 +3436,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       }
       setAssets(result.assets);
       setAdjustmentEditor(null);
-      setMessage(incrementalKind === "tag" ? "吊牌相关输出已增量更新，其他预览保持不变。" : "已生成自动整理初稿。黄色或红色可信度项目需要重点确认。");
+      setMessage(incrementalKind === "tag" ? "吊牌相关输出已增量更新，其他预览保持不变" : "已生成自动整理初稿；黄色或红色可信度项目需要重点确认");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -3546,7 +3508,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       setSlots(nextSlots);
       setAssets(result.assets);
       setAdjustmentEditor(null);
-      setMessage("API 已完成一次素材分类，并按固定标签重新整理。请检查低可信度位置。");
+      setMessage("API 已完成一次素材分类，并按固定标签重新整理；请检查低可信度位置");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -3573,7 +3535,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       return updated;
     });
     scheduleReanalyze(next, assetTagsRef.current);
-    setMessage("固定标签已修改，正在只更新受影响的输出位置。");
+    setMessage("固定标签已修改，正在只更新受影响的输出位置");
   }
 
   function effectiveAssetTags(asset: any) {
@@ -3588,7 +3550,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     setAssetTags(next);
     setManualAssetIds((current) => new Set(current).add(asset.id));
     scheduleReanalyze(assetRolesRef.current, next);
-    setMessage("细节标签已修改，正在只更新受影响的输出位置。");
+    setMessage("细节标签已修改，正在只更新受影响的输出位置");
   }
 
   function resetAssetTags(imageId: number) {
@@ -3695,7 +3657,16 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     const foldersToUpdate = platform === "jd" && syncJdFolders
       ? previewFoldersForSlot(currentSlot, platform)
       : [targetFolder];
+    const baseAdjustments = (currentSlot.adjustments || [])
+      .map((item) => normalizeAdjustment(item));
     const folderAdjustments = { ...(currentSlot.folder_adjustments || {}) };
+    if (platform === "jd") {
+      previewFoldersForSlot(currentSlot, platform).forEach((folder) => {
+        if (!folderAdjustments[folder]) {
+          folderAdjustments[folder] = baseAdjustments.map((item) => ({ ...item }));
+        }
+      });
+    }
     foldersToUpdate.forEach((folder) => {
       folderAdjustments[folder] = normalizedAdjustments.map((item) => ({ ...item }));
     });
@@ -3766,7 +3737,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       anchor.click();
       anchor.remove();
       const platformName = platform === "jd" ? "京东" : "唯品会";
-      setMessage(result.missing.length ? `ZIP 已下载，共 ${result.generated_count} 张，缺少：${result.missing.join("、")}` : `${platformName}套图 ZIP 已开始下载。`);
+      setMessage(result.missing.length ? `ZIP 已下载，共 ${result.generated_count} 张，缺少：${result.missing.join("、")}` : `${platformName}套图 ZIP 已开始下载`);
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -3796,7 +3767,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       setSlotPreviews({ ...cached.previews });
       slotPreviewSignaturesRef.current = { ...cached.signatures };
       setPlatform(nextPlatform);
-      setMessage(`已切换到${nextPlatform === "jd" ? "京东" : "唯品会"}，已恢复该平台预览；缺失项会单独补充。`);
+      setMessage(`已切换到${nextPlatform === "jd" ? "京东" : "唯品会"}，已恢复该平台预览；缺失项会单独补充`);
       window.requestAnimationFrame(() => window.scrollTo({ top: scrollTop, left: 0, behavior: "auto" }));
       return;
     }
@@ -3896,7 +3867,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         <div className="organizer-step-header">
           <div className="organizer-step-heading">
             <h2>1. 上传素材</h2>
-            <p>先上传商品原图；模特图和吊牌图可按实际需要补充。</p>
+            <p>上传商品原图和模特图，吊牌图可按需补充</p>
           </div>
           <div className="button-row organizer-step-actions">
             {sessionId && <button disabled={busy} onClick={startNewSession}><RefreshCw size={18} />开始新一轮</button>}
@@ -3905,14 +3876,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
             </button>
           </div>
         </div>
-        <UploadPasteControl
-          disabled={busy}
-          onUpload={(kind, files, skipped) => upload(kind, files, skipped)}
-        />
         <div className="organizer-upload-columns">
           <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
           <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
-          <UploadSection title="吊牌图" hint="可选" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
+          <UploadSection title="吊牌图" hint="可选 · 支持 Ctrl+V" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
         </div>
       </section>
 
@@ -3921,7 +3888,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           <div className="organizer-step-header organizer-analysis-header">
             <div className="organizer-step-heading">
               <h2>2. 素材分析</h2>
-              <p>核对自动分类和细节标签，确认后可按最新结果重新整理。</p>
+              <p>核对自动分类和细节标签，确认后可按最新结果重新整理</p>
             </div>
             <div className="organizer-analysis-toolbar organizer-step-actions">
               <label className="organizer-api-select">
@@ -3982,7 +3949,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           <div className="organizer-step-header organizer-step-header-simple">
             <div className="organizer-step-heading">
               <h2>3. 商品信息</h2>
-              <p>尺寸统一填写毫米（mm），用于产品信息图和尺寸对比图。</p>
+              <p>尺寸统一填写毫米（mm），用于产品信息图和尺寸对比图</p>
             </div>
           </div>
           <div className="organizer-info-grid">
@@ -4031,7 +3998,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           <div className="organizer-step-header">
             <div className="organizer-step-heading">
               <h2>4. 检查{platform === "jd" ? "京东 7 个" : "15 个"}输出位置</h2>
-              <p>逐项确认成品、来源图片和调整结果后再导出。</p>
+              <p>逐项确认成品、来源图片和调整结果后再导出</p>
             </div>
             {(previewBusy || platformSwitching || platformRegenerating) && <span className="organizer-preview-status organizer-step-actions"><LoaderCircle className="spin" size={16} />{platformSwitching ? "正在切换输出平台" : platformRegenerating ? "正在重新生成当前平台" : "正在更新成品预览"}</span>}
           </div>
