@@ -462,6 +462,43 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[630, 660, 3]), 255)
         self.assertEqual(int(cleaned[655, 660, 3]), 0)
 
+    def test_export_cleanup_uses_terminal_alpha_collapse_on_patterned_bag(self):
+        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((180, 170, 620, 650), fill=(77, 72, 68, 255))
+        for x in range(190, 620, 18):
+            draw.line((x, 180, x + 80, 650), fill=(185, 178, 169, 255), width=4)
+        # The model-supported floor tail is connected, fairly opaque and much
+        # larger than a fragment, but begins only after the real base.
+        draw.rectangle((245, 651, 555, 662), fill=(88, 84, 80, 170))
+        # Gold feet below the same edge remain protected.
+        draw.rectangle((225, 651, 242, 662), fill=(213, 173, 85, 255))
+        draw.rectangle((558, 651, 575, 662), fill=(213, 173, 85, 255))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[645, 400, 3]), 255)
+        self.assertEqual(int(cleaned[658, 400, 3]), 0)
+        self.assertEqual(int(cleaned[658, 233, 3]), 255)
+        self.assertEqual(int(cleaned[658, 566, 3]), 255)
+
+    def test_export_cleanup_removes_opaque_detached_woven_floor_sliver(self):
+        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((200, 170, 600, 650), fill=(204, 151, 169, 255))
+        # This is detached after resize and too opaque for the faint-fragment
+        # cleanup, but remains a shallow central colour-cast floor sliver.
+        draw.rectangle((310, 659, 490, 665), fill=(126, 91, 101, 235))
+        # A tall leather cord and a separate gold chain are real details.
+        draw.rectangle((270, 620, 278, 675), fill=(153, 93, 112, 255))
+        draw.line((510, 662, 575, 662), fill=(213, 173, 85, 255), width=4)
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[662, 400, 3]), 0)
+        self.assertEqual(int(cleaned[660, 274, 3]), 255)
+        self.assertEqual(int(cleaned[662, 540, 3]), 255)
+
     def test_vip_30_export_is_800_square_and_within_required_file_size(self):
         image = Image.new("RGBA", (1100, 900), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)

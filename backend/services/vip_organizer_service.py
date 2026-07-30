@@ -3551,6 +3551,35 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
             if np.any(material_sample)
             else 0.0
         )
+        rgb = rgba[:, :, :3]
+        red = rgb[:, :, 0].astype(np.int16)
+        green = rgb[:, :, 1].astype(np.int16)
+        blue = rgb[:, :, 2].astype(np.int16)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gradient = cv2.magnitude(
+            cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+            cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+        )
+        terminal_gold_core = (
+            (hsv[:, :, 0] >= 7)
+            & (hsv[:, :, 0] <= 42)
+            & (hsv[:, :, 1] >= 90)
+            & (hsv[:, :, 2] >= 105)
+            & (red >= blue + 10)
+            & (green >= blue + 5)
+        )
+        terminal_silver_core = (
+            (hsv[:, :, 1] <= 20)
+            & (hsv[:, :, 2] >= 70)
+            & (hsv[:, :, 2] <= 235)
+            & (gradient >= 55)
+            & (alpha >= 180)
+        )
+        terminal_hardware = cv2.dilate(
+            (terminal_gold_core | terminal_silver_core).astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        ).astype(bool)
         row_widths = np.count_nonzero(
             (alpha[:, central_left:central_right] >= 128)
             & main_pixels[:, central_left:central_right],
@@ -3573,16 +3602,72 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 floor_row = scan_start + index
                 strongest_width_drop = width_drop
 
-        if floor_row is not None and median_material_value > 105:
-            rgb = rgba[:, :, :3]
-            red = rgb[:, :, 0].astype(np.int16)
-            green = rgb[:, :, 1].astype(np.int16)
-            blue = rgb[:, :, 2].astype(np.int16)
-            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-            gradient = cv2.magnitude(
-                cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
-                cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+        # The useful part of the first GitHub algorithm was its decisive
+        # treatment of the low-confidence tail after the real product edge.
+        # Reuse only that observation: locate a late alpha collapse in the
+        # current silhouette, then clear low-chroma tail pixels strictly below
+        # it. The collapse row itself is retained, so this cannot flatten or
+        # synthesise the bag bottom. Verified gold/silver feet and chains are
+        # excluded. A minimum affected area prevents this rule from touching
+        # the few antialiased pixels under an already-clean pale bag.
+        row_alpha_medians = np.zeros(alpha.shape[0], dtype=np.float32)
+        for row in range(main_top, main_top + main_height):
+            row_pixels = (
+                main_pixels[row, central_left:central_right]
+                & (alpha[row, central_left:central_right] > 8)
             )
+            if np.any(row_pixels):
+                row_alpha_medians[row] = float(np.median(
+                    alpha[row, central_left:central_right][row_pixels]
+                ))
+        confidence_collapse_row: int | None = None
+        confidence_scan_start = main_top + round(main_height * 0.82)
+        for row in range(
+            max(main_top + 3, confidence_scan_start),
+            main_top + main_height,
+        ):
+            previous_alpha = row_alpha_medians[row - 3:row]
+            previous_alpha = previous_alpha[previous_alpha > 0]
+            current_alpha = float(row_alpha_medians[row])
+            if (
+                previous_alpha.size
+                and float(np.median(previous_alpha)) >= 235
+                and 0 < current_alpha <= 220
+            ):
+                confidence_collapse_row = row
+                break
+        if confidence_collapse_row is not None:
+            terminal_chroma_limit = max(
+                35.0,
+                median_material_saturation * 1.50,
+            )
+            very_neutral_limit = max(
+                22.0,
+                median_material_saturation * 0.80,
+            )
+            historical_tail_candidate = (
+                main_pixels
+                & (yy > confidence_collapse_row)
+                & (alpha < 245)
+                & (hsv[:, :, 1] <= terminal_chroma_limit)
+                & (
+                    (alpha < 220)
+                    | (hsv[:, :, 1] <= very_neutral_limit)
+                )
+                & ~terminal_hardware
+            )
+            minimum_historical_tail = max(
+                40,
+                round(main_area * 0.00020),
+            )
+            if (
+                int(np.count_nonzero(historical_tail_candidate))
+                >= minimum_historical_tail
+            ):
+                alpha[historical_tail_candidate] = 0
+                changed = True
+
+        if floor_row is not None and median_material_value > 105:
             gold_core = (
                 (hsv[:, :, 0] >= 7)
                 & (hsv[:, :, 0] <= 42)
@@ -3981,6 +4066,80 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
             alpha[low_chroma_floor_residue] = 0
             if np.any(low_chroma_floor_residue):
                 changed = True
+
+        # Resizing can leave several opaque colour-cast slivers detached from
+        # a woven or textured bottom. They are too strong for the old faint
+        # fragment rule, but still have the geometry of a floor residue:
+        # shallow, low, central, and materially darker or less chromatic than
+        # the body. This pass never removes a tall cord/strap or a verified
+        # metal component.
+        detached_count, detached_labels, detached_stats, _ = (
+            cv2.connectedComponentsWithStats(
+                (alpha > 8).astype(np.uint8),
+                8,
+            )
+        )
+        if detached_count > 1:
+            detached_largest = 1 + int(np.argmax(
+                detached_stats[1:, cv2.CC_STAT_AREA]
+            ))
+            detached_lower_start = main_top + round(main_height * 0.86)
+            detached_maximum_height = max(
+                8,
+                round(main_height * 0.035),
+            )
+            detached_maximum_area = max(
+                180,
+                round(main_area * 0.012),
+            )
+            for component in range(1, detached_count):
+                if component == detached_largest:
+                    continue
+                component_left = int(
+                    detached_stats[component, cv2.CC_STAT_LEFT]
+                )
+                component_top = int(
+                    detached_stats[component, cv2.CC_STAT_TOP]
+                )
+                component_width = int(
+                    detached_stats[component, cv2.CC_STAT_WIDTH]
+                )
+                component_height = int(
+                    detached_stats[component, cv2.CC_STAT_HEIGHT]
+                )
+                component_area = int(
+                    detached_stats[component, cv2.CC_STAT_AREA]
+                )
+                component_center_x = component_left + component_width / 2
+                component_pixels = detached_labels == component
+                hardware_fraction = float(np.mean(
+                    terminal_hardware[component_pixels]
+                ))
+                component_value = float(np.median(
+                    hsv[:, :, 2][component_pixels]
+                ))
+                component_saturation = float(np.median(
+                    hsv[:, :, 1][component_pixels]
+                ))
+                material_mismatch = (
+                    component_value
+                    < max(55.0, median_material_value * 0.90)
+                    or component_saturation
+                    < max(18.0, median_material_saturation * 0.70)
+                )
+                if (
+                    component_top >= detached_lower_start
+                    and component_width >= 6
+                    and component_height <= detached_maximum_height
+                    and component_area <= detached_maximum_area
+                    and product_span_left
+                    <= component_center_x
+                    <= product_span_right
+                    and hardware_fraction < 0.12
+                    and material_mismatch
+                ):
+                    alpha[component_pixels] = 0
+                    changed = True
 
     # Removing an attached shadow can expose tiny antialiased islands which
     # were connected to the product during the first component pass. Run the
