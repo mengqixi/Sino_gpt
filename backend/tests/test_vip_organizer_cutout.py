@@ -499,6 +499,80 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[660, 274, 3]), 255)
         self.assertEqual(int(cleaned[662, 540, 3]), 255)
 
+    def test_residue_audit_clears_small_white_hardware_pocket_only(self):
+        shape = (120, 120)
+        alpha = np.zeros(shape, dtype=np.uint8)
+        alpha[20:100, 20:100] = 255
+        tight_hardware = np.zeros(shape, dtype=bool)
+        cv2.circle(tight_hardware.astype(np.uint8), (82, 55), 8, 1, 3)
+        hardware_u8 = np.zeros(shape, dtype=np.uint8)
+        cv2.circle(hardware_u8, (82, 55), 8, 1, 3)
+        tight_hardware = hardware_u8.astype(bool)
+        # A tiny studio-white pocket sits inside the metal ring.
+        white_pocket = np.zeros(shape, dtype=bool)
+        white_pocket[52:56, 80:84] = True
+        lab_distance = np.full(shape, 70.0, dtype=np.float32)
+        saturation = np.full(shape, 80, dtype=np.uint8)
+        value = np.full(shape, 150, dtype=np.uint8)
+        source_min = np.full(shape, 120, dtype=np.uint8)
+        source_spread = np.full(shape, 60, dtype=np.int16)
+        lab_distance[white_pocket] = 4
+        saturation[white_pocket] = 2
+        value[white_pocket] = 245
+        source_min[white_pocket] = 242
+        source_spread[white_pocket] = 3
+        false_mask = np.zeros(shape, dtype=bool)
+
+        cleaned = service._audit_white_studio_residue(
+            alpha,
+            lab_distance=lab_distance,
+            saturation=saturation,
+            value=value,
+            source_min=source_min,
+            source_spread=source_spread,
+            model_matte=np.full(shape, 0.96, dtype=np.float32),
+            tight_hardware=tight_hardware,
+            pale_body_protection=false_mask,
+            colored_material=false_mask,
+            compact_detail=false_mask,
+            verified_floor_hardware=false_mask,
+        )
+
+        self.assertEqual(int(cleaned[53, 81]), 0)
+        self.assertEqual(int(cleaned[55, 74]), 255)
+        self.assertEqual(int(cleaned[50, 50]), 255)
+
+    def test_residue_audit_clears_shallow_floor_but_preserves_hardware(self):
+        shape = (120, 120)
+        alpha = np.zeros(shape, dtype=np.uint8)
+        alpha[20:100, 20:100] = 255
+        alpha[104:107, 42:55] = 190
+        alpha[104:107, 76:84] = 255
+        model_matte = np.full(shape, 0.97, dtype=np.float32)
+        model_matte[104:107, 42:55] = 0.35
+        tight_hardware = np.zeros(shape, dtype=bool)
+        tight_hardware[104:107, 76:84] = True
+        false_mask = np.zeros(shape, dtype=bool)
+
+        cleaned = service._audit_white_studio_residue(
+            alpha,
+            lab_distance=np.full(shape, 45.0, dtype=np.float32),
+            saturation=np.full(shape, 10, dtype=np.uint8),
+            value=np.full(shape, 105, dtype=np.uint8),
+            source_min=np.full(shape, 90, dtype=np.uint8),
+            source_spread=np.full(shape, 12, dtype=np.int16),
+            model_matte=model_matte,
+            tight_hardware=tight_hardware,
+            pale_body_protection=false_mask,
+            colored_material=false_mask,
+            compact_detail=false_mask,
+            verified_floor_hardware=tight_hardware,
+        )
+
+        self.assertEqual(int(cleaned[105, 48]), 0)
+        self.assertEqual(int(cleaned[105, 80]), 255)
+        self.assertEqual(int(cleaned[95, 48]), 255)
+
     def test_vip_30_export_is_800_square_and_within_required_file_size(self):
         image = Image.new("RGBA", (1100, 900), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)

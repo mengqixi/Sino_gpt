@@ -1,5 +1,5 @@
 import { Download, Eye, FileImage, LoaderCircle, RefreshCw, RotateCcw, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { DragEvent } from "react";
+import type { DragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -69,6 +69,15 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
   const [preview, setPreview] = useState<string | null>(null);
   const [previewZoom, setPreviewZoom] = useState(1);
   const [previewBaseSize, setPreviewBaseSize] = useState<{ width: number; height: number } | null>(null);
+  const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
+  const [previewDragging, setPreviewDragging] = useState(false);
+  const previewDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -99,7 +108,7 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
       if (event.key === "Escape") closeImagePreview();
       if (event.key === "+" || event.key === "=") adjustPreviewZoom(PREVIEW_ZOOM_STEP);
       if (event.key === "-") adjustPreviewZoom(-PREVIEW_ZOOM_STEP);
-      if (event.key === "0") setPreviewZoom(1);
+      if (event.key === "0") resetImagePreview();
     };
     window.addEventListener("keydown", closePreview);
     return () => window.removeEventListener("keydown", closePreview);
@@ -110,19 +119,85 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
   }
 
   function adjustPreviewZoom(delta: number) {
-    setPreviewZoom((current) => clampPreviewZoom(Number((current + delta).toFixed(2))));
+    setPreviewZoom((current) => {
+      const next = clampPreviewZoom(Number((current + delta).toFixed(2)));
+      const ratio = next / current;
+      setPreviewPan((pan) => ({ x: pan.x * ratio, y: pan.y * ratio }));
+      return next;
+    });
+  }
+
+  function resetImagePreview() {
+    setPreviewZoom(1);
+    setPreviewPan({ x: 0, y: 0 });
+  }
+
+  function zoomImagePreviewAtPointer(event: ReactWheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const anchorX = event.clientX - (rect.left + rect.width / 2);
+    const anchorY = event.clientY - (rect.top + rect.height / 2);
+    const delta = event.deltaY < 0 ? PREVIEW_ZOOM_STEP : -PREVIEW_ZOOM_STEP;
+    setPreviewZoom((current) => {
+      const next = clampPreviewZoom(Number((current + delta).toFixed(2)));
+      if (next === current) return current;
+      const ratio = next / current;
+      setPreviewPan((pan) => ({
+        x: anchorX - (anchorX - pan.x) * ratio,
+        y: anchorY - (anchorY - pan.y) * ratio
+      }));
+      return next;
+    });
+  }
+
+  function startImagePreviewDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    previewDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: previewPan.x,
+      originY: previewPan.y
+    };
+    setPreviewDragging(true);
+  }
+
+  function moveImagePreview(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = previewDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    setPreviewPan({
+      x: drag.originX + event.clientX - drag.startX,
+      y: drag.originY + event.clientY - drag.startY
+    });
+  }
+
+  function finishImagePreviewDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = previewDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    previewDragRef.current = null;
+    setPreviewDragging(false);
   }
 
   function openImagePreview(url: string) {
-    setPreviewZoom(1);
+    resetImagePreview();
     setPreviewBaseSize(null);
     setPreview(url);
   }
 
   function closeImagePreview() {
     setPreview(null);
-    setPreviewZoom(1);
+    resetImagePreview();
     setPreviewBaseSize(null);
+    previewDragRef.current = null;
+    setPreviewDragging(false);
   }
 
   function measurePreviewImage(image: HTMLImageElement) {
@@ -275,18 +350,27 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
       {message && <div className="alert warning">{message}</div>}
       {preview && <div className="image-modal image-modal-zoomable" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={closeImagePreview}>
         <button className="image-modal-close" type="button" onClick={closeImagePreview} aria-label="关闭预览"><X size={22} /></button>
-        <div className="image-modal-viewport" onClick={(event) => event.stopPropagation()}>
+        <div
+          className={`image-modal-viewport${previewDragging ? " is-dragging" : ""}`}
+          onClick={(event) => event.stopPropagation()}
+          onWheel={zoomImagePreviewAtPointer}
+          onPointerDown={startImagePreviewDrag}
+          onPointerMove={moveImagePreview}
+          onPointerUp={finishImagePreviewDrag}
+          onPointerCancel={finishImagePreviewDrag}
+          onDoubleClick={resetImagePreview}
+          title="滚轮缩放，按住左键拖动查看，双击复位"
+        >
           <div className="image-modal-canvas">
             <img
-              className={previewZoom >= PREVIEW_ZOOM_MAX ? "is-max-zoom" : ""}
               src={preview}
               alt="图片预览"
-              title={previewZoom < PREVIEW_ZOOM_MAX ? "点击继续放大" : "已放大到最大"}
+              draggable={false}
               onLoad={(event) => measurePreviewImage(event.currentTarget)}
-              onClick={() => adjustPreviewZoom(PREVIEW_ZOOM_STEP)}
               style={previewBaseSize ? {
-                width: `${Math.round(previewBaseSize.width * previewZoom)}px`,
-                height: `${Math.round(previewBaseSize.height * previewZoom)}px`
+                width: `${previewBaseSize.width}px`,
+                height: `${previewBaseSize.height}px`,
+                transform: `translate3d(${previewPan.x}px, ${previewPan.y}px, 0) scale(${previewZoom})`
               } : undefined}
             />
           </div>
@@ -295,7 +379,7 @@ export default function ProductCutout({ active, onUseAsOrganizerSource }: Props)
           <button type="button" disabled={previewZoom <= PREVIEW_ZOOM_MIN} onClick={(event) => { event.stopPropagation(); adjustPreviewZoom(-PREVIEW_ZOOM_STEP); }} aria-label="缩小图片"><ZoomOut size={20} /></button>
           <output aria-live="polite">{Math.round(previewZoom * 100)}%</output>
           <button type="button" disabled={previewZoom >= PREVIEW_ZOOM_MAX} onClick={(event) => { event.stopPropagation(); adjustPreviewZoom(PREVIEW_ZOOM_STEP); }} aria-label="放大图片"><ZoomIn size={20} /></button>
-          <button type="button" onClick={(event) => { event.stopPropagation(); setPreviewZoom(1); }} aria-label="恢复原始缩放" title="恢复 100%"><RotateCcw size={18} /></button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); resetImagePreview(); }} aria-label="恢复原始缩放" title="恢复 100%"><RotateCcw size={18} /></button>
         </div>
       </div>}
     </section>

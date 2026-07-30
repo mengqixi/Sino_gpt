@@ -1,5 +1,5 @@
 import { Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { DragEvent } from "react";
+import type { DragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -141,6 +141,10 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
 };
 
 const VIP_INFO_PRODUCT_BOX = { left: 294, top: 238, right: 687, bottom: 511 } as const;
+const VIP_INFO_PRODUCT_SCALE = 0.85;
+const IMAGE_PREVIEW_ZOOM_MIN = 0.5;
+const IMAGE_PREVIEW_ZOOM_MAX = 5;
+const IMAGE_PREVIEW_ZOOM_STEP = 0.25;
 
 function slotDisplayTitle(platform: OrganizerPlatform, fileName: string, fallback: string) {
   const vipTitles: Record<string, string> = {
@@ -537,6 +541,7 @@ function SlotSafeAreaOverlay({ slot, platform, sourceIndex, targetFolder }: {
 
 const livePreviewImageCache = new Map<string, HTMLImageElement>();
 const livePreviewBoundsCache = new Map<string, { left: number; top: number; right: number; bottom: number }>();
+const livePreviewRawCutoutCache = new Map<string, HTMLCanvasElement>();
 const livePreviewCutoutCache = new Map<string, HTMLCanvasElement>();
 const livePreviewLightBorderCache = new Map<string, boolean>();
 let liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
@@ -547,6 +552,7 @@ const liveJdProductLayerCache = new Map<string, LiveProductLayer>();
 function clearLivePreviewCaches() {
   livePreviewImageCache.clear();
   livePreviewBoundsCache.clear();
+  livePreviewRawCutoutCache.clear();
   livePreviewCutoutCache.clear();
   livePreviewLightBorderCache.clear();
   liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
@@ -563,8 +569,8 @@ function livePreviewImage(url: string) {
   return image;
 }
 
-function livePreviewProductCutout(url: string, image: HTMLImageElement) {
-  const cached = livePreviewCutoutCache.get(url);
+function livePreviewRawProductCutout(url: string, image: HTMLImageElement) {
+  const cached = livePreviewRawCutoutCache.get(url);
   if (cached) return cached;
   const scale = Math.min(1, 1100 / Math.max(image.naturalWidth, image.naturalHeight));
   const canvas = document.createElement("canvas");
@@ -637,6 +643,36 @@ function livePreviewProductCutout(url: string, image: HTMLImageElement) {
     if (visited[pixelIndex]) pixels[pixelIndex * 4 + 3] = 0;
   }
   context.putImageData(imageData, 0, 0);
+  livePreviewRawCutoutCache.set(url, canvas);
+  return canvas;
+}
+
+function livePreviewProductCutout(url: string, image: HTMLImageElement) {
+  const cached = livePreviewCutoutCache.get(url);
+  if (cached) return cached;
+  const raw = livePreviewRawProductCutout(url, image);
+  const bounds = liveInfoMeasurementBounds(raw);
+  const objectWidth = Math.max(1, bounds.right - bounds.left);
+  const objectHeight = Math.max(1, bounds.bottom - bounds.top);
+  const padding = Math.max(3, Math.round(Math.max(objectWidth, objectHeight) * 0.015));
+  const left = Math.max(0, bounds.left - padding);
+  const top = Math.max(0, bounds.top - padding);
+  const right = Math.min(raw.width, bounds.right + padding);
+  const bottom = Math.min(raw.height, bounds.bottom + padding);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, right - left);
+  canvas.height = Math.max(1, bottom - top);
+  canvas.getContext("2d")?.drawImage(
+    raw,
+    left,
+    top,
+    canvas.width,
+    canvas.height,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
   livePreviewCutoutCache.set(url, canvas);
   return canvas;
 }
@@ -864,6 +900,9 @@ function infoRulerGeometry(body: PixelBounds) {
   const rulerGap = 34;
   const left = Math.round(body.left + 4);
   const right = Math.round(body.right - 4);
+  // The detected alpha boundary includes anti-aliased edge/shadow pixels.
+  // Keep the long-standing calibrated insets so the rulers follow the visible
+  // leather body rather than the faint outer fringe.
   const bottom = Math.round(body.bottom - 9);
   const top = Math.round(body.top - 5);
   return {
@@ -871,9 +910,37 @@ function infoRulerGeometry(body: PixelBounds) {
     right,
     top,
     bottom,
-    verticalX: Math.max(285, left - rulerGap),
+    verticalX: Math.max(30, left - rulerGap),
     horizontalY: Math.min(535, bottom + rulerGap)
   };
+}
+
+function drawVipInfoStaticPreview(
+  context: CanvasRenderingContext2D,
+  productInfo: Record<string, string>
+) {
+  context.save();
+  context.fillStyle = "#101010";
+  context.font = "700 32px sans-serif";
+  context.textAlign = "left";
+  context.textBaseline = "top";
+  context.fillText("\u4ea7\u54c1\u4fe1\u606f", 290, 40);
+
+  const rows = [
+    ["\u6750\u8d28", productInfo.main_material || "\u5f85\u586b\u5199"],
+    ["\u91cc\u6599", productInfo.lining_material || "\u5f85\u586b\u5199"],
+    ["\u80cc\u6cd5", productInfo.wearing_method || "\u5f85\u586b\u5199"]
+  ];
+  rows.forEach(([label, value], index) => {
+    const y = 216 + index * 96;
+    context.fillStyle = "#111111";
+    context.font = "700 20px sans-serif";
+    context.fillText(label, 45, y);
+    context.fillStyle = "#555555";
+    context.font = "19px sans-serif";
+    context.fillText(value.slice(0, 18), 45, y + 34);
+  });
+  context.restore();
 }
 
 function transformCanvasRulerSegment(
@@ -933,7 +1000,9 @@ function infoWidthRulerGeometry(
   const anchorDirection = Math.hypot(22, 18);
   const start = {
     x: baseBody.right + 22 / anchorDirection * rulerGap,
-    y: baseBody.bottom + 18 / anchorDirection * rulerGap
+    // Match the exact/final renderer.  Without this clamp, the live width
+    // ruler can move lower than the generated 401 image near the safe edge.
+    y: Math.min(520, baseBody.bottom + 18 / anchorDirection * rulerGap)
   };
   const end = { x: start.x + 51, y: start.y - 27 };
   const deltaX = end.x - start.x;
@@ -1005,7 +1074,9 @@ function liveJdProductLayer(url: string, image: HTMLImageElement, draft: ImageAd
   const key = `${url}|${cropKey}`;
   const cached = liveJdProductLayerCache.get(key);
   if (cached) return cached;
-  const cutout = livePreviewProductCutout(url, image);
+  // Crop coordinates are stored against the uploaded image, so manual crops
+  // must start from the full-size cutout rather than the already trimmed layer.
+  const cutout = livePreviewRawProductCutout(url, image);
   const cropLeft = Math.max(0, Math.min(cutout.width - 1, Math.round(draft.crop_x * cutout.width)));
   const cropTop = Math.max(0, Math.min(cutout.height - 1, Math.round(draft.crop_y * cutout.height)));
   const cropRight = Math.max(cropLeft + 1, Math.min(cutout.width, Math.round((draft.crop_x + draft.crop_width) * cutout.width)));
@@ -1091,53 +1162,25 @@ function liveInfoProductBody(
     || draft.crop_y > 0.0001
     || draft.crop_width < 0.9999
     || draft.crop_height < 0.9999;
-  const automaticBounds = livePreviewContentBounds(sourceUrl, image);
-  const bounds = hasManualCrop ? {
-    left: 0,
-    top: 0,
-    right: image.naturalWidth,
-    bottom: image.naturalHeight
-  } : automaticBounds;
-  const contentWidth = Math.max(1, bounds.right - bounds.left);
-  const contentHeight = Math.max(1, bounds.bottom - bounds.top);
-  const sourceX = Math.max(0, Math.min(image.naturalWidth - 1, bounds.left + draft.crop_x * contentWidth));
-  const sourceY = Math.max(0, Math.min(image.naturalHeight - 1, bounds.top + draft.crop_y * contentHeight));
-  const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, draft.crop_width * contentWidth));
-  const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, draft.crop_height * contentHeight));
   const productLayer = livePreviewProductCutout(sourceUrl, image);
   const croppedProductLayer = hasManualCrop ? liveJdProductLayer(sourceUrl, image, draft) : null;
-  const drawSourceScaleX = productLayer.width / Math.max(1, image.naturalWidth);
-  const drawSourceScaleY = productLayer.height / Math.max(1, image.naturalHeight);
-  const drawSourceX = croppedProductLayer ? 0 : sourceX * drawSourceScaleX;
-  const drawSourceY = croppedProductLayer ? 0 : sourceY * drawSourceScaleY;
-  const drawSourceWidth = croppedProductLayer ? croppedProductLayer.canvas.width : sourceWidth * drawSourceScaleX;
-  const drawSourceHeight = croppedProductLayer ? croppedProductLayer.canvas.height : sourceHeight * drawSourceScaleY;
+  const drawSource = croppedProductLayer?.canvas || productLayer;
+  const drawSourceWidth = drawSource.width;
+  const drawSourceHeight = drawSource.height;
   const fitScale = Math.min(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight);
-  const drawWidth = drawSourceWidth * fitScale * draft.zoom;
-  const drawHeight = drawSourceHeight * fitScale * draft.zoom;
+  const drawWidth = drawSourceWidth * fitScale * draft.zoom * VIP_INFO_PRODUCT_SCALE;
+  const drawHeight = drawSourceHeight * fitScale * draft.zoom * VIP_INFO_PRODUCT_SCALE;
   let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
   let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight;
-  const layerBounds = croppedProductLayer?.body || liveInfoMeasurementBounds(productLayer);
-
-  if (!hasManualCrop) {
-    drawX += (drawSourceX + drawSourceWidth / 2 - (layerBounds.left + layerBounds.right) / 2)
-      * drawWidth / drawSourceWidth;
-    drawY += (drawSourceY + drawSourceHeight / 2 - (layerBounds.top + layerBounds.bottom) / 2)
-      * drawHeight / drawSourceHeight;
-  }
-
-  const measuredLeft = Math.max(drawSourceX, layerBounds.left);
-  const measuredTop = Math.max(drawSourceY, layerBounds.top);
-  const measuredRight = Math.min(drawSourceX + drawSourceWidth, layerBounds.right);
-  const measuredBottom = Math.min(drawSourceY + drawSourceHeight, layerBounds.bottom);
-  if (measuredRight <= measuredLeft || measuredBottom <= measuredTop) {
+  const layerBounds = croppedProductLayer?.body || liveInfoMeasurementBounds(drawSource);
+  if (layerBounds.right <= layerBounds.left || layerBounds.bottom <= layerBounds.top) {
     return { left: drawX, top: drawY, right: drawX + drawWidth, bottom: drawY + drawHeight };
   }
   return {
-    left: drawX + (measuredLeft - drawSourceX) / drawSourceWidth * drawWidth,
-    top: drawY + (measuredTop - drawSourceY) / drawSourceHeight * drawHeight,
-    right: drawX + (measuredRight - drawSourceX) / drawSourceWidth * drawWidth,
-    bottom: drawY + (measuredBottom - drawSourceY) / drawSourceHeight * drawHeight
+    left: drawX + layerBounds.left / drawSourceWidth * drawWidth,
+    top: drawY + layerBounds.top / drawSourceHeight * drawHeight,
+    right: drawX + layerBounds.right / drawSourceWidth * drawWidth,
+    bottom: drawY + layerBounds.bottom / drawSourceHeight * drawHeight
   };
 }
 
@@ -1518,7 +1561,6 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     const compositePrimary = platform === "vip" && slot.file_name === "606.jpg"
       ? livePreviewImage(compositePrimaryUrl || sourceUrl)
       : null;
-    const template = templateUrl && platform !== "jd" ? livePreviewImage(templateUrl) : null;
     const phoneReference = platform === "jd" && slot.file_name === "5.jpg"
       ? livePreviewImage("/organizer-assets/iphone_reference.png")
       : null;
@@ -1528,11 +1570,12 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     const draw = () => {
       if (!image.complete || !image.naturalWidth) return;
       if (compositePrimary && (!compositePrimary.complete || !compositePrimary.naturalWidth)) return;
-      if (template && (!template.complete || !template.naturalWidth)) return;
       context.clearRect(0, 0, output.width, output.height);
       context.fillStyle = slot.file_name === "5.jpg" && platform === "jd" ? "#f3f3f3" : "#fff";
       context.fillRect(0, 0, output.width, output.height);
-      if (template) context.drawImage(template, 0, 0, output.width, output.height);
+      if (platform === "vip" && slot.file_name === "401.jpg") {
+        drawVipInfoStaticPreview(context, productInfo);
+      }
       if (platform === "vip" && ["604.jpg", "605.jpg"].includes(slot.file_name)) {
         context.fillStyle = "#fff";
         context.fillRect(0, output.height * 0.18, output.width, output.height * 0.82);
@@ -1567,7 +1610,7 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         ? ["2.jpg", "透明.png"].includes(slot.file_name)
         : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg"].includes(slot.file_name))
         || usesAutomaticDetailCutout;
-      const automaticBounds = usesProductCutout ? livePreviewContentBounds(sourceUrl, image) : {
+      const automaticBounds = !usesProductCutout ? livePreviewContentBounds(sourceUrl, image) : {
         left: 0,
         top: 0,
         right: image.naturalWidth,
@@ -1575,7 +1618,7 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       };
       // A manual crop is expressed in full-image coordinates. Automatic content
       // bounds are only useful before the designer chooses an explicit region.
-      const bounds = usesProductCutout && !hasManualCrop ? automaticBounds : {
+      const bounds = !usesProductCutout && !hasManualCrop ? automaticBounds : {
         left: 0,
         top: 0,
         right: image.naturalWidth,
@@ -1595,24 +1638,25 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         ? liveJdProductLayer(sourceUrl, image, draft)
         : null;
       const drawSource = croppedProductLayer?.canvas || productLayer || image;
-      const drawSourceScaleX = productLayer ? productLayer.width / image.naturalWidth : 1;
-      const drawSourceScaleY = productLayer ? productLayer.height / image.naturalHeight : 1;
-      const drawSourceX = croppedProductLayer ? 0 : sourceX * drawSourceScaleX;
-      const drawSourceY = croppedProductLayer ? 0 : sourceY * drawSourceScaleY;
-      const drawSourceWidth = croppedProductLayer ? croppedProductLayer.canvas.width : sourceWidth * drawSourceScaleX;
-      const drawSourceHeight = croppedProductLayer ? croppedProductLayer.canvas.height : sourceHeight * drawSourceScaleY;
+      const drawSourceX = usesProductCutout ? 0 : sourceX;
+      const drawSourceY = usesProductCutout ? 0 : sourceY;
+      const drawSourceWidth = usesProductCutout ? drawSource.width : sourceWidth;
+      const drawSourceHeight = usesProductCutout ? drawSource.height : sourceHeight;
       const fitScale = area.mode === "cover" && !hasManualCrop && !usesAutomaticDetailCutout
         ? Math.max(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight)
         : Math.min(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight);
       const automaticDetailScale = usesAutomaticDetailCutout
         ? automaticInteriorDetail ? 0.9 : 0.82
         : 1;
-      const detailRatio = contentWidth / Math.max(1, contentHeight);
+      const detailRatio = drawSourceWidth / Math.max(1, drawSourceHeight);
       const vipDetailOffset = detailRatio <= 0.78
         ? -0.105
         : detailRatio <= 1.05 ? -0.11 : detailRatio <= 1.45 ? -0.12 : -0.13;
-      const drawWidth = drawSourceWidth * fitScale * draft.zoom * automaticDetailScale;
-      const drawHeight = drawSourceHeight * fitScale * draft.zoom * automaticDetailScale;
+      const infoProductScale = platform === "vip" && slot.file_name === "401.jpg"
+        ? VIP_INFO_PRODUCT_SCALE
+        : 1;
+      const drawWidth = drawSourceWidth * fitScale * draft.zoom * automaticDetailScale * infoProductScale;
+      const drawHeight = drawSourceHeight * fitScale * draft.zoom * automaticDetailScale * infoProductScale;
       let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
       const multiAngleHandleLift = compositePrimary
         ? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
@@ -1620,43 +1664,27 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       const multiAngleRowShift = multiAngleHandleLift >= 0.55
         ? (sourceIndex < 2 ? 1 : -1) * Math.round(13 * multiAngleHandleLift * output.height / 750)
         : 0;
-      const handleAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
-        || (platform === "jd" && slot.file_name === "2.jpg");
       const tallHandleDropAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
         || (platform === "jd" && slot.file_name === "2.jpg");
       const tallHandleDropRatio = platform === "vip" && slot.file_name === "2.jpg" ? 0.14 : 0.12;
-      const bodyCentered = (handleAware || (platform === "vip" && slot.file_name === "401.jpg"))
-        && productLayer
-        && !hasManualCrop;
       let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
         + multiAngleRowShift
-        + (usesAutomaticDetailCutout && !automaticInteriorDetail ? vipDetailOffset * areaHeight : 0)
+        + (usesAutomaticDetailCutout && !automaticInteriorDetail ? (vipDetailOffset + 0.02) * areaHeight : 0)
         - (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name) && !hasManualCrop ? 0.03 * areaHeight : 0)
         + (tallHandleDropAware && productLayer && !hasManualCrop
           ? tallHandleDropRatio * liveHandleVisualLift(productLayer) * areaHeight
           : 0);
-      if (bodyCentered) {
-        const body = liveInfoMeasurementBounds(productLayer);
-        const cropLeft = sourceX * drawSourceScaleX;
-        const cropTop = sourceY * drawSourceScaleY;
-        const cropWidth = sourceWidth * drawSourceScaleX;
-        const cropHeight = sourceHeight * drawSourceScaleY;
-        drawX += (cropLeft + cropWidth / 2 - (body.left + body.right) / 2) * drawWidth / Math.max(1, cropWidth);
-        drawY += (cropTop + cropHeight / 2 - (body.top + body.bottom) / 2) * drawHeight / Math.max(1, cropHeight);
-      }
       const editorArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
       const safeLeft = editorArea.x * output.width;
       const safeTop = editorArea.y * output.height;
       const safeRight = (editorArea.x + editorArea.width) * output.width;
       const safeBottom = (editorArea.y + editorArea.height) * output.height;
-      const allowFreeMovement = hasManualLayout && (
-        (platform === "vip" && slot.file_name === "401.jpg")
-        || (platform === "jd" && slot.file_name === "3.jpg")
-      );
-      const allowFreeHorizontalMovement = hasManualLayout
-        && platform === "jd"
-        && ["0-无logo.jpg", "1.jpg"].includes(slot.file_name);
-      if (!allowFreeMovement && !allowFreeHorizontalMovement) {
+      // Keep automatic placement constrained, but do not re-clamp a layer
+      // after the designer explicitly moves, crops or zooms it. Re-clamping
+      // made dragging asymmetric and caused the zoom anchor to jump from one
+      // edge to the other. This applies equally to VIP and JD manual edits.
+      const allowFreeMovement = hasManualLayout;
+      if (!allowFreeMovement) {
         drawX = clampLayerOrigin(drawX, drawWidth, safeLeft, safeRight);
       }
       if (!allowFreeMovement) {
@@ -1783,14 +1811,12 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     };
     image.addEventListener("load", draw);
     if (compositePrimary) compositePrimary.addEventListener("load", draw);
-    if (template) template.addEventListener("load", draw);
     if (phoneReference) phoneReference.addEventListener("load", draw);
     if (logoReference) logoReference.addEventListener("load", draw);
     draw();
     return () => {
       image.removeEventListener("load", draw);
       if (compositePrimary) compositePrimary.removeEventListener("load", draw);
-      if (template) template.removeEventListener("load", draw);
       if (phoneReference) phoneReference.removeEventListener("load", draw);
       if (logoReference) logoReference.removeEventListener("load", draw);
     };
@@ -1807,7 +1833,10 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     logoColor,
     productInfo.product_length,
     productInfo.product_width,
-    productInfo.product_height
+    productInfo.product_height,
+    productInfo.main_material,
+    productInfo.lining_material,
+    productInfo.wearing_method
   ]);
 
   return <canvas ref={canvasRef} aria-label={`${slot.file_name} 前端即时预览`} />;
@@ -1950,12 +1979,17 @@ function SlotAdjustmentEditor({
     syncJdFolders?: boolean
   ) => void;
 }) {
+  const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
   const initial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
+  // A stored 401 preview may have been rendered with the former 100% product
+  // scale. Always rebuild it so the editor opens with the same exact 85%
+  // geometry used by the live canvas and the final export.
+  const usableInitialPreview = isInfoPage ? "" : (initialPreview || "");
   const supportsLogoColor = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name);
   const [draft, setDraft] = useState<ImageAdjustment>(initial);
   const [logoColor, setLogoColor] = useState<LogoColor>(slot.logo_color === "white" ? "white" : "black");
-  const [renderedPreview, setRenderedPreview] = useState(initialPreview || "");
-  const [previewSynced, setPreviewSynced] = useState(Boolean(initialPreview));
+  const [renderedPreview, setRenderedPreview] = useState(usableInitialPreview);
+  const [previewSynced, setPreviewSynced] = useState(Boolean(usableInitialPreview));
   const [holdExactPreview, setHoldExactPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1963,11 +1997,8 @@ function SlotAdjustmentEditor({
   const [cropMode, setCropMode] = useState(false);
   const isPhoneComparison = platform === "jd" && slot.file_name === "5.jpg";
   const supportsJdFolderSync = platform === "jd" && previewFoldersForSlot(slot, platform).length > 1;
-  const [syncJdFolders, setSyncJdFolders] = useState(
-    supportsJdFolderSync && !isPhoneComparison
-  );
+  const [syncJdFolders, setSyncJdFolders] = useState(false);
   const isPhoneObjectEditor = isPhoneComparison && initialMoveTarget === "phone";
-  const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
   const [moveTarget, setMoveTarget] = useState<AdjustmentTarget>(initialMoveTarget);
   const [infoMoveTarget, setInfoMoveTarget] = useState<InfoMoveTarget>(
     initial.product_show_ruler === false ? "product" : "product_rulers"
@@ -1983,7 +2014,7 @@ function SlotAdjustmentEditor({
   const moveFrameRef = useRef<number | null>(null);
   const draftRef = useRef<ImageAdjustment>(initial);
   const logoColorRef = useRef<LogoColor>(slot.logo_color === "white" ? "white" : "black");
-  const renderedPreviewRef = useRef(initialPreview || "");
+  const renderedPreviewRef = useRef(usableInitialPreview);
   const draftVersionRef = useRef(0);
   const syncedVersionRef = useRef(initialPreview ? 0 : -1);
   const previewRequestRef = useRef(0);
@@ -2263,7 +2294,7 @@ function SlotAdjustmentEditor({
   }
 
   useEffect(() => {
-    if (!initialPreview) void refreshPreview(initial, 0);
+    if (!usableInitialPreview) void refreshPreview(initial, 0);
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
@@ -2411,26 +2442,8 @@ function SlotAdjustmentEditor({
       logoColorRef.current = "black";
       setLogoColor("black");
     }
-    if (activeMoveTarget !== "product") {
-      let next = withTargetScale(draftRef.current, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
-      next = withTargetOffset(next, activeMoveTarget, 0, 0);
-      if (activeMoveTarget === "phone") {
-        const keepPhoneRulerLinked = isPhoneObjectEditor && draftRef.current.phone_show_ruler !== false;
-        next = {
-          ...next,
-          phone_alignment: "bottom",
-          phone_show_ruler: keepPhoneRulerLinked,
-          ...(keepPhoneRulerLinked ? {
-            phone_ruler_scale: DEFAULT_ADJUSTMENT.phone_ruler_scale,
-            phone_ruler_offset_x: DEFAULT_ADJUSTMENT.phone_ruler_offset_x,
-            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y
-          } : {})
-        };
-      }
-      applyDraft(next);
-    } else if (isPhoneComparison || isInfoPage) {
-      const resetProduct = {
-        ...draftRef.current,
+    const resetProduct = (current: ImageAdjustment) => ({
+        ...current,
         zoom: DEFAULT_ADJUSTMENT.zoom,
         offset_x: DEFAULT_ADJUSTMENT.offset_x,
         offset_y: DEFAULT_ADJUSTMENT.offset_y,
@@ -2441,13 +2454,10 @@ function SlotAdjustmentEditor({
         product_ruler_base_left: undefined,
         product_ruler_base_top: undefined,
         product_ruler_base_right: undefined,
-        product_ruler_base_bottom: undefined,
-        product_show_ruler: isInfoPage
-          ? infoMoveTarget === "product_rulers"
-          : draftRef.current.product_show_ruler
-      };
-      const automaticDraft = linkedProductRulersRef.current ? {
-        ...resetProduct,
+        product_ruler_base_bottom: undefined
+    });
+    const resetProductRulers = (current: ImageAdjustment) => ({
+        ...current,
         product_ruler_group_scale: 1,
         product_ruler_group_offset_x: 0,
         product_ruler_group_offset_y: 0,
@@ -2456,11 +2466,59 @@ function SlotAdjustmentEditor({
         length_ruler_offset_y: 0,
         height_ruler_scale: 1,
         height_ruler_offset_x: 0,
-        height_ruler_offset_y: 0
-      } : resetProduct;
-      // A reset must discard the stored manual ruler body. Re-syncing here would
-      // rebuild it from the pre-reset draft and make "恢复自动" retain stale state.
-      applyDraft(automaticDraft, false);
+        height_ruler_offset_y: 0,
+        width_ruler_scale: 1,
+        width_ruler_offset_x: 0,
+        width_ruler_offset_y: 0
+    });
+    let next = draftRef.current;
+
+    if (isInfoPage) {
+      if (infoMoveTarget === "product_rulers") {
+        next = resetProductRulers({
+          ...resetProduct(next),
+          product_show_ruler: true
+        });
+      } else if (infoMoveTarget === "product") {
+        next = {
+          ...resetProduct(next),
+          product_show_ruler: false
+        };
+      } else {
+        next = withTargetScale(next, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
+        next = withTargetOffset(next, activeMoveTarget, 0, 0);
+      }
+      applyDraft(next, false);
+    } else if (isPhoneComparison) {
+      if (activeMoveTarget === "product") {
+        next = {
+          ...resetProduct(next),
+          product_show_ruler: next.product_show_ruler
+        };
+        if (linkedProductRulersRef.current) next = resetProductRulers(next);
+      } else if (activeMoveTarget === "phone") {
+        const phoneRulerLinked = next.phone_show_ruler !== false;
+        next = {
+          ...next,
+          phone_scale: DEFAULT_ADJUSTMENT.phone_scale,
+          phone_offset_x: DEFAULT_ADJUSTMENT.phone_offset_x,
+          phone_offset_y: DEFAULT_ADJUSTMENT.phone_offset_y,
+          phone_alignment: "bottom",
+          ...(phoneRulerLinked ? {
+            phone_ruler_scale: DEFAULT_ADJUSTMENT.phone_ruler_scale,
+            phone_ruler_offset_x: DEFAULT_ADJUSTMENT.phone_ruler_offset_x,
+            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y
+          } : {})
+        };
+      } else {
+        next = withTargetScale(next, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
+        next = withTargetOffset(next, activeMoveTarget, 0, 0);
+      }
+      applyDraft(next, false);
+    } else if (activeMoveTarget !== "product") {
+      next = withTargetScale(next, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
+      next = withTargetOffset(next, activeMoveTarget, 0, 0);
+      applyDraft(next, false);
     } else {
       applyDraft({ ...DEFAULT_ADJUSTMENT });
     }
@@ -2581,6 +2639,9 @@ function SlotAdjustmentEditor({
               ref={resultStageRef}
               className={`slot-result-stage${busy ? " is-loading" : ""}`}
               onPointerDown={(event) => {
+                cancelStalePreview();
+                setHoldExactPreview(false);
+                setPreviewSynced(false);
                 event.currentTarget.setPointerCapture(event.pointerId);
                 const currentOffset = targetOffset(draftRef.current, activeMoveTarget);
                 moveStartRef.current = {
@@ -2600,7 +2661,7 @@ function SlotAdjustmentEditor({
                 const dragSensitivity = platform === "jd"
                   && slot.file_name === "2.jpg"
                   && start.target === "product"
-                  ? 0.55
+                  ? 0.65
                   : 1;
                 const canvasDeltaX = (event.clientX - start.x) * output.width / Math.max(1, bounds.width) * dragSensitivity;
                 const canvasDeltaY = (event.clientY - start.y) * output.height / Math.max(1, bounds.height) * dragSensitivity;
@@ -2622,7 +2683,7 @@ function SlotAdjustmentEditor({
               <LiveSlotPreview
                 sourceUrl={sourceUrl}
                 compositePrimaryUrl={compositePrimaryUrl}
-                templateUrl={renderedPreview || initialPreview}
+                templateUrl={renderedPreview || usableInitialPreview}
                 slot={slot}
                 draft={draft}
                 platform={platform}
@@ -2680,18 +2741,18 @@ function SlotAdjustmentEditor({
               <button type="button" className={draft.phone_alignment === "center" ? "active-tool" : ""} onClick={() => changePhoneAlignment("center")}>中心同高</button>
               <button type="button" className={(draft.phone_alignment || "bottom") === "bottom" ? "active-tool" : ""} onClick={() => changePhoneAlignment("bottom")}>底部齐平</button>
             </> : isInfoPage ? <>
+              <button type="button" className={infoMoveTarget === "product_rulers" ? "active-tool" : ""} onClick={() => {
+                setInfoMoveTarget("product_rulers");
+                linkedProductRulersRef.current = true;
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
+              }}>全部</button>
               <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product");
                 linkedProductRulersRef.current = false;
                 if (draftRef.current.product_show_ruler !== false) {
                   applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
                 }
-              }}>仅商品图</button>
-              <button type="button" className={infoMoveTarget === "product_rulers" ? "active-tool" : ""} onClick={() => {
-                setInfoMoveTarget("product_rulers");
-                linkedProductRulersRef.current = true;
-                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
-              }}>全部</button>
+              }}>商品图</button>
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("length_ruler");
                 linkedProductRulersRef.current = false;
@@ -2708,6 +2769,11 @@ function SlotAdjustmentEditor({
                 setCropMode(false);
               }}>宽标线</button>
             </> : <>
+              <button type="button" className={moveTarget === "product" && draft.product_show_ruler !== false ? "active-tool" : ""} onClick={() => {
+                setMoveTarget("product");
+                linkedProductRulersRef.current = true;
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
+              }}>全部</button>
               <button type="button" className={moveTarget === "product" && draft.product_show_ruler === false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("product");
                 linkedProductRulersRef.current = false;
@@ -2715,23 +2781,18 @@ function SlotAdjustmentEditor({
                   applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
                 }
               }}>商品图</button>
-              <button type="button" className={moveTarget === "product" && draft.product_show_ruler !== false ? "active-tool" : ""} onClick={() => {
-                setMoveTarget("product");
-                linkedProductRulersRef.current = true;
-                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
-              }}>商品图和长高标线</button>
               <button type="button" className={moveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("length_ruler");
                 linkedProductRulersRef.current = false;
                 setCropMode(false);
                 if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
-              }}>商品长标线</button>
+              }}>长标线</button>
               <button type="button" className={moveTarget === "height_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("height_ruler");
                 linkedProductRulersRef.current = false;
                 setCropMode(false);
                 if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
-              }}>商品高标线</button>
+              }}>高标线</button>
             </>}
           </div>}
           {activeMoveTarget === "product" && <button type="button" className={cropMode ? "active-tool" : ""} onClick={toggleCropMode}><Crop size={18} />裁剪</button>}
@@ -2780,6 +2841,153 @@ type VipOrganizerProps = {
   initialProductFile?: File | null;
   onInitialProductFileConsumed?: () => void;
 };
+
+function ZoomableImagePreview({ url, onClose }: { url: string; onClose: () => void }) {
+  const [zoom, setZoom] = useState(1);
+  const [baseSize, setBaseSize] = useState<{ width: number; height: number } | null>(null);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+
+  function clampZoom(value: number) {
+    return Math.min(IMAGE_PREVIEW_ZOOM_MAX, Math.max(IMAGE_PREVIEW_ZOOM_MIN, value));
+  }
+
+  function resetPreview() {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }
+
+  function adjustZoom(delta: number) {
+    setZoom((current) => {
+      const next = clampZoom(Number((current + delta).toFixed(2)));
+      if (next === current) return current;
+      const ratio = next / current;
+      setPan((currentPan) => ({ x: currentPan.x * ratio, y: currentPan.y * ratio }));
+      return next;
+    });
+  }
+
+  function zoomAtPointer(event: ReactWheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const anchorX = event.clientX - (rect.left + rect.width / 2);
+    const anchorY = event.clientY - (rect.top + rect.height / 2);
+    const delta = event.deltaY < 0 ? IMAGE_PREVIEW_ZOOM_STEP : -IMAGE_PREVIEW_ZOOM_STEP;
+    setZoom((current) => {
+      const next = clampZoom(Number((current + delta).toFixed(2)));
+      if (next === current) return current;
+      const ratio = next / current;
+      setPan((currentPan) => ({
+        x: anchorX - (anchorX - currentPan.x) * ratio,
+        y: anchorY - (anchorY - currentPan.y) * ratio
+      }));
+      return next;
+    });
+  }
+
+  function startDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: pan.x,
+      originY: pan.y
+    };
+    setDragging(true);
+  }
+
+  function movePreview(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    setPan({
+      x: drag.originX + event.clientX - drag.startX,
+      y: drag.originY + event.clientY - drag.startY
+    });
+  }
+
+  function finishDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    dragRef.current = null;
+    setDragging(false);
+  }
+
+  function measureImage(image: HTMLImageElement) {
+    const availableWidth = Math.min(window.innerWidth * 0.92, 1600);
+    const availableHeight = Math.max(240, window.innerHeight - 160);
+    const fitScale = Math.min(
+      availableWidth / Math.max(1, image.naturalWidth),
+      availableHeight / Math.max(1, image.naturalHeight),
+      1
+    );
+    setBaseSize({
+      width: Math.max(1, Math.round(image.naturalWidth * fitScale)),
+      height: Math.max(1, Math.round(image.naturalHeight * fitScale))
+    });
+  }
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "+" || event.key === "=") adjustZoom(IMAGE_PREVIEW_ZOOM_STEP);
+      if (event.key === "-") adjustZoom(-IMAGE_PREVIEW_ZOOM_STEP);
+      if (event.key === "0") resetPreview();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  return <div className="image-modal image-modal-zoomable" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={onClose}>
+    <button className="image-modal-close" type="button" onClick={onClose} aria-label="关闭预览"><X size={22} /></button>
+    <div
+      className={`image-modal-viewport${dragging ? " is-dragging" : ""}`}
+      onClick={(event) => event.stopPropagation()}
+      onWheel={zoomAtPointer}
+      onPointerDown={startDrag}
+      onPointerMove={movePreview}
+      onPointerUp={finishDrag}
+      onPointerCancel={finishDrag}
+      onDoubleClick={resetPreview}
+      title="滚轮缩放，按住左键拖动查看，双击复位"
+    >
+      <div className="image-modal-canvas">
+        <img
+          src={url}
+          alt="图片预览"
+          draggable={false}
+          onLoad={(event) => measureImage(event.currentTarget)}
+          style={baseSize ? {
+            width: `${baseSize.width}px`,
+            height: `${baseSize.height}px`,
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`
+          } : undefined}
+        />
+      </div>
+    </div>
+    <div className="image-modal-zoom-controls" role="group" aria-label="图片缩放" onClick={(event) => event.stopPropagation()}>
+      <button type="button" disabled={zoom <= IMAGE_PREVIEW_ZOOM_MIN} onClick={() => adjustZoom(-IMAGE_PREVIEW_ZOOM_STEP)} aria-label="缩小图片"><ZoomOut size={20} /></button>
+      <output aria-live="polite">{Math.round(zoom * 100)}%</output>
+      <button type="button" disabled={zoom >= IMAGE_PREVIEW_ZOOM_MAX} onClick={() => adjustZoom(IMAGE_PREVIEW_ZOOM_STEP)} aria-label="放大图片"><ZoomIn size={20} /></button>
+      <button type="button" onClick={resetPreview} aria-label="恢复原始缩放" title="恢复 100%"><RotateCcw size={18} /></button>
+    </div>
+  </div>;
+}
 
 export default function VipOrganizer({ active, initialProductFile, onInitialProductFileConsumed }: VipOrganizerProps) {
   const sessionStorageKey = "vip-organizer-session-id";
@@ -2874,15 +3082,6 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   useEffect(() => {
     slotsRef.current = slots;
   }, [slots]);
-
-  useEffect(() => {
-    if (!preview) return;
-    const closePreview = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setPreview(null);
-    };
-    window.addEventListener("keydown", closePreview);
-    return () => window.removeEventListener("keydown", closePreview);
-  }, [preview]);
 
   function organizerProductInfo() {
     const dimensions = [info.product_length, info.product_width, info.product_height]
@@ -4112,10 +4311,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       </>}
 
       {message && <div className="alert warning organizer-status-message" role="status">{message}</div>}
-      {preview && <div className="image-modal" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={() => setPreview(null)}>
-        <button className="image-modal-close" type="button" onClick={() => setPreview(null)} aria-label="关闭预览"><X size={22} /></button>
-        <img src={preview} alt="图片预览" onClick={(event) => event.stopPropagation()} />
-      </div>}
+      {preview && <ZoomableImagePreview url={preview} onClose={() => setPreview(null)} />}
       {adjustmentEditor && activeEditorSlot && activeEditorAsset && <SlotAdjustmentEditor
         key={`${platform}:${adjustmentEditor.targetFolder}:${activeEditorSlot.file_name}:${adjustmentEditor.sourceIndex}:${adjustmentEditor.targetObject}:${activeEditorAsset.id}`}
         sessionId={sessionId}

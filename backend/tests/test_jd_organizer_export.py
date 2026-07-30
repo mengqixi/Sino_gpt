@@ -448,6 +448,15 @@ def test_vip_info_rulers_start_with_one_shared_gap():
     assert width_gap == 34
 
 
+def test_vip_info_rulers_use_calibrated_body_insets():
+    body = (360.4, 280.4, 559.6, 469.6)
+
+    ruler = service._info_ruler_geometry(body)
+
+    assert ruler["top"] == round(body[1] - 5)
+    assert ruler["bottom"] == round(body[3] - 9)
+
+
 def test_vip_info_width_ruler_stays_rigid_after_repeated_adjustments():
     body = (360.0, 280.0, 560.0, 470.0)
     geometry = service._info_width_ruler_geometry(
@@ -592,6 +601,23 @@ def test_vip_info_template_box_is_fifty_percent_larger():
 
     assert right - left == round(262 * 1.5)
     assert bottom - top == round(182 * 1.5)
+
+
+def test_vip_info_exact_renderer_uses_eighty_five_percent_product_scale():
+    source = Image.new("RGBA", (200, 100), (80, 90, 100, 255))
+    with (
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_jd_product_body_bbox", return_value=(0, 0, 200, 100)),
+    ):
+        body = service._paste_info_product(
+            Image.new("RGB", (750, 665), "white"),
+            source,
+            None,
+        )
+
+    box_width = service.INFO_PRODUCT_BOX[2] - service.INFO_PRODUCT_BOX[0]
+    expected_width = box_width * service.INFO_PRODUCT_SCALE
+    assert abs((body[2] - body[0]) - expected_width) <= 1
 
 
 def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
@@ -1123,6 +1149,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_vip_info_template_box_is_larger(self):
         test_vip_info_template_box_is_fifty_percent_larger()
+
+    def test_vip_info_exact_renderer_uses_eighty_five_percent_scale(self):
+        test_vip_info_exact_renderer_uses_eighty_five_percent_product_scale()
 
     def test_vip_info_rulers_stay_visible(self):
         test_vip_info_rulers_remain_visible_in_both_adjustment_modes()

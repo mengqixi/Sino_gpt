@@ -253,7 +253,8 @@ class VipOrganizerClassificationTests(unittest.TestCase):
 
         self.assertGreater(len(xs), 0)
         self.assertLess(int(ys.max()), 690)
-        self.assertLess(float(ys.mean()), 455)
+        self.assertGreater(float(ys.mean()), 455)
+        self.assertLess(float(ys.mean()), 470)
 
     def test_detail_position_adjustment_keeps_the_automatic_cutout_scale(self):
         source = Image.new("RGB", (400, 600), "white")
