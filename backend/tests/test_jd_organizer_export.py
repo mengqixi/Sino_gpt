@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from backend.services import vip_organizer_service as service
 
@@ -206,7 +206,7 @@ def test_jd_logo_detail_manual_offset_moves_the_image_horizontally():
     assert _dark_pixel_bbox(moved_right) == (500, 300, 700, 500)
 
 
-def test_jd_model_manual_offset_moves_horizontally_but_keeps_vertical_clamp():
+def test_jd_model_manual_offset_moves_freely_on_both_axes():
     source = Image.new("RGB", (800, 800), "white")
     ImageDraw.Draw(source).rectangle((300, 300, 499, 499), fill="black")
     with patch.object(service, "_draw_jd_elle_logo"):
@@ -219,7 +219,51 @@ def test_jd_model_manual_offset_moves_horizontally_but_keeps_vertical_clamp():
         )
 
     assert _dark_pixel_bbox(automatic) == (300, 300, 500, 500)
-    assert _dark_pixel_bbox(moved) == (100, 300, 300, 500)
+    assert _dark_pixel_bbox(moved) == (100, 100, 300, 300)
+
+
+def test_jd_product_first_manual_move_starts_from_automatic_position():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+
+    with (
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_draw_jd_elle_logo"),
+    ):
+        automatic = service._jd_product_page(source, (800, 800), None)
+        moved = service._jd_product_page(source, (800, 800), {"offset_y": -0.01})
+
+    automatic_box = _dark_pixel_bbox(automatic)
+    moved_box = _dark_pixel_bbox(moved)
+    assert moved_box[0] == automatic_box[0]
+    assert moved_box[2] == automatic_box[2]
+    assert -8 <= moved_box[1] - automatic_box[1] <= -4
+    assert -8 <= moved_box[3] - automatic_box[3] <= -4
+
+
+def test_jd_long_handle_product_and_transparent_slots_are_lifted():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+
+    with (
+        patch.object(service, "_load_image", return_value=source),
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_draw_jd_elle_logo"),
+    ):
+        product = service._render_jd_slot_image("2.jpg", [1], {}, [])
+        transparent = service._render_jd_slot_image("透明.png", [1], {}, [])
+
+    assert product is not None
+    assert transparent is not None
+    product_box = _dark_pixel_bbox(product)
+    transparent_box = transparent.getchannel("A").getbbox()
+    assert transparent_box is not None
+    assert 168 <= product_box[1] <= 175
+    assert (transparent_box[1] + transparent_box[3]) / 2 < (170 + 710) / 2
 
 
 def test_jd_interior_detail_fills_the_canvas_without_white_border():
@@ -448,6 +492,42 @@ def test_vip_info_rulers_start_with_one_shared_gap():
     assert width_gap == 34
 
 
+def test_vip_info_ruler_gaps_expand_with_linked_product_zoom():
+    body = (360.0, 280.0, 560.0, 470.0)
+    gap_scale = 1.25
+    ruler = service._info_ruler_geometry(body, gap_scale)
+    width_ruler = service._info_width_ruler_geometry(
+        body,
+        {"product_ruler_gap_scale": gap_scale},
+    )
+    width_start = width_ruler["segments"][0][0]
+
+    height_gap = ruler["left"] - ruler["vertical_x"]
+    length_gap = ruler["horizontal_y"] - ruler["bottom"]
+    width_gap = round(((width_start[0] - body[2]) ** 2 + (width_start[1] - body[3]) ** 2) ** 0.5)
+
+    expected_gap = 34 * gap_scale
+    assert abs(height_gap - expected_gap) <= 1
+    assert abs(length_gap - expected_gap) <= 1
+    assert abs(width_gap - expected_gap) <= 1
+
+
+def test_vip_info_enlarged_rulers_never_fold_back_into_product():
+    body = (80.0, 180.0, 690.0, 590.0)
+    gap_scale = 2.0
+    ruler = service._info_ruler_geometry(body, gap_scale)
+    width_ruler = service._info_width_ruler_geometry(
+        body,
+        {"product_ruler_gap_scale": gap_scale},
+    )
+    width_start = width_ruler["segments"][0][0]
+
+    assert ruler["horizontal_y"] > body[3]
+    assert ruler["vertical_x"] < body[0]
+    assert width_start[0] > body[2]
+    assert width_start[1] > body[3]
+
+
 def test_vip_info_rulers_use_calibrated_body_insets():
     body = (360.4, 280.4, 559.6, 469.6)
 
@@ -455,6 +535,7 @@ def test_vip_info_rulers_use_calibrated_body_insets():
 
     assert ruler["top"] == round(body[1] - 5)
     assert ruler["bottom"] == round(body[3] - 9)
+    assert service.INFO_HEIGHT_RULER_SHIFT_Y == 5
 
 
 def test_vip_info_width_ruler_stays_rigid_after_repeated_adjustments():
@@ -587,13 +668,21 @@ def test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size():
     assert abs(just_inside - just_outside) == 1
 
 
-def test_vip_info_centers_the_bag_body_instead_of_the_handle_layer():
+def test_vip_info_centers_and_lifts_the_complete_product_layer():
     source = _vip_info_test_source()
-    body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
+    canvas = Image.new("RGB", (750, 665), "white")
+    service._paste_info_product(canvas, source, None)
     left, top, right, bottom = service.INFO_PRODUCT_BOX
+    product = ImageChops.difference(canvas, Image.new("RGB", canvas.size, "white")).getbbox()
+    expected_lift = (
+        service.INFO_PRODUCT_HANDLE_LIFT_Y
+        * service._handle_visual_lift(source)
+        * (bottom - top)
+    )
 
-    assert abs((body[0] + body[2]) / 2 - (left + right) / 2) <= 1
-    assert abs((body[1] + body[3]) / 2 - (top + bottom) / 2) <= 1
+    assert product is not None
+    assert abs((product[0] + product[2]) / 2 - (left + right) / 2) <= 1
+    assert abs((product[1] + product[3]) / 2 - ((top + bottom) / 2 - expected_lift)) <= 1
 
 
 def test_vip_info_template_box_is_fifty_percent_larger():
@@ -603,7 +692,7 @@ def test_vip_info_template_box_is_fifty_percent_larger():
     assert bottom - top == round(182 * 1.5)
 
 
-def test_vip_info_exact_renderer_uses_eighty_five_percent_product_scale():
+def test_vip_info_exact_renderer_uses_full_product_scale():
     source = Image.new("RGBA", (200, 100), (80, 90, 100, 255))
     with (
         patch.object(service, "_product_cutout", return_value=source),
@@ -618,6 +707,35 @@ def test_vip_info_exact_renderer_uses_eighty_five_percent_product_scale():
     box_width = service.INFO_PRODUCT_BOX[2] - service.INFO_PRODUCT_BOX[0]
     expected_width = box_width * service.INFO_PRODUCT_SCALE
     assert abs((body[2] - body[0]) - expected_width) <= 1
+
+
+def test_vip_info_long_handles_receive_extra_product_scale():
+    ordinary = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    ImageDraw.Draw(ordinary).rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+    long_handle = ordinary.copy()
+    ImageDraw.Draw(long_handle).arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+
+    ordinary_lift = service._handle_visual_lift(ordinary)
+    long_handle_lift = service._handle_visual_lift(long_handle)
+    ordinary_scale = service.INFO_PRODUCT_SCALE * (1 + service.INFO_PRODUCT_HANDLE_SCALE * ordinary_lift)
+    long_handle_scale = service.INFO_PRODUCT_SCALE * (1 + service.INFO_PRODUCT_HANDLE_SCALE * long_handle_lift)
+
+    assert ordinary_lift == 0
+    assert long_handle_lift > 0.5
+    assert long_handle_scale > ordinary_scale
+
+
+def test_vip_info_long_handles_are_lifted_away_from_footer():
+    ordinary = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    ImageDraw.Draw(ordinary).rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+    long_handle = ordinary.copy()
+    ImageDraw.Draw(long_handle).arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+
+    ordinary_lift_y = service.INFO_PRODUCT_HANDLE_LIFT_Y * service._handle_visual_lift(ordinary)
+    long_handle_lift_y = service.INFO_PRODUCT_HANDLE_LIFT_Y * service._handle_visual_lift(long_handle)
+
+    assert ordinary_lift_y == 0
+    assert abs(long_handle_lift_y - 0.04) < 0.001
 
 
 def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
@@ -1063,8 +1181,14 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_jd_logo_detail_manual_horizontal_movement(self):
         test_jd_logo_detail_manual_offset_moves_the_image_horizontally()
 
-    def test_jd_model_manual_horizontal_movement(self):
-        test_jd_model_manual_offset_moves_horizontally_but_keeps_vertical_clamp()
+    def test_jd_model_manual_movement(self):
+        test_jd_model_manual_offset_moves_freely_on_both_axes()
+
+    def test_jd_product_first_manual_move_is_continuous(self):
+        test_jd_product_first_manual_move_starts_from_automatic_position()
+
+    def test_jd_long_handle_product_slots_are_lifted(self):
+        test_jd_long_handle_product_and_transparent_slots_are_lifted()
 
     def test_jd_interior_detail_is_full_bleed(self):
         test_jd_interior_detail_fills_the_canvas_without_white_border()
@@ -1144,14 +1268,26 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_vip_info_rulers_follow_product(self):
         test_vip_info_product_and_rulers_share_zoom_and_movement()
 
-    def test_vip_info_centers_bag_body(self):
-        test_vip_info_centers_the_bag_body_instead_of_the_handle_layer()
+    def test_vip_info_ruler_gaps_follow_product_zoom(self):
+        test_vip_info_ruler_gaps_expand_with_linked_product_zoom()
+
+    def test_vip_info_enlarged_rulers_stay_outside_product(self):
+        test_vip_info_enlarged_rulers_never_fold_back_into_product()
+
+    def test_vip_info_centers_complete_product(self):
+        test_vip_info_centers_and_lifts_the_complete_product_layer()
 
     def test_vip_info_template_box_is_larger(self):
         test_vip_info_template_box_is_fifty_percent_larger()
 
-    def test_vip_info_exact_renderer_uses_eighty_five_percent_scale(self):
-        test_vip_info_exact_renderer_uses_eighty_five_percent_product_scale()
+    def test_vip_info_exact_renderer_uses_full_scale(self):
+        test_vip_info_exact_renderer_uses_full_product_scale()
+
+    def test_vip_info_long_handles_receive_extra_scale(self):
+        test_vip_info_long_handles_receive_extra_product_scale()
+
+    def test_vip_info_long_handles_are_lifted_from_footer(self):
+        test_vip_info_long_handles_are_lifted_away_from_footer()
 
     def test_vip_info_rulers_stay_visible(self):
         test_vip_info_rulers_remain_visible_in_both_adjustment_modes()

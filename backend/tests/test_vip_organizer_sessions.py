@@ -70,6 +70,25 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
             )
         return path
 
+    def _add_image_asset(self, session_id: str, name: str = "product.png") -> tuple[int, Path]:
+        folder = service._session_upload_dir(session_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        image = Image.new("RGB", (160, 160), "white")
+        ImageDraw.Draw(image).rounded_rectangle((35, 45, 125, 140), radius=12, fill="#244a73")
+        image.save(path)
+        with database.db_session() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO vip_organizer_assets
+                    (session_id, asset_type, file_name, file_path, width, height, created_at)
+                VALUES (?, 'product', ?, ?, 160, 160, ?)
+                """,
+                (session_id, name, str(path), database.now_iso()),
+            )
+            image_id = int(cursor.lastrowid)
+        return image_id, path
+
     def test_replacing_one_session_does_not_delete_another(self):
         session_a = service.start_session()["session_id"]
         asset_a = self._add_asset(session_a, "a.jpg")
@@ -152,6 +171,47 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
         self.assertEqual(asset_count, 0)
         with self.assertRaises(ValueError):
             service.prepared_cutout_file(session_id, result["prepared_id"], "invalid")
+
+    def test_organizer_layer_is_generated_once_and_reused_by_fast_slot_preview(self):
+        session_id = service.start_session()["session_id"]
+        image_id, _ = self._add_image_asset(session_id)
+        adjustment = {
+            "crop_x": 0,
+            "crop_y": 0,
+            "crop_width": 1,
+            "crop_height": 1,
+            "zoom": 1.15,
+            "offset_x": 0.08,
+            "offset_y": -0.04,
+        }
+
+        def render_layer_inline(_module, payload, **_kwargs):
+            self.assertEqual(payload["operation"], "organizer_layer")
+            return service._render_organizer_layer_cache(payload["image_id"], payload["adjustment"])
+
+        with patch.object(service, "run_heavy_task", side_effect=render_layer_inline) as worker:
+            first = service.asset_organizer_layer_info(image_id, adjustment)
+            second = service.asset_organizer_layer_info(image_id, adjustment)
+
+        self.assertEqual(worker.call_count, 1)
+        self.assertEqual(first, second)
+        self.assertTrue((self.organizer_root / "uploads" / session_id / "render-cache").is_dir())
+
+        slots = [{
+            "file_name": "2.jpg",
+            "image_ids": [image_id],
+            "adjustments": [adjustment],
+        }]
+        with patch.object(service, "run_heavy_task") as worker:
+            result = service.render_slot_preview(session_id, slots, {}, "2.jpg")
+
+        worker.assert_not_called()
+        self.assertEqual(result["file_name"], "2.jpg")
+        preview_parts = result["preview_url"].removeprefix("/api/vip-organizer/previews/").split("/")
+        preview_path = service.preview_file(preview_parts[0], preview_parts[1], preview_parts[2])
+        self.assertTrue(preview_path.is_file())
+        with Image.open(preview_path) as preview:
+            self.assertEqual(preview.size, (800, 800))
 
 
 if __name__ == "__main__":

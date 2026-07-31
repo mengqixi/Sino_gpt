@@ -647,6 +647,18 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(hardware_showcase.getpixel((375, 400)), (181, 34, 38))
         self.assertIsNone(ImageChops.difference(detail_showcase, hardware_showcase).getbbox())
 
+    def test_vip_logo_detail_composites_transparent_pixels_on_white(self):
+        source = Image.new("RGBA", (320, 480), (0, 0, 0, 0))
+        ImageDraw.Draw(source).rectangle((80, 120, 240, 360), fill=(181, 34, 38, 255))
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=source):
+            rendered = _render_slot_image("4.jpg", [11], {})
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertEqual(rendered.getpixel((20, 20)), (255, 255, 255))
+        self.assertEqual(rendered.getpixel((400, 400)), (181, 34, 38))
+
     def test_interior_slot_enlarges_a_small_subject_on_a_white_studio_frame(self):
         source = Image.new("RGB", (400, 600), "white")
         ImageDraw.Draw(source).rectangle((120, 85, 365, 540), fill="#252525")
@@ -757,10 +769,10 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         square_top = product_top(square, 250)
         portrait_top = product_top(portrait, 260)
         raised_top = product_top(raised, 250)
-        self.assertGreaterEqual(square_top, 180)
-        self.assertGreaterEqual(portrait_top, 185)
-        self.assertLessEqual(square_top, 195)
-        self.assertLessEqual(portrait_top, 200)
+        self.assertGreaterEqual(square_top, 162)
+        self.assertGreaterEqual(portrait_top, 175)
+        self.assertLessEqual(square_top, 180)
+        self.assertLessEqual(portrait_top, 190)
         self.assertLess(raised_top, square_top - 50)
 
     def test_slot_map_links_the_two_model_output_sizes(self):

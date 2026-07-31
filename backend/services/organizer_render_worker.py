@@ -26,6 +26,11 @@ def _handle(payload: dict[str, Any]) -> Any:
             payload["platform"],
             payload["target_folder"],
         )
+    if operation == "organizer_layer":
+        return service._render_organizer_layer_cache(
+            payload["image_id"],
+            payload.get("adjustment"),
+        )
     if operation == "export":
         return service._export_package(
             payload["session_id"],

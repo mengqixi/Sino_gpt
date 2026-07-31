@@ -48,7 +48,8 @@ U2NETP_MODEL_PATH = Path(__file__).resolve().parents[1] / "assets" / "models" / 
 CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py")
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
-PREVIEW_RENDER_VERSION = 20
+_FAST_SLOT_PREVIEW_LOCK = Lock()
+PREVIEW_RENDER_VERSION = 29
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -83,7 +84,11 @@ JD_SLOT_DEFINITIONS = [
 ]
 ORGANIZER_PLATFORMS = {"vip", "jd"}
 INFO_PRODUCT_BOX = (294, 238, 687, 511)
-INFO_PRODUCT_SCALE = 0.85
+INFO_PRODUCT_SCALE = 1.0
+INFO_PRODUCT_HANDLE_SCALE = 0.08
+INFO_PRODUCT_HANDLE_LIFT_Y = 0.04
+INFO_TEXT_X = 53
+INFO_HEIGHT_RULER_SHIFT_Y = 5
 INFO_LENGTH_LINE_Y = 528
 
 PRODUCT_ROLES = {
@@ -1234,6 +1239,67 @@ def asset_original(image_id: int) -> Path:
     return path
 
 
+def asset_organizer_layer(
+    image_id: int,
+    adjustment: dict[str, Any] | None = None,
+) -> Path:
+    """Return the exact product layer shared by the editor and renderer."""
+    source_path = asset_original(image_id)
+    modified_ns = source_path.stat().st_mtime_ns
+    crop_key = _crop_cache_key(adjustment)
+    cache_path = _organizer_layer_cache_path(image_id, modified_ns, crop_key)
+    if not cache_path.is_file():
+        run_heavy_task(
+            "backend.services.organizer_render_worker",
+            {
+                "operation": "organizer_layer",
+                "image_id": image_id,
+                "adjustment": _normalize_adjustment(adjustment),
+            },
+            timeout=180,
+        )
+    if not cache_path.is_file():
+        raise ValueError("商品编辑层生成失败")
+    return cache_path
+
+
+def asset_organizer_layer_info(
+    image_id: int,
+    adjustment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = _normalize_adjustment(adjustment)
+    path = asset_organizer_layer(image_id, adjustment)
+    with Image.open(path) as cached:
+        layer = cached.convert("RGBA")
+    measurement = _info_measurement_bbox(layer)
+    product_body = _jd_product_body_bbox(layer)
+    return {
+        "url": (
+            f"/api/vip-organizer/assets/{image_id}/organizer-layer"
+            f"?crop_x={normalized['crop_x']:.6f}"
+            f"&crop_y={normalized['crop_y']:.6f}"
+            f"&crop_width={normalized['crop_width']:.6f}"
+            f"&crop_height={normalized['crop_height']:.6f}"
+        ),
+        "width": layer.width,
+        "height": layer.height,
+        "measurement_bbox": list(measurement),
+        "product_body_bbox": list(product_body),
+        "handle_lift": _handle_visual_lift(layer),
+    }
+
+
+def _render_organizer_layer_cache(
+    image_id: int,
+    adjustment: dict[str, Any] | None = None,
+) -> str:
+    source_path = asset_original(image_id)
+    modified_ns = source_path.stat().st_mtime_ns
+    crop_key = _crop_cache_key(adjustment)
+    _cached_product_cutout(image_id, modified_ns, crop_key)
+    return str(_organizer_layer_cache_path(image_id, modified_ns, crop_key))
+
+
 def _slot(file_name: str, title: str, size: str, kind: str, ids: list[int], confidence: int, reason: str) -> dict[str, Any]:
     return {
         "file_name": file_name,
@@ -1501,6 +1567,14 @@ def _fit(image: Image.Image, size: tuple[int, int], margin: int = 0, contain: bo
     rendered = ImageOps.contain(source, inner, Image.Resampling.LANCZOS) if contain else ImageOps.fit(source, inner, Image.Resampling.LANCZOS, centering=(0.5, 0.5))
     target.paste(rendered, ((size[0] - rendered.width) // 2, (size[1] - rendered.height) // 2))
     return target
+
+
+def _rgb_on_white(image: Image.Image) -> Image.Image:
+    """Flatten organizer source transparency onto white, never implicit black."""
+    rgba = ImageOps.exif_transpose(image).convert("RGBA")
+    flattened = Image.new("RGB", rgba.size, "white")
+    flattened.paste(rgba.convert("RGB"), (0, 0), rgba.getchannel("A"))
+    return flattened
 
 
 @lru_cache(maxsize=64)
@@ -4828,6 +4902,7 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "phone_alignment": "center" if value.get("phone_alignment") == "center" else "bottom",
         "product_show_ruler": value.get("product_show_ruler") is not False,
         "phone_show_ruler": value.get("phone_show_ruler") is not False,
+        "product_ruler_gap_scale": number("product_ruler_gap_scale", 1.0, 0.5, 4.0),
         "product_ruler_group_scale": number("product_ruler_group_scale", 1.0, 0.25, 4.0),
         "product_ruler_group_offset_x": number("product_ruler_group_offset_x", 0.0, -1.5, 1.5),
         "product_ruler_group_offset_y": number("product_ruler_group_offset_y", 0.0, -1.5, 1.5),
@@ -4894,12 +4969,27 @@ def _crop_cache_key(adjustment: dict[str, Any] | None) -> tuple[int, int, int, i
     )
 
 
+def _organizer_layer_cache_path(
+    image_id: int,
+    modified_ns: int,
+    crop_key: tuple[int, int, int, int],
+) -> Path:
+    source_path = asset_original(image_id)
+    crop_token = "-".join(str(value) for value in crop_key)
+    return source_path.parent / "render-cache" / f"organizer-layer-{image_id}-{modified_ns}-{crop_token}.png"
+
+
 @lru_cache(maxsize=16)
 def _cached_product_cutout(
     image_id: int,
     modified_ns: int,
     crop_key: tuple[int, int, int, int],
 ) -> Image.Image:
+    cache_path = _organizer_layer_cache_path(image_id, modified_ns, crop_key)
+    if cache_path.is_file():
+        with Image.open(cache_path) as cached:
+            return cached.convert("RGBA").copy()
+
     crop_x, crop_y, crop_width, crop_height = (value / 1_000_000 for value in crop_key)
     source = _load_image(image_id)
     cropped = _crop_source(source, {
@@ -4908,7 +4998,15 @@ def _cached_product_cutout(
         "crop_width": crop_width,
         "crop_height": crop_height,
     })
-    return _product_cutout(cropped)
+    cutout = _product_cutout(cropped)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_name(f".{cache_path.stem}-{uuid.uuid4().hex[:8]}.png")
+    try:
+        cutout.save(temporary, format="PNG", compress_level=1)
+        os.replace(temporary, cache_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return cutout
 
 
 def _clamp_layer_origin(position: int, layer_size: int, minimum: int, maximum: int) -> int:
@@ -5042,7 +5140,16 @@ def _paste_detail_layer(
     cropped = _crop_source(source, adjustment)
     has_manual_layout = _has_manual_layout_adjustment(adjustment)
     if not _has_manual_crop(adjustment) and _has_light_studio_border(cropped):
-        cutout = _product_cutout(cropped)
+        image_id = source.info.get("_organizer_image_id")
+        modified_ns = source.info.get("_organizer_modified_ns")
+        if isinstance(image_id, int) and isinstance(modified_ns, int):
+            cutout = _cached_product_cutout(
+                image_id,
+                modified_ns,
+                _crop_cache_key(adjustment),
+            ).copy()
+        else:
+            cutout = _product_cutout(cropped)
         normalized = _normalize_adjustment(adjustment)
         handle_offset_y = -0.04 * _handle_visual_lift(cutout) if auto_handle_layout else 0.0
         shape_offset_y = (
@@ -5066,7 +5173,7 @@ def _paste_detail_layer(
         return
     _paste_layer(
         canvas,
-        cropped.convert("RGB"),
+        _rgb_on_white(cropped),
         box,
         adjustment,
         mode=_crop_aware_mode(adjustment, default_mode),
@@ -5101,35 +5208,64 @@ def _paste_product(
     else:
         cutout = _product_cutout(_crop_source(source, adjustment))
     has_manual_layout = _has_manual_layout_adjustment(adjustment)
-    effective_minimum_top = None if has_manual_layout else minimum_rendered_top
-    if not has_manual_layout and tall_handle_minimum_rendered_top is not None:
+    automatic_minimum_top = minimum_rendered_top
+    if tall_handle_minimum_rendered_top is not None:
         body_left, body_top, body_right, body_bottom = _info_measurement_bbox(cutout)
         body_ratio = (body_right - body_left) / max(1, body_bottom - body_top)
         if body_ratio <= 1.15 and _handle_visual_lift(cutout) >= 0.55:
-            effective_minimum_top = max(
-                effective_minimum_top or 0,
+            automatic_minimum_top = max(
+                automatic_minimum_top or 0,
                 tall_handle_minimum_rendered_top,
             )
+    effective_minimum_top = None if has_manual_layout else automatic_minimum_top
     layout_adjustment = adjustment
+    automatic_layout_adjustment: dict[str, Any] | None = None
     if auto_handle_layout and not _has_manual_crop(adjustment):
         normalized = _normalize_adjustment(adjustment)
         left, top, right, bottom = box
         box_width = max(1, right - left)
         box_height = max(1, bottom - top)
+        handle_lift = _handle_visual_lift(cutout)
         scale = min(box_width / cutout.width, box_height / cutout.height) * normalized["zoom"]
         body_left, body_top, body_right, body_bottom = _info_measurement_bbox(cutout)
         body_center_x = (body_left + body_right) / 2
         body_center_y = (body_top + body_bottom) / 2
-        tall_handle_drop_y = tall_handle_drop_ratio * _handle_visual_lift(cutout) if auto_tall_handle_drop else 0.0
-        layout_adjustment = {
+        tall_handle_drop_y = tall_handle_drop_ratio * handle_lift if auto_tall_handle_drop else 0.0
+        automatic_layout_adjustment = {
             **normalized,
-            "offset_x": normalized["offset_x"] + (cutout.width / 2 - body_center_x) * scale / box_width,
+            "offset_x": (cutout.width / 2 - body_center_x) * scale / box_width,
             "offset_y": (
-                normalized["offset_y"]
-                + auto_offset_y
+                auto_offset_y
                 + tall_handle_drop_y
                 + (cutout.height / 2 - body_center_y) * scale / box_height
             ),
+        }
+        layout_adjustment = {
+            **automatic_layout_adjustment,
+            "offset_x": automatic_layout_adjustment["offset_x"] + normalized["offset_x"],
+            "offset_y": automatic_layout_adjustment["offset_y"] + normalized["offset_y"],
+        }
+    if has_manual_layout and automatic_layout_adjustment is not None:
+        left, top, right, bottom = box
+        box_width = max(1, right - left)
+        box_height = max(1, bottom - top)
+        clip_left, clip_top, clip_right, clip_bottom = clip_box or (0, 0, *canvas.size)
+        rendered_width = max(1, int(round(cutout.width * scale)))
+        rendered_height = max(1, int(round(cutout.height * scale)))
+        automatic_x = left + (box_width - rendered_width) // 2 + int(round(automatic_layout_adjustment["offset_x"] * box_width))
+        automatic_y = top + (box_height - rendered_height) // 2 + int(round(automatic_layout_adjustment["offset_y"] * box_height))
+        anchored_x = _clamp_layer_origin(automatic_x, rendered_width, clip_left, clip_right)
+        anchored_y = _clamp_layer_origin(automatic_y, rendered_height, clip_top, clip_bottom)
+        if automatic_minimum_top is not None:
+            anchored_y = max(automatic_minimum_top, anchored_y)
+        if maximum_rendered_bottom is not None:
+            latest_y = maximum_rendered_bottom - rendered_height
+            if automatic_minimum_top is None or latest_y >= automatic_minimum_top:
+                anchored_y = min(anchored_y, latest_y)
+        layout_adjustment = {
+            **layout_adjustment,
+            "offset_x": layout_adjustment["offset_x"] + (anchored_x - automatic_x) / box_width,
+            "offset_y": layout_adjustment["offset_y"] + (anchored_y - automatic_y) / box_height,
         }
     _paste_layer(
         canvas,
@@ -5298,26 +5434,27 @@ def _paste_info_product(
     box_width = right - left
     box_height = bottom - top
     normalized = _normalize_adjustment(adjustment)
-    # Keep the exact/final 401 renderer on the same 85% baseline as the live
-    # editor.  Applying this only in the browser makes a dragged product jump
-    # back to the former 100% geometry as soon as the exact preview arrives.
+    # Keep the exact/final 401 renderer on the same handle-aware baseline as
+    # the live editor so the product does not jump when exact preview arrives.
+    handle_lift = _handle_visual_lift(cutout)
     scale = (
         min(box_width / cutout.width, box_height / cutout.height)
         * normalized["zoom"]
         * INFO_PRODUCT_SCALE
+        * (1.0 + INFO_PRODUCT_HANDLE_SCALE * handle_lift)
     )
     rendered = cutout.resize(
         (max(1, round(cutout.width * scale)), max(1, round(cutout.height * scale))),
         Image.Resampling.LANCZOS,
     )
     body_left, body_top, body_right, body_bottom = _jd_product_body_bbox(cutout)
-    body_center_x = (body_left + body_right) / 2
-    body_center_y = (body_top + body_bottom) / 2
     x = left + (box_width - rendered.width) // 2 + round(normalized["offset_x"] * box_width)
-    y = top + (box_height - rendered.height) // 2 + round(normalized["offset_y"] * box_height)
-    if not _has_manual_crop(adjustment):
-        x += round((cutout.width / 2 - body_center_x) * scale)
-        y += round((cutout.height / 2 - body_center_y) * scale)
+    y = (
+        top
+        + (box_height - rendered.height) // 2
+        + round(normalized["offset_y"] * box_height)
+        - round(INFO_PRODUCT_HANDLE_LIFT_Y * handle_lift * box_height)
+    )
     canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
     return (
         x + body_left * scale,
@@ -5329,8 +5466,9 @@ def _paste_info_product(
 
 def _info_ruler_geometry(
     body: tuple[float, float, float, float],
+    gap_scale: float = 1.0,
 ) -> dict[str, int]:
-    ruler_gap = 34
+    ruler_gap = 34 * gap_scale
     body_left, body_top, body_right, body_bottom = body
     line_left = round(body_left + 4)
     line_right = round(body_right - 4)
@@ -5338,8 +5476,8 @@ def _info_ruler_geometry(
     # insets track the visible bag body more accurately than the raw extrema.
     line_bottom = round(body_bottom - 9)
     line_top = round(body_top - 5)
-    vertical_x = max(30, line_left - ruler_gap)
-    horizontal_y = min(535, line_bottom + ruler_gap)
+    vertical_x = line_left - ruler_gap
+    horizontal_y = line_bottom + ruler_gap
     return {
         "left": line_left,
         "right": line_right,
@@ -5428,11 +5566,11 @@ def _info_width_ruler_geometry(
 ) -> dict[str, Any]:
     normalized = _normalize_adjustment(adjustment)
     _, _, body_right, body_bottom = base_body
-    ruler_gap = 34.0
+    ruler_gap = 34.0 * normalized["product_ruler_gap_scale"]
     anchor_direction = (22.0 ** 2 + 18.0 ** 2) ** 0.5
     start = (
         body_right + 22.0 / anchor_direction * ruler_gap,
-        min(520.0, body_bottom + 18.0 / anchor_direction * ruler_gap),
+        body_bottom + 18.0 / anchor_direction * ruler_gap,
     )
     end = (start[0] + 51.0, start[1] - 27.0)
     delta_x = end[0] - start[0]
@@ -5545,7 +5683,7 @@ def _tag_certificate_page(
 ) -> Image.Image:
     """Keep the uploaded tag image intact unless the designer explicitly crops it."""
     canvas = Image.new("RGB", (750, 750), "white")
-    normalized_source = ImageOps.exif_transpose(source).convert("RGB")
+    normalized_source = _rgb_on_white(source)
     layer = _crop_source(normalized_source, adjustment)
     _paste_layer(
         canvas,
@@ -5652,8 +5790,8 @@ def _info_page(
     ]
     y = 216
     for label, value in rows:
-        draw.text((45, y), label, font=_font(20, True), fill="#111111")
-        draw.text((45, y + 34), value[:18], font=_font(19), fill="#555555")
+        draw.text((INFO_TEXT_X, y), label, font=_font(20, True), fill="#111111")
+        draw.text((INFO_TEXT_X, y + 34), value[:18], font=_font(19), fill="#555555")
         y += 96
 
     normalized = _normalize_adjustment(adjustment)
@@ -5676,7 +5814,10 @@ def _info_page(
         if not _has_manual_layout_adjustment(adjustment):
             base_body = body
     ruler_body = _stored_product_ruler_base(normalized) or body
-    ruler = _info_ruler_geometry(ruler_body)
+    ruler = _info_ruler_geometry(
+        ruler_body,
+        normalized["product_ruler_gap_scale"],
+    )
     product_ruler_center = (
         (INFO_PRODUCT_BOX[0] + INFO_PRODUCT_BOX[2]) / 2,
         (INFO_PRODUCT_BOX[1] + INFO_PRODUCT_BOX[3]) / 2,
@@ -5689,6 +5830,21 @@ def _info_page(
     )
 
     line_color = "#8a8a8a"
+    def draw_ruler_segments(
+        segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    ) -> None:
+        scale = 4
+        layer = Image.new("RGBA", (image.width * scale, image.height * scale), (0, 0, 0, 0))
+        layer_draw = ImageDraw.Draw(layer)
+        for start, end in segments:
+            layer_draw.line(
+                (start[0] * scale, start[1] * scale, end[0] * scale, end[1] * scale),
+                fill=line_color,
+                width=2 * scale,
+            )
+        layer = layer.resize(image.size, Image.Resampling.LANCZOS)
+        image.paste(layer, (0, 0), layer)
+
     length_start, length_end = _transform_product_ruler_segment(
         (ruler["left"], ruler["horizontal_y"]),
         (ruler["right"], ruler["horizontal_y"]),
@@ -5699,9 +5855,11 @@ def _info_page(
         offset_y=normalized["length_ruler_offset_y"],
         canvas_size=image.size,
     )
-    draw.line((length_start, length_end), fill=line_color, width=2)
-    draw.line((length_start[0], length_start[1] - 9, length_start[0], length_start[1] + 9), fill=line_color, width=2)
-    draw.line((length_end[0], length_end[1] - 9, length_end[0], length_end[1] + 9), fill=line_color, width=2)
+    draw_ruler_segments([
+        (length_start, length_end),
+        ((length_start[0], length_start[1] - 9), (length_start[0], length_start[1] + 9)),
+        ((length_end[0], length_end[1] - 9), (length_end[0], length_end[1] + 9)),
+    ])
     length_text = _dimension_mm(info.get("product_length") or "")
     length_font = _font(19)
     length_box = draw.textbbox((0, 0), length_text, font=length_font)
@@ -5709,8 +5867,8 @@ def _info_page(
     draw.text((length_center - (length_box[2] - length_box[0]) / 2, length_start[1] + 16), length_text, font=length_font, fill="#555555")
 
     height_start, height_end = _transform_product_ruler_segment(
-        (ruler["vertical_x"], ruler["top"]),
-        (ruler["vertical_x"], ruler["bottom"]),
+        (ruler["vertical_x"], ruler["top"] + INFO_HEIGHT_RULER_SHIFT_Y),
+        (ruler["vertical_x"], ruler["bottom"] + INFO_HEIGHT_RULER_SHIFT_Y),
         product_ruler_center,
         normalized,
         scale=normalized["height_ruler_scale"],
@@ -5718,9 +5876,11 @@ def _info_page(
         offset_y=normalized["height_ruler_offset_y"],
         canvas_size=image.size,
     )
-    draw.line((height_start, height_end), fill=line_color, width=2)
-    draw.line((height_start[0] - 9, height_start[1], height_start[0] + 9, height_start[1]), fill=line_color, width=2)
-    draw.line((height_end[0] - 9, height_end[1], height_end[0] + 9, height_end[1]), fill=line_color, width=2)
+    draw_ruler_segments([
+        (height_start, height_end),
+        ((height_start[0] - 9, height_start[1]), (height_start[0] + 9, height_start[1])),
+        ((height_end[0] - 9, height_end[1]), (height_end[0] + 9, height_end[1])),
+    ])
     _draw_rotated_text(
         image,
         _dimension_mm(info.get("product_height") or ""),
@@ -5729,16 +5889,7 @@ def _info_page(
         _font(18),
     )
 
-    ruler_layer = Image.new("RGBA", (image.width * 4, image.height * 4), (0, 0, 0, 0))
-    ruler_draw = ImageDraw.Draw(ruler_layer)
-    for start, end in width_ruler["segments"]:
-        ruler_draw.line(
-            (start[0] * 4, start[1] * 4, end[0] * 4, end[1] * 4),
-            fill=line_color,
-            width=8,
-        )
-    ruler_layer = ruler_layer.resize(image.size, Image.Resampling.LANCZOS)
-    image.paste(ruler_layer, (0, 0), ruler_layer)
+    draw_ruler_segments(width_ruler["segments"])
     _draw_rotated_text_centered(
         image,
         _dimension_mm(info.get("product_width") or ""),
@@ -5919,7 +6070,7 @@ def _jd_model_page(
         (0, 0, *size),
         adjustment,
         mode=_crop_aware_mode(adjustment, "cover"),
-        allow_free_x_position=_has_manual_layout_adjustment(adjustment),
+        allow_free_position=_has_manual_layout_adjustment(adjustment),
     )
     if with_logo:
         _draw_jd_elle_logo(canvas, size, logo_color)
@@ -5969,15 +6120,16 @@ def _jd_product_page(
             clip_box=clip_box,
             auto_handle_layout=True,
             auto_tall_handle_drop=True,
+            auto_offset_y=-0.03,
             minimum_rendered_top=(
                 162
                 if size == (800, 800)
                 else 175
             ),
             tall_handle_minimum_rendered_top=(
-                180
+                162
                 if size == (800, 800)
-                else 185
+                else 175
             ),
             maximum_rendered_bottom=(
                 740
@@ -6557,7 +6709,7 @@ def _render_jd_slot_image(
         canvas = Image.new("RGB", size, "white")
         _paste_layer(
             canvas,
-            _crop_source(source.convert("RGB"), adjustment),
+            _crop_source(_rgb_on_white(source), adjustment),
             (0, 0, *size),
             adjustment,
             mode=_crop_aware_mode(adjustment, "cover"),
@@ -6572,7 +6724,15 @@ def _render_jd_slot_image(
             return None
         return _jd_size_comparison_page(source, size, product_info, adjustment, logo_color)
     if file_name == "透明.png":
-        return _normalized_product_page(source, transparent=True, adjustment=adjustment, manual_padding_ratio=0.18)
+        return _normalized_product_page(
+            source,
+            transparent=True,
+            adjustment=adjustment,
+            auto_handle_layout=True,
+            auto_tall_handle_drop=True,
+            auto_offset_y=-0.03,
+            manual_padding_ratio=0.18,
+        )
     return None
 
 
@@ -6703,7 +6863,7 @@ def _render_slot_image(
         canvas = Image.new("RGB", (800, 800), "white")
         _paste_layer(
             canvas,
-            _crop_source(source.convert("RGB"), adjustment),
+            _crop_source(_rgb_on_white(source), adjustment),
             (0, 0, 800, 800),
             adjustment,
             mode=_crop_aware_mode(adjustment, "cover"),
@@ -6869,6 +7029,23 @@ def render_slot_preview(
     platform: str = "vip",
     target_folder: str = "800",
 ) -> dict[str, str]:
+    if _fast_slot_preview_ready(slots, file_name, platform, target_folder):
+        with _FAST_SLOT_PREVIEW_LOCK:
+            try:
+                return _render_slot_preview(
+                    session_id,
+                    slots,
+                    product_info,
+                    file_name,
+                    platform,
+                    target_folder,
+                )
+            finally:
+                # The API process may serve many sessions on a 2GB host. Keep
+                # the fast path bounded to one request and release decoded
+                # source/layer images immediately after composing the slot.
+                _cached_product_cutout.cache_clear()
+                _load_image_file.cache_clear()
     return run_heavy_task(
         "backend.services.organizer_render_worker",
         {
@@ -6882,6 +7059,44 @@ def render_slot_preview(
         },
         timeout=600,
     )
+
+
+def _fast_slot_preview_ready(
+    slots: list[dict[str, Any]],
+    file_name: str,
+    platform: str,
+    target_folder: str,
+) -> bool:
+    """Use the resident Pillow renderer only when heavy layers are on disk."""
+    if platform == "vip" and file_name in {"15.jpg", "604.jpg", "605.jpg"}:
+        return False
+    if platform == "jd" and file_name == "4.jpg":
+        return False
+
+    product_files = (
+        {"2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg"}
+        if platform == "vip"
+        else {"2.jpg", "5.jpg", "透明.png"}
+    )
+    if file_name not in product_files:
+        return True
+
+    slot_map = _slot_map(slots, platform)
+    slot = slot_map.get(file_name)
+    if not slot:
+        return False
+    adjustments = _slot_adjustments_for_folder(slot, target_folder)
+    for index, image_id in enumerate(slot.get("image_ids", [])):
+        adjustment = adjustments[index] if index < len(adjustments) else None
+        source_path = asset_original(image_id)
+        cache_path = _organizer_layer_cache_path(
+            image_id,
+            source_path.stat().st_mtime_ns,
+            _crop_cache_key(adjustment),
+        )
+        if not cache_path.is_file():
+            return False
+    return bool(slot.get("image_ids"))
 
 
 def _render_slot_preview(

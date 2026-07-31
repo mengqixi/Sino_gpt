@@ -110,6 +110,12 @@ export const api = {
     body: JSON.stringify(payload),
     signal
   }),
+  getVipOrganizerLayerInfo: (imageId: number, crop: Record<string, number>, signal?: AbortSignal) => {
+    const params = new URLSearchParams(Object.fromEntries(
+      Object.entries(crop).map(([key, value]) => [key, value.toFixed(6)])
+    ));
+    return request<any>(`/api/vip-organizer/assets/${imageId}/organizer-layer-info?${params.toString()}`, { signal });
+  },
   exportVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/export", { method: "POST", body: JSON.stringify(payload) }),
   startVipOrganizerSession: (previousSessionId?: string) => request<{ session_id: string }>("/api/vip-organizer/session", {
     method: "POST",

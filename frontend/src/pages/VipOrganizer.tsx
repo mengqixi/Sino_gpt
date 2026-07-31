@@ -41,6 +41,7 @@ type ImageAdjustment = {
   phone_alignment?: "center" | "bottom";
   product_show_ruler?: boolean;
   phone_show_ruler?: boolean;
+  product_ruler_gap_scale?: number;
   product_ruler_group_scale?: number;
   product_ruler_group_offset_x?: number;
   product_ruler_group_offset_y?: number;
@@ -63,6 +64,14 @@ type ImageAdjustment = {
 };
 
 type CropSelection = { left: number; top: number; width: number; height: number };
+type OrganizerLayerInfo = {
+  url: string;
+  width: number;
+  height: number;
+  measurement_bbox: [number, number, number, number];
+  product_body_bbox: [number, number, number, number];
+  handle_lift: number;
+};
 type AdjustmentTarget = "product" | "phone" | "length_ruler" | "height_ruler" | "width_ruler" | "phone_ruler";
 type InfoMoveTarget = "product" | "product_rulers" | "length_ruler" | "height_ruler" | "width_ruler";
 
@@ -123,6 +132,7 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_alignment: "bottom",
   product_show_ruler: true,
   phone_show_ruler: true,
+  product_ruler_gap_scale: 1,
   product_ruler_group_scale: 1,
   product_ruler_group_offset_x: 0,
   product_ruler_group_offset_y: 0,
@@ -141,7 +151,12 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
 };
 
 const VIP_INFO_PRODUCT_BOX = { left: 294, top: 238, right: 687, bottom: 511 } as const;
-const VIP_INFO_PRODUCT_SCALE = 0.85;
+const VIP_INFO_PRODUCT_SCALE = 1;
+const VIP_INFO_HANDLE_SCALE = 0.08;
+const VIP_INFO_HANDLE_LIFT_Y = 0.04;
+const VIP_INFO_TEXT_X = 53;
+const VIP_INFO_HEIGHT_RULER_SHIFT_Y = 5;
+const VIP_INFO_RULER_COLOR = "#8a8a8a";
 const IMAGE_PREVIEW_ZOOM_MIN = 0.5;
 const IMAGE_PREVIEW_ZOOM_MAX = 5;
 const IMAGE_PREVIEW_ZOOM_STEP = 0.25;
@@ -178,6 +193,14 @@ function slotDisplayTitle(platform: OrganizerPlatform, fileName: string, fallbac
 
 function normalizeAdjustment(value?: Partial<ImageAdjustment>): ImageAdjustment {
   return { ...DEFAULT_ADJUSTMENT, ...(value || {}) };
+}
+
+function vipInfoProductScale(handleLift = 0) {
+  return VIP_INFO_PRODUCT_SCALE * (1 + VIP_INFO_HANDLE_SCALE * Math.max(0, Math.min(1, handleLift)));
+}
+
+function vipInfoProductLiftY(handleLift = 0) {
+  return VIP_INFO_HANDLE_LIFT_Y * Math.max(0, Math.min(1, handleLift));
 }
 
 function targetScale(draft: ImageAdjustment, target: AdjustmentTarget) {
@@ -233,6 +256,21 @@ function withLinkedProductScale(draft: ImageAdjustment, scale: number): ImageAdj
     ...draft,
     zoom: scale
   };
+}
+
+function modelDragOffsetWithBoundaryResistance(start: number, delta: number) {
+  const softBoundary = 0.12;
+  const resistance = 0.35;
+  const projected = start + delta;
+  if (Math.abs(projected) <= softBoundary || Math.abs(projected) <= Math.abs(start)) {
+    return projected;
+  }
+  const direction = Math.sign(projected) || 1;
+  if (Math.abs(start) >= softBoundary && Math.sign(start) === direction) {
+    return start + delta * resistance;
+  }
+  const boundary = direction * softBoundary;
+  return boundary + (projected - boundary) * resistance;
 }
 
 function isManuallyConfirmedSlot(slot: Slot) {
@@ -304,6 +342,12 @@ function slotCanvasSize(size: string, platform?: OrganizerPlatform, targetFolder
   }
   const match = size.match(/(\d+)\s*[×x]\s*(\d+)/i);
   return match ? { width: Number(match[1]), height: Number(match[2]) } : { width: 800, height: 800 };
+}
+
+function slotUsesOrganizerLayer(slot: Slot, platform: OrganizerPlatform) {
+  return platform === "jd"
+    ? ["2.jpg", "4.jpg", "5.jpg", "透明.png"].includes(slot.file_name)
+    : ["2.jpg", "3.jpg", "15.jpg", "30.png", "401.jpg", "604.jpg", "605.jpg", "606.jpg"].includes(slot.file_name);
 }
 
 function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex: number, targetFolder: PreviewFolder) {
@@ -543,6 +587,7 @@ const livePreviewImageCache = new Map<string, HTMLImageElement>();
 const livePreviewBoundsCache = new Map<string, { left: number; top: number; right: number; bottom: number }>();
 const livePreviewRawCutoutCache = new Map<string, HTMLCanvasElement>();
 const livePreviewCutoutCache = new Map<string, HTMLCanvasElement>();
+const livePreparedProductCache = new Map<string, HTMLCanvasElement>();
 const livePreviewLightBorderCache = new Map<string, boolean>();
 let liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
 type PixelBounds = { left: number; top: number; right: number; bottom: number };
@@ -554,6 +599,7 @@ function clearLivePreviewCaches() {
   livePreviewBoundsCache.clear();
   livePreviewRawCutoutCache.clear();
   livePreviewCutoutCache.clear();
+  livePreparedProductCache.clear();
   livePreviewLightBorderCache.clear();
   liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
   liveJdProductLayerCache.clear();
@@ -567,6 +613,17 @@ function livePreviewImage(url: string) {
   image.src = url;
   livePreviewImageCache.set(url, image);
   return image;
+}
+
+function preparedProductCutout(url: string, image: HTMLImageElement) {
+  const cached = livePreparedProductCache.get(url);
+  if (cached) return cached;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, image.naturalWidth);
+  canvas.height = Math.max(1, image.naturalHeight);
+  canvas.getContext("2d")?.drawImage(image, 0, 0);
+  livePreparedProductCache.set(url, canvas);
+  return canvas;
 }
 
 function livePreviewRawProductCutout(url: string, image: HTMLImageElement) {
@@ -896,8 +953,8 @@ function liveHandleVisualLift(canvas: HTMLCanvasElement) {
   return lift;
 }
 
-function infoRulerGeometry(body: PixelBounds) {
-  const rulerGap = 34;
+function infoRulerGeometry(body: PixelBounds, gapScale = 1) {
+  const rulerGap = 34 * gapScale;
   const left = Math.round(body.left + 4);
   const right = Math.round(body.right - 4);
   // The detected alpha boundary includes anti-aliased edge/shadow pixels.
@@ -910,8 +967,8 @@ function infoRulerGeometry(body: PixelBounds) {
     right,
     top,
     bottom,
-    verticalX: Math.max(30, left - rulerGap),
-    horizontalY: Math.min(535, bottom + rulerGap)
+    verticalX: left - rulerGap,
+    horizontalY: bottom + rulerGap
   };
 }
 
@@ -935,10 +992,10 @@ function drawVipInfoStaticPreview(
     const y = 216 + index * 96;
     context.fillStyle = "#111111";
     context.font = "700 20px sans-serif";
-    context.fillText(label, 45, y);
+    context.fillText(label, VIP_INFO_TEXT_X, y);
     context.fillStyle = "#555555";
     context.font = "19px sans-serif";
-    context.fillText(value.slice(0, 18), 45, y + 34);
+    context.fillText(value.slice(0, 18), VIP_INFO_TEXT_X, y + 34);
   });
   context.restore();
 }
@@ -996,13 +1053,11 @@ function infoWidthRulerGeometry(
   draft: ImageAdjustment,
   output: { width: number; height: number }
 ) {
-  const rulerGap = 34;
+  const rulerGap = 34 * (draft.product_ruler_gap_scale || 1);
   const anchorDirection = Math.hypot(22, 18);
   const start = {
     x: baseBody.right + 22 / anchorDirection * rulerGap,
-    // Match the exact/final renderer.  Without this clamp, the live width
-    // ruler can move lower than the generated 401 image near the safe edge.
-    y: Math.min(520, baseBody.bottom + 18 / anchorDirection * rulerGap)
+    y: baseBody.bottom + 18 / anchorDirection * rulerGap
   };
   const end = { x: start.x + 51, y: start.y - 27 };
   const deltaX = end.x - start.x;
@@ -1142,46 +1197,70 @@ function storedProductRulerBase(draft: ImageAdjustment): PixelBounds | null {
   return right > left && bottom > top ? { left, top, right, bottom } : null;
 }
 
+function organizerLayerBounds(bounds: OrganizerLayerInfo["measurement_bbox"] | undefined): PixelBounds | null {
+  if (!bounds) return null;
+  const [left, top, right, bottom] = bounds;
+  return right > left && bottom > top ? { left, top, right, bottom } : null;
+}
+
+function positionedInfoProductBody(
+  layerWidth: number,
+  layerHeight: number,
+  layerBounds: PixelBounds,
+  draft: ImageAdjustment,
+  handleLift = 0
+): PixelBounds {
+  const areaX = VIP_INFO_PRODUCT_BOX.left;
+  const areaY = VIP_INFO_PRODUCT_BOX.top;
+  const areaWidth = VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left;
+  const areaHeight = VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top;
+  const fitScale = Math.min(areaWidth / layerWidth, areaHeight / layerHeight);
+  const scale = fitScale * draft.zoom * vipInfoProductScale(handleLift);
+  const drawWidth = layerWidth * scale;
+  const drawHeight = layerHeight * scale;
+  let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+  let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
+    - vipInfoProductLiftY(handleLift) * areaHeight;
+  return {
+    left: drawX + layerBounds.left * scale,
+    top: drawY + layerBounds.top * scale,
+    right: drawX + layerBounds.right * scale,
+    bottom: drawY + layerBounds.bottom * scale
+  };
+}
+
 function liveInfoProductBody(
   sourceUrl: string,
   image: HTMLImageElement,
-  draft: ImageAdjustment
+  draft: ImageAdjustment,
+  preparedLayer?: HTMLCanvasElement,
+  preparedBody?: PixelBounds
 ): PixelBounds {
-  const output = { width: 750, height: 665 };
-  const area = {
-    x: VIP_INFO_PRODUCT_BOX.left / 750,
-    y: VIP_INFO_PRODUCT_BOX.top / 665,
-    width: (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left) / 750,
-    height: (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top) / 665
-  };
-  const areaX = area.x * output.width;
-  const areaY = area.y * output.height;
-  const areaWidth = area.width * output.width;
-  const areaHeight = area.height * output.height;
   const hasManualCrop = draft.crop_x > 0.0001
     || draft.crop_y > 0.0001
     || draft.crop_width < 0.9999
     || draft.crop_height < 0.9999;
-  const productLayer = livePreviewProductCutout(sourceUrl, image);
-  const croppedProductLayer = hasManualCrop ? liveJdProductLayer(sourceUrl, image, draft) : null;
+  const productLayer = preparedLayer || livePreviewProductCutout(sourceUrl, image);
+  const croppedProductLayer = !preparedLayer && hasManualCrop ? liveJdProductLayer(sourceUrl, image, draft) : null;
   const drawSource = croppedProductLayer?.canvas || productLayer;
   const drawSourceWidth = drawSource.width;
   const drawSourceHeight = drawSource.height;
-  const fitScale = Math.min(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight);
-  const drawWidth = drawSourceWidth * fitScale * draft.zoom * VIP_INFO_PRODUCT_SCALE;
-  const drawHeight = drawSourceHeight * fitScale * draft.zoom * VIP_INFO_PRODUCT_SCALE;
-  let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
-  let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight;
-  const layerBounds = croppedProductLayer?.body || liveInfoMeasurementBounds(drawSource);
+  const layerBounds = preparedBody || croppedProductLayer?.body || liveInfoMeasurementBounds(drawSource);
   if (layerBounds.right <= layerBounds.left || layerBounds.bottom <= layerBounds.top) {
-    return { left: drawX, top: drawY, right: drawX + drawWidth, bottom: drawY + drawHeight };
+    return positionedInfoProductBody(drawSourceWidth, drawSourceHeight, {
+      left: 0,
+      top: 0,
+      right: drawSourceWidth,
+      bottom: drawSourceHeight
+    }, draft, liveHandleVisualLift(drawSource));
   }
-  return {
-    left: drawX + layerBounds.left / drawSourceWidth * drawWidth,
-    top: drawY + layerBounds.top / drawSourceHeight * drawHeight,
-    right: drawX + layerBounds.right / drawSourceWidth * drawWidth,
-    bottom: drawY + layerBounds.bottom / drawSourceHeight * drawHeight
-  };
+  return positionedInfoProductBody(
+    drawSourceWidth,
+    drawSourceHeight,
+    layerBounds,
+    draft,
+    liveHandleVisualLift(drawSource)
+  );
 }
 
 function jdProductShapeProfile(bodyWidth: number, bodyHeight: number, physicalRatio?: number) {
@@ -1535,9 +1614,11 @@ function drawJdComparisonPreview(
   context.restore();
 }
 
-function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor }: {
+function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compositePrimaryImageId, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor, onLayerInfoChange }: {
   sourceUrl: string;
+  sourceImageId: number;
   compositePrimaryUrl?: string;
+  compositePrimaryImageId?: number;
   templateUrl?: string;
   slot: Slot;
   draft: ImageAdjustment;
@@ -1546,8 +1627,56 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
   targetFolder: PreviewFolder;
   productInfo: Record<string, string>;
   logoColor: LogoColor;
+  onLayerInfoChange?: (info: OrganizerLayerInfo | null) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [layerInfo, setLayerInfo] = useState<OrganizerLayerInfo | null>(null);
+  const [primaryLayerInfo, setPrimaryLayerInfo] = useState<OrganizerLayerInfo | null>(null);
+  const cropKey = `${draft.crop_x.toFixed(6)}:${draft.crop_y.toFixed(6)}:${draft.crop_width.toFixed(6)}:${draft.crop_height.toFixed(6)}`;
+
+  useEffect(() => {
+    if (!slotUsesOrganizerLayer(slot, platform)) {
+      setLayerInfo(null);
+      onLayerInfoChange?.(null);
+      return;
+    }
+    setLayerInfo(null);
+    onLayerInfoChange?.(null);
+    const controller = new AbortController();
+    void api.getVipOrganizerLayerInfo(sourceImageId, {
+      crop_x: draft.crop_x,
+      crop_y: draft.crop_y,
+      crop_width: draft.crop_width,
+      crop_height: draft.crop_height
+    }, controller.signal).then((info) => {
+      setLayerInfo(info);
+      onLayerInfoChange?.(info);
+    }).catch((requestError: any) => {
+      if (requestError?.name !== "AbortError") {
+        setLayerInfo(null);
+        onLayerInfoChange?.(null);
+      }
+    });
+    return () => controller.abort();
+  }, [sourceImageId, cropKey, platform, slot.file_name, onLayerInfoChange]);
+
+  useEffect(() => {
+    if (platform !== "vip" || slot.file_name !== "606.jpg" || !compositePrimaryImageId) {
+      setPrimaryLayerInfo(null);
+      return;
+    }
+    setPrimaryLayerInfo(null);
+    const controller = new AbortController();
+    void api.getVipOrganizerLayerInfo(compositePrimaryImageId, {
+      crop_x: 0,
+      crop_y: 0,
+      crop_width: 1,
+      crop_height: 1
+    }, controller.signal).then(setPrimaryLayerInfo).catch((requestError: any) => {
+      if (requestError?.name !== "AbortError") setPrimaryLayerInfo(null);
+    });
+    return () => controller.abort();
+  }, [compositePrimaryImageId, platform, slot.file_name]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1567,6 +1696,8 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     const logoReference = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name)
       ? livePreviewImage(`/organizer-assets/elle_logo_${logoColor}.png`)
       : null;
+    const preparedUrl = layerInfo?.url || "";
+    const preparedProduct = preparedUrl ? livePreviewImage(preparedUrl) : null;
     const draw = () => {
       if (!image.complete || !image.naturalWidth) return;
       if (compositePrimary && (!compositePrimary.complete || !compositePrimary.naturalWidth)) return;
@@ -1575,6 +1706,10 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       context.fillRect(0, 0, output.width, output.height);
       if (platform === "vip" && slot.file_name === "401.jpg") {
         drawVipInfoStaticPreview(context, productInfo);
+        if (!layerInfo || !preparedProduct?.complete || !preparedProduct.naturalWidth) {
+          drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
+          return;
+        }
       }
       if (platform === "vip" && ["604.jpg", "605.jpg"].includes(slot.file_name)) {
         context.fillStyle = "#fff";
@@ -1610,15 +1745,13 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         ? ["2.jpg", "透明.png"].includes(slot.file_name)
         : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg"].includes(slot.file_name))
         || usesAutomaticDetailCutout;
-      const automaticBounds = !usesProductCutout ? livePreviewContentBounds(sourceUrl, image) : {
-        left: 0,
-        top: 0,
-        right: image.naturalWidth,
-        bottom: image.naturalHeight
-      };
-      // A manual crop is expressed in full-image coordinates. Automatic content
-      // bounds are only useful before the designer chooses an explicit region.
-      const bounds = !usesProductCutout && !hasManualCrop ? automaticBounds : {
+      if (usesProductCutout && preparedProduct && (!preparedProduct.complete || !preparedProduct.naturalWidth)) return;
+      // The backend applies crop, zoom and offsets to the complete source image
+      // for model, detail and tag slots. Cropping the browser preview to its
+      // detected non-white content changes the coordinate basis and makes the
+      // layer jump when the exact preview arrives. Product slots use their
+      // prepared cutout below; every other slot must retain full-image bounds.
+      const bounds = {
         left: 0,
         top: 0,
         right: image.naturalWidth,
@@ -1630,11 +1763,15 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       const sourceY = Math.max(0, Math.min(image.naturalHeight - 1, bounds.top + draft.crop_y * contentHeight));
       const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, draft.crop_width * contentWidth));
       const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, draft.crop_height * contentHeight));
-      const productLayer = usesProductCutout ? livePreviewProductCutout(sourceUrl, image) : null;
+      const productLayer = usesProductCutout
+        ? preparedProduct
+          ? preparedProductCutout(preparedUrl, preparedProduct)
+          : livePreviewProductCutout(sourceUrl, image)
+        : null;
       // The backend removes whitespace again after a manual product crop. Use
       // the same cropped, tightly bounded layer in the live preview so crop,
       // zoom and drag do not jump when the exact preview is generated.
-      const croppedProductLayer = usesProductCutout && hasManualCrop
+      const croppedProductLayer = usesProductCutout && hasManualCrop && !preparedProduct
         ? liveJdProductLayer(sourceUrl, image, draft)
         : null;
       const drawSource = croppedProductLayer?.canvas || productLayer || image;
@@ -1653,27 +1790,59 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         ? -0.105
         : detailRatio <= 1.05 ? -0.11 : detailRatio <= 1.45 ? -0.12 : -0.13;
       const infoProductScale = platform === "vip" && slot.file_name === "401.jpg"
-        ? VIP_INFO_PRODUCT_SCALE
+        ? vipInfoProductScale(
+          layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
+        )
         : 1;
+      const infoProductLiftY = platform === "vip" && slot.file_name === "401.jpg"
+        ? vipInfoProductLiftY(
+          layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
+        )
+        : 0;
+      const autoHandleLayout = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
+        || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
+      const automaticHandleLift = autoHandleLayout && productLayer && !hasManualCrop
+        ? layerInfo?.handle_lift ?? liveHandleVisualLift(productLayer)
+        : 0;
       const drawWidth = drawSourceWidth * fitScale * draft.zoom * automaticDetailScale * infoProductScale;
       const drawHeight = drawSourceHeight * fitScale * draft.zoom * automaticDetailScale * infoProductScale;
-      let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+      const productBody = autoHandleLayout && productLayer && !hasManualCrop
+        ? organizerLayerBounds(
+          platform === "vip" && slot.file_name === "401.jpg"
+            ? layerInfo?.product_body_bbox
+            : layerInfo?.measurement_bbox
+        ) || liveInfoMeasurementBounds(productLayer)
+        : null;
+      const productScale = fitScale * draft.zoom * automaticDetailScale * infoProductScale;
+      const bodyCenterOffsetX = productBody && productLayer
+        ? (productLayer.width / 2 - (productBody.left + productBody.right) / 2) * productScale
+        : 0;
+      const bodyCenterOffsetY = productBody && productLayer
+        ? (productLayer.height / 2 - (productBody.top + productBody.bottom) / 2) * productScale
+        : 0;
+      let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth + bodyCenterOffsetX;
       const multiAngleHandleLift = compositePrimary
-        ? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
+        ? primaryLayerInfo?.handle_lift
+          ?? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
         : 0;
       const multiAngleRowShift = multiAngleHandleLift >= 0.55
         ? (sourceIndex < 2 ? 1 : -1) * Math.round(13 * multiAngleHandleLift * output.height / 750)
         : 0;
       const tallHandleDropAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
-        || (platform === "jd" && slot.file_name === "2.jpg");
+        || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
+      const productAutoLift = autoHandleLayout ? 0.03 : 0;
       const tallHandleDropRatio = platform === "vip" && slot.file_name === "2.jpg" ? 0.14 : 0.12;
       let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
+        + bodyCenterOffsetY
         + multiAngleRowShift
+        - infoProductLiftY * areaHeight
         + (usesAutomaticDetailCutout && !automaticInteriorDetail ? (vipDetailOffset + 0.02) * areaHeight : 0)
-        - (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name) && !hasManualCrop ? 0.03 * areaHeight : 0)
+        - (!hasManualCrop ? productAutoLift * areaHeight : 0)
         + (tallHandleDropAware && productLayer && !hasManualCrop
-          ? tallHandleDropRatio * liveHandleVisualLift(productLayer) * areaHeight
+          ? tallHandleDropRatio * automaticHandleLift * areaHeight
           : 0);
+      const automaticBaseX = drawX - draft.offset_x * areaWidth;
+      const automaticBaseY = drawY - draft.offset_y * areaHeight;
       const editorArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
       const safeLeft = editorArea.x * output.width;
       const safeTop = editorArea.y * output.height;
@@ -1684,6 +1853,23 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       // made dragging asymmetric and caused the zoom anchor to jump from one
       // edge to the other. This applies equally to VIP and JD manual edits.
       const allowFreeMovement = hasManualLayout;
+      const jdProductManualAnchor = platform === "jd"
+        && slot.file_name === "2.jpg"
+        && hasManualLayout
+        && !hasManualCrop;
+      if (jdProductManualAnchor) {
+        const anchoredX = clampLayerOrigin(automaticBaseX, drawWidth, safeLeft, safeRight);
+        let anchoredY = clampLayerOrigin(automaticBaseY, drawHeight, safeTop, safeBottom);
+        const minimumTop = output.width === 800 && output.height === 800
+          ? 162
+          : 175;
+        const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
+        anchoredY = drawHeight <= maximumBottom - minimumTop
+          ? Math.max(minimumTop, Math.min(anchoredY, maximumBottom - drawHeight))
+          : Math.max(anchoredY, minimumTop);
+        drawX += anchoredX - automaticBaseX;
+        drawY += anchoredY - automaticBaseY;
+      }
       if (!allowFreeMovement) {
         drawX = clampLayerOrigin(drawX, drawWidth, safeLeft, safeRight);
       }
@@ -1691,14 +1877,8 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         drawY = clampLayerOrigin(drawY, drawHeight, safeTop, safeBottom);
       }
       if (platform === "jd" && slot.file_name === "2.jpg" && !hasManualLayout) {
-        const body = productLayer ? liveInfoMeasurementBounds(productLayer) : null;
-        const isTallHandleBag = productLayer && body
-          ? (body.right - body.left) / Math.max(1, body.bottom - body.top) <= 1.15
-            && liveHandleVisualLift(productLayer) >= 0.55
-          : false;
         const baseSafeTop = output.width === 800 && output.height === 800 ? 162 : 175;
-        const tallHandleSafeTop = output.width === 800 && output.height === 800 ? 180 : 185;
-        const minimumTop = isTallHandleBag ? tallHandleSafeTop : baseSafeTop;
+        const minimumTop = baseSafeTop;
         const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
         drawY = drawHeight <= maximumBottom - minimumTop
           ? Math.max(minimumTop, Math.min(drawY, maximumBottom - drawHeight))
@@ -1730,10 +1910,16 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       if (platform === "vip" && slot.file_name === "401.jpg") {
         const scaleX = output.width / 750;
         const scaleY = output.height / 665;
-        const lineColor = "#777";
+        const lineColor = VIP_INFO_RULER_COLOR;
         const storedBaseBody = storedProductRulerBase(draft);
-        const baseBody = storedBaseBody || liveInfoProductBody(sourceUrl, image, draft);
-        const ruler = infoRulerGeometry(baseBody);
+        const baseBody = storedBaseBody || liveInfoProductBody(
+          sourceUrl,
+          image,
+          draft,
+          productLayer || undefined,
+          organizerLayerBounds(layerInfo?.product_body_bbox) || undefined
+        );
+        const ruler = infoRulerGeometry(baseBody, draft.product_ruler_gap_scale || 1);
         const productRulerCenter = {
           x: areaX + areaWidth / 2,
           y: areaY + areaHeight / 2
@@ -1750,8 +1936,8 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
           output
         );
         const heightRuler = transformProductRulerSegment(
-          { x: ruler.verticalX, y: ruler.top },
-          { x: ruler.verticalX, y: ruler.bottom },
+          { x: ruler.verticalX, y: ruler.top + VIP_INFO_HEIGHT_RULER_SHIFT_Y },
+          { x: ruler.verticalX, y: ruler.bottom + VIP_INFO_HEIGHT_RULER_SHIFT_Y },
           productRulerCenter,
           draft,
           draft.height_ruler_scale || 1,
@@ -1813,12 +1999,14 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     if (compositePrimary) compositePrimary.addEventListener("load", draw);
     if (phoneReference) phoneReference.addEventListener("load", draw);
     if (logoReference) logoReference.addEventListener("load", draw);
+    if (preparedProduct) preparedProduct.addEventListener("load", draw);
     draw();
     return () => {
       image.removeEventListener("load", draw);
       if (compositePrimary) compositePrimary.removeEventListener("load", draw);
       if (phoneReference) phoneReference.removeEventListener("load", draw);
       if (logoReference) logoReference.removeEventListener("load", draw);
+      if (preparedProduct) preparedProduct.removeEventListener("load", draw);
     };
   }, [
     draft,
@@ -1827,7 +2015,11 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     slot.size,
     sourceIndex,
     sourceUrl,
+    sourceImageId,
     compositePrimaryUrl,
+    compositePrimaryImageId,
+    layerInfo,
+    primaryLayerInfo,
     targetFolder,
     templateUrl,
     logoColor,
@@ -1949,8 +2141,10 @@ function SlotAdjustmentEditor({
   sessionId,
   slot,
   sourceIndex,
+  sourceImageId,
   sourceUrl,
   compositePrimaryUrl,
+  compositePrimaryImageId,
   displaySourceUrl,
   initialPreview,
   productInfo,
@@ -1963,8 +2157,10 @@ function SlotAdjustmentEditor({
   sessionId: string;
   slot: Slot;
   sourceIndex: number;
+  sourceImageId: number;
   sourceUrl: string;
   compositePrimaryUrl?: string;
+  compositePrimaryImageId?: number;
   displaySourceUrl?: string;
   initialPreview?: string;
   productInfo: Record<string, string>;
@@ -1980,13 +2176,23 @@ function SlotAdjustmentEditor({
   ) => void;
 }) {
   const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
-  const initial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
-  // A stored 401 preview may have been rendered with the former 100% product
-  // scale. Always rebuild it so the editor opens with the same exact 85%
-  // geometry used by the live canvas and the final export.
+  const storedInitial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
+  const initial = isInfoPage && storedInitial.product_show_ruler !== false ? {
+    ...storedInitial,
+    product_ruler_base_left: undefined,
+    product_ruler_base_top: undefined,
+    product_ruler_base_right: undefined,
+    product_ruler_base_bottom: undefined,
+    product_ruler_group_scale: 1,
+    product_ruler_group_offset_x: 0,
+    product_ruler_group_offset_y: 0
+  } : storedInitial;
+  // Always rebuild 401 so its handle-aware product scale and ruler geometry
+  // match the live canvas and the final export.
   const usableInitialPreview = isInfoPage ? "" : (initialPreview || "");
   const supportsLogoColor = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name);
   const [draft, setDraft] = useState<ImageAdjustment>(initial);
+  const [editorLayerInfo, setEditorLayerInfo] = useState<OrganizerLayerInfo | null>(null);
   const [logoColor, setLogoColor] = useState<LogoColor>(slot.logo_color === "white" ? "white" : "black");
   const [renderedPreview, setRenderedPreview] = useState(usableInitialPreview);
   const [previewSynced, setPreviewSynced] = useState(Boolean(usableInitialPreview));
@@ -2118,18 +2324,45 @@ function SlotAdjustmentEditor({
   }
 
   function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
-    if ((!isInfoPage && !isPhoneComparison) || !sourceImageRef.current?.naturalWidth) return null;
+    if (!isInfoPage && !isPhoneComparison) return null;
+    if (isInfoPage) {
+      const body = organizerLayerBounds(editorLayerInfo?.product_body_bbox);
+      return body && editorLayerInfo
+        ? positionedInfoProductBody(
+          editorLayerInfo.width,
+          editorLayerInfo.height,
+          body,
+          nextDraft,
+          editorLayerInfo.handle_lift
+        )
+        : null;
+    }
+    if (!sourceImageRef.current?.naturalWidth) return null;
     const output = slotCanvasSize(slot.size, platform, targetFolder);
     const layer = liveJdProductLayer(sourceUrl, sourceImageRef.current, nextDraft);
     if (isPhoneComparison) {
       const { geometry } = jdComparisonProductGeometry(output, layer, nextDraft, productInfo);
       return geometry.body;
     }
-    return liveInfoProductBody(sourceUrl, sourceImageRef.current, nextDraft);
+    return null;
   }
 
   function withSyncedProductRulerBody(nextDraft: ImageAdjustment): ImageAdjustment {
     if (isPhoneObjectEditor) return nextDraft;
+    if (isInfoPage) {
+      const body = productRulerBodyForDraft(nextDraft);
+      return {
+        ...nextDraft,
+        product_ruler_base_left: body?.left,
+        product_ruler_base_top: body?.top,
+        product_ruler_base_right: body?.right,
+        product_ruler_base_bottom: body?.bottom,
+        product_ruler_gap_scale: nextDraft.zoom,
+        product_ruler_group_scale: 1,
+        product_ruler_group_offset_x: 0,
+        product_ruler_group_offset_y: 0
+      };
+    }
     const current = draftRef.current;
     const currentBody = storedProductRulerBase(current);
     const cropUnchanged = current.crop_x === nextDraft.crop_x
@@ -2206,7 +2439,8 @@ function SlotAdjustmentEditor({
 
   function applyDraft(
     nextDraft: ImageAdjustment,
-    syncProductRulerBody = linkedProductRulersRef.current
+    syncProductRulerBody = linkedProductRulersRef.current,
+    requestExactPreview = true
   ) {
     const preparedDraft = syncProductRulerBody
       ? withSyncedProductRulerBody(nextDraft)
@@ -2217,7 +2451,9 @@ function SlotAdjustmentEditor({
     draftRef.current = preparedDraft;
     setDraft(preparedDraft);
     setPreviewSynced(false);
-    scheduleExactPreview(preparedDraft, draftVersionRef.current);
+    if (requestExactPreview) {
+      scheduleExactPreview(preparedDraft, draftVersionRef.current);
+    }
   }
 
   function changeLogoColor(nextColor: LogoColor) {
@@ -2461,6 +2697,7 @@ function SlotAdjustmentEditor({
         product_ruler_group_scale: 1,
         product_ruler_group_offset_x: 0,
         product_ruler_group_offset_y: 0,
+        product_ruler_gap_scale: 1,
         length_ruler_scale: 1,
         length_ruler_offset_x: 0,
         length_ruler_offset_y: 0,
@@ -2527,19 +2764,20 @@ function SlotAdjustmentEditor({
     setCropMode(false);
   }
 
-  function flushPendingMove() {
+  function flushPendingMove(requestExactPreview = false) {
     if (moveFrameRef.current !== null) {
       window.cancelAnimationFrame(moveFrameRef.current);
       moveFrameRef.current = null;
     }
     const nextDraft = pendingMoveRef.current;
     pendingMoveRef.current = null;
-    if (nextDraft) applyDraft(nextDraft);
+    if (nextDraft) applyDraft(nextDraft, linkedProductRulersRef.current, requestExactPreview);
   }
 
   function finishMove() {
-    flushPendingMove();
+    flushPendingMove(false);
     moveStartRef.current = null;
+    scheduleExactPreview(draftRef.current, draftVersionRef.current);
   }
 
   async function saveAdjustment() {
@@ -2658,22 +2896,32 @@ function SlotAdjustmentEditor({
                 const bounds = event.currentTarget.getBoundingClientRect();
                 const output = slotCanvasSize(slot.size, platform, targetFolder);
                 const basis = adjustmentOffsetBasis(slot, platform, sourceIndex, targetFolder, start.target);
-                const dragSensitivity = platform === "jd"
-                  && slot.file_name === "2.jpg"
-                  && start.target === "product"
-                  ? 0.65
-                  : 1;
+                const dragSensitivity = start.target === "product" && slot.kind === "model"
+                  ? 0.6
+                  : platform === "jd" && slot.file_name === "2.jpg" && start.target === "product"
+                    ? 0.65
+                    : 1;
                 const canvasDeltaX = (event.clientX - start.x) * output.width / Math.max(1, bounds.width) * dragSensitivity;
                 const canvasDeltaY = (event.clientY - start.y) * output.height / Math.max(1, bounds.height) * dragSensitivity;
-                const nextOffsetX = Math.max(-1.5, Math.min(1.5, start.offsetX + canvasDeltaX / basis.x));
-                const nextOffsetY = Math.max(-1.5, Math.min(1.5, start.offsetY + canvasDeltaY / basis.y));
+                const rawOffsetX = start.offsetX + canvasDeltaX / basis.x;
+                const rawOffsetY = start.offsetY + canvasDeltaY / basis.y;
+                const nextOffsetX = Math.max(-1.5, Math.min(1.5,
+                  slot.kind === "model"
+                    ? modelDragOffsetWithBoundaryResistance(start.offsetX, rawOffsetX - start.offsetX)
+                    : rawOffsetX
+                ));
+                const nextOffsetY = Math.max(-1.5, Math.min(1.5,
+                  slot.kind === "model"
+                    ? modelDragOffsetWithBoundaryResistance(start.offsetY, rawOffsetY - start.offsetY)
+                    : rawOffsetY
+                ));
                 pendingMoveRef.current = updateTargetOffset(draftRef.current, start.target, nextOffsetX, nextOffsetY);
                 if (moveFrameRef.current === null) {
                   moveFrameRef.current = window.requestAnimationFrame(() => {
                     moveFrameRef.current = null;
                     const nextDraft = pendingMoveRef.current;
                     pendingMoveRef.current = null;
-                    if (nextDraft) applyDraft(nextDraft);
+                    if (nextDraft) applyDraft(nextDraft, linkedProductRulersRef.current, false);
                   });
                 }
               }}
@@ -2682,7 +2930,9 @@ function SlotAdjustmentEditor({
             >
               <LiveSlotPreview
                 sourceUrl={sourceUrl}
+                sourceImageId={sourceImageId}
                 compositePrimaryUrl={compositePrimaryUrl}
+                compositePrimaryImageId={compositePrimaryImageId}
                 templateUrl={renderedPreview || usableInitialPreview}
                 slot={slot}
                 draft={draft}
@@ -2691,6 +2941,7 @@ function SlotAdjustmentEditor({
                 targetFolder={targetFolder}
                 productInfo={productInfo}
                 logoColor={logoColor}
+                onLayerInfoChange={setEditorLayerInfo}
               />
               {renderedPreview && <img
                 className={`slot-exact-preview${previewSynced || holdExactPreview ? " is-visible" : ""}`}
@@ -4317,8 +4568,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         sessionId={sessionId}
         slot={activeEditorSlot}
         sourceIndex={adjustmentEditor.sourceIndex}
+        sourceImageId={activeEditorAsset.id}
         sourceUrl={activeEditorAsset.original_url || activeEditorAsset.preview_url}
         compositePrimaryUrl={activeEditorPrimaryAsset?.original_url || activeEditorPrimaryAsset?.preview_url}
+        compositePrimaryImageId={activeEditorPrimaryAsset?.id}
         displaySourceUrl={adjustmentEditor.targetObject === "phone" ? "/organizer-assets/iphone_reference.png" : undefined}
         initialPreview={slotPreviews[slotPreviewKey(platform, activeEditorSlot.file_name, adjustmentEditor.targetFolder)]}
         productInfo={organizerProductInfo()}

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 from ..services.vip_organizer_service import (
     analysis_config_status,
     asset_original,
+    asset_organizer_layer,
+    asset_organizer_layer_info,
     asset_thumbnail,
     analyze_assets,
     analyze_assets_with_api,
@@ -139,6 +141,49 @@ def get_asset_original(image_id: int):
     try:
         path = asset_original(image_id)
         return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/assets/{image_id}/organizer-layer")
+def get_asset_organizer_layer(
+    image_id: int,
+    crop_x: float = 0.0,
+    crop_y: float = 0.0,
+    crop_width: float = 1.0,
+    crop_height: float = 1.0,
+):
+    try:
+        path = asset_organizer_layer(image_id, {
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_width": crop_width,
+            "crop_height": crop_height,
+        })
+        return FileResponse(
+            path,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/assets/{image_id}/organizer-layer-info")
+def get_asset_organizer_layer_info(
+    image_id: int,
+    crop_x: float = 0.0,
+    crop_y: float = 0.0,
+    crop_width: float = 1.0,
+    crop_height: float = 1.0,
+):
+    try:
+        return asset_organizer_layer_info(image_id, {
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_width": crop_width,
+            "crop_height": crop_height,
+        })
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

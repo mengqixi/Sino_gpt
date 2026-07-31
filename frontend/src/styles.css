@@ -257,7 +257,8 @@
 .slot-adjustment-controls button.primary { border-color: #1f5a4b; color: #fff; background: #1f5a4b; }
 .slot-save-actions { position: sticky; right: 0; z-index: 2; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 9px; margin-left: auto; padding-left: 9px; background: #f7f9f8; }
 .slot-close-confirm > .slot-save-actions { position: static; padding-left: 0; background: transparent; }
-.slot-sync-toggle { display: inline-flex; min-height: 38px; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid #ced8d3; border-radius: 5px; background: #fff; color: #273d35; cursor: pointer; white-space: nowrap; }
+.slot-sync-toggle { display: inline-flex; height: 38px; min-height: 38px; align-items: center; gap: 7px; margin: 0; padding: 7px 10px; border: 1px solid #ced8d3; border-radius: 5px; background: #fff; color: #273d35; cursor: pointer; white-space: nowrap; }
+.slot-save-actions > button.primary { height: 38px; min-height: 38px; margin: 0; }
 .slot-sync-toggle:has(input:checked) { border-color: #1f5d4d; color: #174a3d; background: #e8f1ed; }
 .slot-sync-toggle input { width: 16px; height: 16px; margin: 0; accent-color: #1f5d4d; cursor: pointer; }
 .slot-logo-color { display: inline-flex; align-items: center; gap: 5px; padding-left: 9px; border-left: 1px solid #d8e0dc; }
@@ -1439,6 +1440,10 @@ main {
 @media (max-width: 760px) {
   .app-shell {
     grid-template-columns: 1fr;
+  }
+
+  .app-shell.sidebar-collapsed {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .app-shell.sidebar-collapsed .sidebar {
