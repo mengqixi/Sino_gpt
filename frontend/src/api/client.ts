@@ -93,6 +93,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload)
     }),
+  prewarmHeavyTask: (feature: "cutout" | "organizer" | "recolor") =>
+    request<{ feature: string; status: string }>(`/api/heavy-tasks/prewarm/${feature}`, { method: "POST" }),
   deleteProductSources: (taskId: string) =>
     request<any>(`/api/product-images/tasks/${taskId}/sources/cleanup`, { method: "POST" }),
   analyzeVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/analyze", { method: "POST", body: JSON.stringify(payload) }),
@@ -108,17 +110,38 @@ export const api = {
     body: JSON.stringify(payload),
     signal
   }),
+  getVipOrganizerLayerInfo: (imageId: number, crop: Record<string, number>, signal?: AbortSignal) => {
+    const params = new URLSearchParams(Object.fromEntries(
+      Object.entries(crop).map(([key, value]) => [key, value.toFixed(6)])
+    ));
+    return request<any>(`/api/vip-organizer/assets/${imageId}/organizer-layer-info?${params.toString()}`, { signal });
+  },
   exportVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/export", { method: "POST", body: JSON.stringify(payload) }),
   startVipOrganizerSession: (previousSessionId?: string) => request<{ session_id: string }>("/api/vip-organizer/session", {
     method: "POST",
     body: JSON.stringify({ previous_session_id: previousSessionId || null })
   }),
+  cleanupVipOrganizerSession: (sessionId: string) =>
+    request<{ deleted: boolean }>("/api/vip-organizer/session/cleanup", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId })
+    }),
   uploadVipOrganizerAssets: (sessionId: string, assetType: string, files: File[]) => {
     const form = new FormData();
     form.append("session_id", sessionId);
     form.append("asset_type", assetType);
     files.forEach((file) => form.append("files", file));
     return request<any[]>("/api/vip-organizer/upload", { method: "POST", body: form });
+  },
+  deleteVipOrganizerAsset: (sessionId: string, imageId: number) =>
+    request<{ deleted: boolean }>(`/api/vip-organizer/assets/${imageId}?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "DELETE"
+    }),
+  prepareVipOrganizerCutout: (sessionId: string, file: File) => {
+    const form = new FormData();
+    form.append("session_id", sessionId);
+    form.append("file", file);
+    return request<any>("/api/vip-organizer/prepare-cutout", { method: "POST", body: form });
   },
   createApiConfig: (payload: any) => request<any>("/api/api-configs", { method: "POST", body: JSON.stringify(payload) }),
   updateApiConfig: (id: number, payload: any) => request<any>(`/api/api-configs/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),

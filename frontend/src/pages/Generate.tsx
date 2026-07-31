@@ -86,6 +86,7 @@ export default function Generate({
   const cropStageRef = useRef<HTMLDivElement | null>(null);
   const cropStartRef = useRef<{ x: number; y: number } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [uploadDragging, setUploadDragging] = useState(false);
   const [message, setMessage] = useState("");
   const [copyMessage, setCopyMessage] = useState("");
 
@@ -189,7 +190,7 @@ export default function Generate({
     }
   }
 
-  async function handleUpload(files?: FileList | null) {
+  async function handleUpload(files?: FileList | File[] | null) {
     const fileList = Array.from(files || []);
     if (!fileList.length) return;
     try {
@@ -503,10 +504,36 @@ export default function Generate({
       <div className="generate-grid">
         <section className="panel">
           <h2>图片与参数</h2>
-          <label className="upload-box">
+          <label
+            className={`upload-box ${uploadDragging ? "is-dragging" : ""}`}
+            tabIndex={0}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              setUploadDragging(true);
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+              setUploadDragging(true);
+            }}
+            onDragLeave={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setUploadDragging(false);
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              setUploadDragging(false);
+              void handleUpload(Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith("image/")));
+            }}
+            onPaste={(event) => {
+              const files = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+              if (!files.length) return;
+              event.preventDefault();
+              void handleUpload(files);
+            }}
+          >
             <UploadCloud size={28} />
             <input type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={(event) => handleUpload(event.target.files)} />
-            <span>{uploadedImages.length ? `已上传 ${uploadedImages.length} 张原图` : "上传女包原图，可多选"}</span>
+            <span>{uploadedImages.length ? `已上传 ${uploadedImages.length} 张原图，可继续拖入或粘贴替换` : "点击、拖入或粘贴女包原图，可多选"}</span>
           </label>
           {uploadedImages.length > 0 && (
             <div className="upload-preview-grid">

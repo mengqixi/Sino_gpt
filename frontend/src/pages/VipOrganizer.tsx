@@ -1,5 +1,5 @@
-import { CheckCircle2, Crop, Download, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { DragEvent } from "react";
+import { Crop, Download, Eye, FileImage, LoaderCircle, Move, RefreshCw, RotateCcw, Save, Smartphone, UploadCloud, X, ZoomIn, ZoomOut } from "lucide-react";
+import type { DragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 
@@ -23,6 +23,7 @@ type Slot = {
   confidence: number;
   reason: string;
   adjustments?: ImageAdjustment[];
+  folder_adjustments?: Partial<Record<PreviewFolder, ImageAdjustment[]>>;
   logo_color?: LogoColor;
 };
 
@@ -40,6 +41,14 @@ type ImageAdjustment = {
   phone_alignment?: "center" | "bottom";
   product_show_ruler?: boolean;
   phone_show_ruler?: boolean;
+  product_ruler_gap_scale?: number;
+  product_ruler_group_scale?: number;
+  product_ruler_group_offset_x?: number;
+  product_ruler_group_offset_y?: number;
+  product_ruler_base_left?: number;
+  product_ruler_base_top?: number;
+  product_ruler_base_right?: number;
+  product_ruler_base_bottom?: number;
   length_ruler_scale?: number;
   length_ruler_offset_x?: number;
   length_ruler_offset_y?: number;
@@ -55,6 +64,14 @@ type ImageAdjustment = {
 };
 
 type CropSelection = { left: number; top: number; width: number; height: number };
+type OrganizerLayerInfo = {
+  url: string;
+  width: number;
+  height: number;
+  measurement_bbox: [number, number, number, number];
+  product_body_bbox: [number, number, number, number];
+  handle_lift: number;
+};
 type AdjustmentTarget = "product" | "phone" | "length_ruler" | "height_ruler" | "width_ruler" | "phone_ruler";
 type InfoMoveTarget = "product" | "product_rulers" | "length_ruler" | "height_ruler" | "width_ruler";
 
@@ -115,6 +132,10 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_alignment: "bottom",
   product_show_ruler: true,
   phone_show_ruler: true,
+  product_ruler_gap_scale: 1,
+  product_ruler_group_scale: 1,
+  product_ruler_group_offset_x: 0,
+  product_ruler_group_offset_y: 0,
   length_ruler_scale: 1,
   length_ruler_offset_x: 0,
   length_ruler_offset_y: 0,
@@ -129,8 +150,57 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_ruler_offset_y: 0
 };
 
+const VIP_INFO_PRODUCT_BOX = { left: 294, top: 238, right: 687, bottom: 511 } as const;
+const VIP_INFO_PRODUCT_SCALE = 1;
+const VIP_INFO_HANDLE_SCALE = 0.08;
+const VIP_INFO_HANDLE_LIFT_Y = 0.04;
+const VIP_INFO_TEXT_X = 53;
+const VIP_INFO_HEIGHT_RULER_SHIFT_Y = 5;
+const VIP_INFO_RULER_COLOR = "#8a8a8a";
+const IMAGE_PREVIEW_ZOOM_MIN = 0.5;
+const IMAGE_PREVIEW_ZOOM_MAX = 5;
+const IMAGE_PREVIEW_ZOOM_STEP = 0.25;
+
+function slotDisplayTitle(platform: OrganizerPlatform, fileName: string, fallback: string) {
+  const vipTitles: Record<string, string> = {
+    "1.jpg": "模特主图",
+    "2.jpg": "半侧/全侧图",
+    "3.jpg": "背面图",
+    "4.jpg": "Logo图",
+    "15.jpg": "内里图",
+    "30.png": "透明图",
+    "50.jpg": "模特竖图",
+    "401.jpg": "产品信息",
+    "601.jpg": "模特展示1",
+    "602.jpg": "模特展示2",
+    "603.jpg": "模特展示3",
+    "604.jpg": "内里细节",
+    "605.jpg": "Logo/五金细节",
+    "606.jpg": "多角度图",
+    "801.jpg": "吊牌图"
+  };
+  const jdTitles: Record<string, string> = {
+    "0-无logo.jpg": "模特主图（无Logo）",
+    "1.jpg": "模特主图",
+    "2.jpg": "半侧产品图",
+    "3.jpg": "Logo图",
+    "4.jpg": "内里图",
+    "5.jpg": "尺寸对比图",
+    "透明.png": "透明图"
+  };
+  return (platform === "jd" ? jdTitles : vipTitles)[fileName] || fallback;
+}
+
 function normalizeAdjustment(value?: Partial<ImageAdjustment>): ImageAdjustment {
   return { ...DEFAULT_ADJUSTMENT, ...(value || {}) };
+}
+
+function vipInfoProductScale(handleLift = 0) {
+  return VIP_INFO_PRODUCT_SCALE * (1 + VIP_INFO_HANDLE_SCALE * Math.max(0, Math.min(1, handleLift)));
+}
+
+function vipInfoProductLiftY(handleLift = 0) {
+  return VIP_INFO_HANDLE_LIFT_Y * Math.max(0, Math.min(1, handleLift));
 }
 
 function targetScale(draft: ImageAdjustment, target: AdjustmentTarget) {
@@ -169,6 +239,40 @@ function withTargetOffset(draft: ImageAdjustment, target: AdjustmentTarget, x: n
   return { ...draft, offset_x: x, offset_y: y };
 }
 
+function withLinkedProductOffset(
+  draft: ImageAdjustment,
+  x: number,
+  y: number
+): ImageAdjustment {
+  return {
+    ...draft,
+    offset_x: x,
+    offset_y: y
+  };
+}
+
+function withLinkedProductScale(draft: ImageAdjustment, scale: number): ImageAdjustment {
+  return {
+    ...draft,
+    zoom: scale
+  };
+}
+
+function modelDragOffsetWithBoundaryResistance(start: number, delta: number) {
+  const softBoundary = 0.12;
+  const resistance = 0.35;
+  const projected = start + delta;
+  if (Math.abs(projected) <= softBoundary || Math.abs(projected) <= Math.abs(start)) {
+    return projected;
+  }
+  const direction = Math.sign(projected) || 1;
+  if (Math.abs(start) >= softBoundary && Math.sign(start) === direction) {
+    return start + delta * resistance;
+  }
+  const boundary = direction * softBoundary;
+  return boundary + (projected - boundary) * resistance;
+}
+
 function isManuallyConfirmedSlot(slot: Slot) {
   return slot.reason.includes("已由设计师人工确认")
     || slot.reason.includes("已同步使用同一张模特图");
@@ -194,6 +298,7 @@ function mergeAnalyzedSlots(current: Slot[], incoming: Slot[]) {
       ...nextSlot,
       image_ids: imageIds,
       adjustments,
+      folder_adjustments: previous.folder_adjustments,
       logo_color: previous.logo_color || nextSlot.logo_color,
       confidence: preserveManualSources ? previous.confidence : nextSlot.confidence,
       reason: preserveManualSources ? previous.reason : nextSlot.reason
@@ -206,6 +311,27 @@ function previewFoldersForSlot(slot: Slot, platform: OrganizerPlatform): Preview
   return ["800", "750"];
 }
 
+function slotForPreviewFolder(
+  slot: Slot,
+  platform: OrganizerPlatform,
+  targetFolder: PreviewFolder
+): Slot {
+  if (platform !== "jd") return slot;
+  const { folder_adjustments: folderAdjustments, ...baseSlot } = slot;
+  return {
+    ...baseSlot,
+    adjustments: folderAdjustments?.[targetFolder] || slot.adjustments
+  };
+}
+
+function slotsForPreviewFolder(
+  slots: Slot[],
+  platform: OrganizerPlatform,
+  targetFolder: PreviewFolder
+) {
+  return slots.map((slot) => slotForPreviewFolder(slot, platform, targetFolder));
+}
+
 function slotPreviewKey(platform: OrganizerPlatform, fileName: string, targetFolder: PreviewFolder = "800") {
   return platform === "jd" ? `${targetFolder}/${fileName}` : fileName;
 }
@@ -216,6 +342,12 @@ function slotCanvasSize(size: string, platform?: OrganizerPlatform, targetFolder
   }
   const match = size.match(/(\d+)\s*[×x]\s*(\d+)/i);
   return match ? { width: Number(match[1]), height: Number(match[2]) } : { width: 800, height: 800 };
+}
+
+function slotUsesOrganizerLayer(slot: Slot, platform: OrganizerPlatform) {
+  return platform === "jd"
+    ? ["2.jpg", "4.jpg", "5.jpg", "透明.png"].includes(slot.file_name)
+    : ["2.jpg", "3.jpg", "15.jpg", "30.png", "401.jpg", "604.jpg", "605.jpg", "606.jpg"].includes(slot.file_name);
 }
 
 function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex: number, targetFolder: PreviewFolder) {
@@ -245,7 +377,13 @@ function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex:
     return { x: 0, y: 0, width: 1, height: 1, mode: "cover" as const };
   }
   if (slot.file_name === "401.jpg") {
-    return { x: 359 / 750, y: 283 / 665, width: 262 / 750, height: 182 / 665, mode: "contain" as const };
+    return {
+      x: VIP_INFO_PRODUCT_BOX.left / 750,
+      y: VIP_INFO_PRODUCT_BOX.top / 665,
+      width: (VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left) / 750,
+      height: (VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top) / 665,
+      mode: "contain" as const
+    };
   }
   if (slot.file_name === "606.jpg") {
     const positions = [
@@ -269,7 +407,7 @@ function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex:
     return { x: 52 / 750, y: 181 / 750, width: 643 / 750, height: 523 / 750, mode: "cover" as const };
   }
   if (slot.file_name === "801.jpg") {
-    return { x: 90 / 750, y: 105 / 750, width: 570 / 750, height: 560 / 750, mode: "contain" as const };
+    return { x: 0, y: 0, width: 1, height: 1, mode: "contain" as const };
   }
   return { x: 0.15, y: 0.2125, width: 0.7, height: 0.675, mode: "contain" as const };
 }
@@ -291,9 +429,16 @@ function slotEditorSafeAreaLayout(slot: Slot, platform: OrganizerPlatform, sourc
   if (platform === "jd" && slot.file_name === "5.jpg") {
     return { x: 0.04, y: 0.04, width: 0.92, height: 0.92 };
   }
-  if (["2.jpg", "3.jpg", "4.jpg"].includes(slot.file_name) || slot.file_name.endsWith(".png")) {
+  if (platform === "vip" && ["604.jpg", "605.jpg"].includes(slot.file_name)) {
+    return { x: 0.04, y: 0.18, width: 0.92, height: 0.78 };
+  }
+  if (platform === "jd" && slot.file_name === "2.jpg") {
     return { x: 0.04, y: 0.04, width: 0.92, height: 0.92 };
   }
+  if (platform === "vip" && ["2.jpg", "3.jpg", "4.jpg"].includes(slot.file_name)) {
+    return { x: 0.04, y: 0.04, width: 0.92, height: 0.92 };
+  }
+  if (slot.file_name.endsWith(".png")) return { x: 0.04, y: 0.04, width: 0.92, height: 0.92 };
   const template = slotPreviewLayout(slot, platform, sourceIndex, targetFolder);
   if (template.x <= 0.04 && template.y <= 0.04 && template.x + template.width >= 0.96 && template.y + template.height >= 0.96) {
     return template;
@@ -308,16 +453,49 @@ function slotEditorSafeAreaLayout(slot: Slot, platform: OrganizerPlatform, sourc
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
+function clampLayerOrigin(position: number, layerSize: number, minimum: number, maximum: number) {
+  const available = Math.max(1, maximum - minimum);
+  return layerSize <= available
+    ? Math.max(minimum, Math.min(position, maximum - layerSize))
+    : Math.max(maximum - layerSize, Math.min(position, minimum));
+}
+
+function adjustmentOffsetBasis(
+  slot: Slot,
+  platform: OrganizerPlatform,
+  sourceIndex: number,
+  targetFolder: PreviewFolder,
+  target: AdjustmentTarget
+) {
+  const output = slotCanvasSize(slot.size, platform, targetFolder);
+  if (target !== "product" || (platform === "jd" && slot.file_name === "5.jpg")) {
+    return { x: output.width * 0.18, y: output.height * 0.18 };
+  }
+  const area = slotPreviewLayout(slot, platform, sourceIndex, targetFolder);
+  return {
+    x: Math.max(1, area.width * output.width),
+    y: Math.max(1, area.height * output.height)
+  };
+}
+
 function cropSelectionForTemplate(
   start: { x: number; y: number },
   point: { x: number; y: number },
   imageRect: CropSelection,
-  aspectRatio: number
+  aspectRatio: number | null
 ): CropSelection {
   const directionX = point.x < start.x ? -1 : 1;
   const directionY = point.y < start.y ? -1 : 1;
   const rawWidth = Math.max(1, Math.abs(point.x - start.x));
   const rawHeight = Math.max(1, Math.abs(point.y - start.y));
+  if (aspectRatio === null) {
+    return {
+      left: Math.min(start.x, point.x),
+      top: Math.min(start.y, point.y),
+      width: rawWidth,
+      height: rawHeight
+    };
+  }
   const ratio = Math.max(0.05, aspectRatio);
   let width: number;
   let height: number;
@@ -348,11 +526,18 @@ function cropSelectionForTemplate(
 function fitCropSelectionToTemplate(
   selection: CropSelection,
   imageRect: CropSelection,
-  aspectRatio: number
+  aspectRatio: number | null
 ): CropSelection {
-  const ratio = Math.max(0.05, aspectRatio);
   const centerX = selection.left + selection.width / 2;
   const centerY = selection.top + selection.height / 2;
+  if (aspectRatio === null) {
+    const width = Math.min(selection.width, imageRect.width);
+    const height = Math.min(selection.height, imageRect.height);
+    const left = Math.max(imageRect.left, Math.min(centerX - width / 2, imageRect.left + imageRect.width - width));
+    const top = Math.max(imageRect.top, Math.min(centerY - height / 2, imageRect.top + imageRect.height - height));
+    return { left, top, width, height };
+  }
+  const ratio = Math.max(0.05, aspectRatio);
   let width = selection.width;
   let height = selection.height;
   if (width / Math.max(1, height) > ratio) height = width / ratio;
@@ -381,6 +566,7 @@ function SlotSafeAreaOverlay({ slot, platform, sourceIndex, targetFolder }: {
   const labelY = y > 24 ? y - 8 : y + 20;
   const templateDiffers = Math.abs(template.x - area.x) + Math.abs(template.y - area.y)
     + Math.abs(template.width - area.width) + Math.abs(template.height - area.height) > 0.001;
+  const showTemplate = templateDiffers && !(platform === "vip" && slot.file_name === "401.jpg");
 
   return <svg
     className="slot-safe-area-overlay"
@@ -388,7 +574,7 @@ function SlotSafeAreaOverlay({ slot, platform, sourceIndex, targetFolder }: {
     preserveAspectRatio="xMidYMid meet"
     aria-hidden="true"
   >
-    {templateDiffers && <>
+    {showTemplate && <>
       <rect className="template-area" x={template.x * output.width} y={template.y * output.height} width={template.width * output.width} height={template.height * output.height} />
       <text className="template-label" x={template.x * output.width + 8} y={template.y * output.height + 20}>模板区域</text>
     </>}
@@ -399,7 +585,9 @@ function SlotSafeAreaOverlay({ slot, platform, sourceIndex, targetFolder }: {
 
 const livePreviewImageCache = new Map<string, HTMLImageElement>();
 const livePreviewBoundsCache = new Map<string, { left: number; top: number; right: number; bottom: number }>();
+const livePreviewRawCutoutCache = new Map<string, HTMLCanvasElement>();
 const livePreviewCutoutCache = new Map<string, HTMLCanvasElement>();
+const livePreparedProductCache = new Map<string, HTMLCanvasElement>();
 const livePreviewLightBorderCache = new Map<string, boolean>();
 let liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
 type PixelBounds = { left: number; top: number; right: number; bottom: number };
@@ -409,7 +597,9 @@ const liveJdProductLayerCache = new Map<string, LiveProductLayer>();
 function clearLivePreviewCaches() {
   livePreviewImageCache.clear();
   livePreviewBoundsCache.clear();
+  livePreviewRawCutoutCache.clear();
   livePreviewCutoutCache.clear();
+  livePreparedProductCache.clear();
   livePreviewLightBorderCache.clear();
   liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
   liveJdProductLayerCache.clear();
@@ -425,8 +615,19 @@ function livePreviewImage(url: string) {
   return image;
 }
 
-function livePreviewProductCutout(url: string, image: HTMLImageElement) {
-  const cached = livePreviewCutoutCache.get(url);
+function preparedProductCutout(url: string, image: HTMLImageElement) {
+  const cached = livePreparedProductCache.get(url);
+  if (cached) return cached;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, image.naturalWidth);
+  canvas.height = Math.max(1, image.naturalHeight);
+  canvas.getContext("2d")?.drawImage(image, 0, 0);
+  livePreparedProductCache.set(url, canvas);
+  return canvas;
+}
+
+function livePreviewRawProductCutout(url: string, image: HTMLImageElement) {
+  const cached = livePreviewRawCutoutCache.get(url);
   if (cached) return cached;
   const scale = Math.min(1, 1100 / Math.max(image.naturalWidth, image.naturalHeight));
   const canvas = document.createElement("canvas");
@@ -499,6 +700,36 @@ function livePreviewProductCutout(url: string, image: HTMLImageElement) {
     if (visited[pixelIndex]) pixels[pixelIndex * 4 + 3] = 0;
   }
   context.putImageData(imageData, 0, 0);
+  livePreviewRawCutoutCache.set(url, canvas);
+  return canvas;
+}
+
+function livePreviewProductCutout(url: string, image: HTMLImageElement) {
+  const cached = livePreviewCutoutCache.get(url);
+  if (cached) return cached;
+  const raw = livePreviewRawProductCutout(url, image);
+  const bounds = liveInfoMeasurementBounds(raw);
+  const objectWidth = Math.max(1, bounds.right - bounds.left);
+  const objectHeight = Math.max(1, bounds.bottom - bounds.top);
+  const padding = Math.max(3, Math.round(Math.max(objectWidth, objectHeight) * 0.015));
+  const left = Math.max(0, bounds.left - padding);
+  const top = Math.max(0, bounds.top - padding);
+  const right = Math.min(raw.width, bounds.right + padding);
+  const bottom = Math.min(raw.height, bounds.bottom + padding);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, right - left);
+  canvas.height = Math.max(1, bottom - top);
+  canvas.getContext("2d")?.drawImage(
+    raw,
+    left,
+    top,
+    canvas.width,
+    canvas.height,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
   livePreviewCutoutCache.set(url, canvas);
   return canvas;
 }
@@ -722,21 +953,51 @@ function liveHandleVisualLift(canvas: HTMLCanvasElement) {
   return lift;
 }
 
-function infoRulerGeometry(body: PixelBounds) {
+function infoRulerGeometry(body: PixelBounds, gapScale = 1) {
+  const rulerGap = 34 * gapScale;
   const left = Math.round(body.left + 4);
   const right = Math.round(body.right - 4);
-  const width = Math.max(48, right - left);
+  // The detected alpha boundary includes anti-aliased edge/shadow pixels.
+  // Keep the long-standing calibrated insets so the rulers follow the visible
+  // leather body rather than the faint outer fringe.
   const bottom = Math.round(body.bottom - 9);
   const top = Math.round(body.top - 5);
-  const lineHeight = Math.max(1, bottom - top);
   return {
     left,
     right,
     top,
     bottom,
-    verticalX: Math.max(285, left - Math.max(34, Math.round(width * 0.205))),
-    horizontalY: Math.min(535, bottom + Math.max(34, Math.round(lineHeight * 0.19)))
+    verticalX: left - rulerGap,
+    horizontalY: bottom + rulerGap
   };
+}
+
+function drawVipInfoStaticPreview(
+  context: CanvasRenderingContext2D,
+  productInfo: Record<string, string>
+) {
+  context.save();
+  context.fillStyle = "#101010";
+  context.font = "700 32px sans-serif";
+  context.textAlign = "left";
+  context.textBaseline = "top";
+  context.fillText("\u4ea7\u54c1\u4fe1\u606f", 290, 40);
+
+  const rows = [
+    ["\u6750\u8d28", productInfo.main_material || "\u5f85\u586b\u5199"],
+    ["\u91cc\u6599", productInfo.lining_material || "\u5f85\u586b\u5199"],
+    ["\u80cc\u6cd5", productInfo.wearing_method || "\u5f85\u586b\u5199"]
+  ];
+  rows.forEach(([label, value], index) => {
+    const y = 216 + index * 96;
+    context.fillStyle = "#111111";
+    context.font = "700 20px sans-serif";
+    context.fillText(label, VIP_INFO_TEXT_X, y);
+    context.fillStyle = "#555555";
+    context.font = "19px sans-serif";
+    context.fillText(value.slice(0, 18), VIP_INFO_TEXT_X, y + 34);
+  });
+  context.restore();
 }
 
 function transformCanvasRulerSegment(
@@ -745,9 +1006,10 @@ function transformCanvasRulerSegment(
   scale: number,
   offsetX: number,
   offsetY: number,
-  output: { width: number; height: number }
+  output: { width: number; height: number },
+  origin?: { x: number; y: number }
 ) {
-  const center = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+  const center = origin || { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
   const move = { x: offsetX * output.width * 0.18, y: offsetY * output.height * 0.18 };
   const transform = (point: { x: number; y: number }) => ({
     x: center.x + (point.x - center.x) * scale + move.x,
@@ -756,27 +1018,107 @@ function transformCanvasRulerSegment(
   return { start: transform(start), end: transform(end) };
 }
 
-function infoWidthRulerGeometry(baseBody: PixelBounds, draft: ImageAdjustment) {
-  const start = { x: Math.min(660, baseBody.right + 22), y: Math.min(520, baseBody.bottom + 18) };
-  const end = { x: start.x + 51, y: start.y - 27 };
-  const center = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
-  const scale = draft.width_ruler_scale || 1;
-  const offset = {
-    x: (draft.width_ruler_offset_x || 0) * 750 * 0.18,
-    y: (draft.width_ruler_offset_y || 0) * 665 * 0.18
+function transformProductRulerSegment(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  productCenter: { x: number; y: number },
+  draft: ImageAdjustment,
+  rulerScale: number,
+  rulerOffsetX: number,
+  rulerOffsetY: number,
+  output: { width: number; height: number }
+) {
+  const grouped = transformCanvasRulerSegment(
+    start,
+    end,
+    draft.product_ruler_group_scale || 1,
+    draft.product_ruler_group_offset_x || 0,
+    draft.product_ruler_group_offset_y || 0,
+    output,
+    productCenter
+  );
+  return transformCanvasRulerSegment(
+    grouped.start,
+    grouped.end,
+    rulerScale,
+    rulerOffsetX,
+    rulerOffsetY,
+    output
+  );
+}
+
+function infoWidthRulerGeometry(
+  baseBody: PixelBounds,
+  productCenter: { x: number; y: number },
+  draft: ImageAdjustment,
+  output: { width: number; height: number }
+) {
+  const rulerGap = 34 * (draft.product_ruler_gap_scale || 1);
+  const anchorDirection = Math.hypot(22, 18);
+  const start = {
+    x: baseBody.right + 22 / anchorDirection * rulerGap,
+    y: baseBody.bottom + 18 / anchorDirection * rulerGap
   };
-  const transform = (point: { x: number; y: number }) => ({
-    x: center.x + (point.x - center.x) * scale + offset.x,
-    y: center.y + (point.y - center.y) * scale + offset.y
-  });
-  const segments = [
+  const end = { x: start.x + 51, y: start.y - 27 };
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const length = Math.max(1, Math.hypot(deltaX, deltaY));
+  const perpendicular = { x: -deltaY / length * 9, y: deltaX / length * 9 };
+  const rawSegments = [
     [start, end],
-    [{ x: start.x - 6, y: start.y - 8 }, { x: start.x + 5, y: start.y + 7 }],
-    [{ x: end.x - 5, y: end.y - 7 }, { x: end.x + 6, y: end.y + 8 }]
+    [
+      { x: start.x - perpendicular.x, y: start.y - perpendicular.y },
+      { x: start.x + perpendicular.x, y: start.y + perpendicular.y }
+    ],
+    [
+      { x: end.x - perpendicular.x, y: end.y - perpendicular.y },
+      { x: end.x + perpendicular.x, y: end.y + perpendicular.y }
+    ]
   ];
+  const groupedSegments = rawSegments.map(([segmentStart, segmentEnd]) => {
+    const grouped = transformCanvasRulerSegment(
+      segmentStart,
+      segmentEnd,
+      draft.product_ruler_group_scale || 1,
+      draft.product_ruler_group_offset_x || 0,
+      draft.product_ruler_group_offset_y || 0,
+      output,
+      productCenter
+    );
+    return [grouped.start, grouped.end] as const;
+  });
+  const groupedMain = groupedSegments[0];
+  const widthOrigin = {
+    x: (groupedMain[0].x + groupedMain[1].x) / 2,
+    y: (groupedMain[0].y + groupedMain[1].y) / 2
+  };
+  const segments = groupedSegments.map(([segmentStart, segmentEnd]) => {
+    const transformed = transformCanvasRulerSegment(
+      segmentStart,
+      segmentEnd,
+      draft.width_ruler_scale || 1,
+      draft.width_ruler_offset_x || 0,
+      draft.width_ruler_offset_y || 0,
+      output,
+      widthOrigin
+    );
+    return [transformed.start, transformed.end] as const;
+  });
+  const transformedMain = segments[0];
+  const transformedDeltaX = transformedMain[1].x - transformedMain[0].x;
+  const transformedDeltaY = transformedMain[1].y - transformedMain[0].y;
+  const transformedLength = Math.max(1, Math.hypot(transformedDeltaX, transformedDeltaY));
+  const labelNormal = {
+    x: -transformedDeltaY / transformedLength,
+    y: transformedDeltaX / transformedLength
+  };
+  const text = {
+    x: (transformedMain[0].x + transformedMain[1].x) / 2 + labelNormal.x * 26,
+    y: (transformedMain[0].y + transformedMain[1].y) / 2 + labelNormal.y * 26
+  };
   return {
-    segments: segments.map(([start, end]) => [transform(start), transform(end)]),
-    text: transform({ x: start.x + 8, y: start.y + 8 })
+    segments,
+    text
   };
 }
 
@@ -787,7 +1129,9 @@ function liveJdProductLayer(url: string, image: HTMLImageElement, draft: ImageAd
   const key = `${url}|${cropKey}`;
   const cached = liveJdProductLayerCache.get(key);
   if (cached) return cached;
-  const cutout = livePreviewProductCutout(url, image);
+  // Crop coordinates are stored against the uploaded image, so manual crops
+  // must start from the full-size cutout rather than the already trimmed layer.
+  const cutout = livePreviewRawProductCutout(url, image);
   const cropLeft = Math.max(0, Math.min(cutout.width - 1, Math.round(draft.crop_x * cutout.width)));
   const cropTop = Math.max(0, Math.min(cutout.height - 1, Math.round(draft.crop_y * cutout.height)));
   const cropRight = Math.max(cropLeft + 1, Math.min(cutout.width, Math.round((draft.crop_x + draft.crop_width) * cutout.width)));
@@ -841,6 +1185,84 @@ function liveJdProductLayer(url: string, image: HTMLImageElement, draft: ImageAd
   return layer;
 }
 
+function storedProductRulerBase(draft: ImageAdjustment): PixelBounds | null {
+  const values = [
+    draft.product_ruler_base_left,
+    draft.product_ruler_base_top,
+    draft.product_ruler_base_right,
+    draft.product_ruler_base_bottom
+  ];
+  if (!values.every((value) => typeof value === "number" && Number.isFinite(value))) return null;
+  const [left, top, right, bottom] = values as number[];
+  return right > left && bottom > top ? { left, top, right, bottom } : null;
+}
+
+function organizerLayerBounds(bounds: OrganizerLayerInfo["measurement_bbox"] | undefined): PixelBounds | null {
+  if (!bounds) return null;
+  const [left, top, right, bottom] = bounds;
+  return right > left && bottom > top ? { left, top, right, bottom } : null;
+}
+
+function positionedInfoProductBody(
+  layerWidth: number,
+  layerHeight: number,
+  layerBounds: PixelBounds,
+  draft: ImageAdjustment,
+  handleLift = 0
+): PixelBounds {
+  const areaX = VIP_INFO_PRODUCT_BOX.left;
+  const areaY = VIP_INFO_PRODUCT_BOX.top;
+  const areaWidth = VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left;
+  const areaHeight = VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top;
+  const fitScale = Math.min(areaWidth / layerWidth, areaHeight / layerHeight);
+  const scale = fitScale * draft.zoom * vipInfoProductScale(handleLift);
+  const drawWidth = layerWidth * scale;
+  const drawHeight = layerHeight * scale;
+  let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+  let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
+    - vipInfoProductLiftY(handleLift) * areaHeight;
+  return {
+    left: drawX + layerBounds.left * scale,
+    top: drawY + layerBounds.top * scale,
+    right: drawX + layerBounds.right * scale,
+    bottom: drawY + layerBounds.bottom * scale
+  };
+}
+
+function liveInfoProductBody(
+  sourceUrl: string,
+  image: HTMLImageElement,
+  draft: ImageAdjustment,
+  preparedLayer?: HTMLCanvasElement,
+  preparedBody?: PixelBounds
+): PixelBounds {
+  const hasManualCrop = draft.crop_x > 0.0001
+    || draft.crop_y > 0.0001
+    || draft.crop_width < 0.9999
+    || draft.crop_height < 0.9999;
+  const productLayer = preparedLayer || livePreviewProductCutout(sourceUrl, image);
+  const croppedProductLayer = !preparedLayer && hasManualCrop ? liveJdProductLayer(sourceUrl, image, draft) : null;
+  const drawSource = croppedProductLayer?.canvas || productLayer;
+  const drawSourceWidth = drawSource.width;
+  const drawSourceHeight = drawSource.height;
+  const layerBounds = preparedBody || croppedProductLayer?.body || liveInfoMeasurementBounds(drawSource);
+  if (layerBounds.right <= layerBounds.left || layerBounds.bottom <= layerBounds.top) {
+    return positionedInfoProductBody(drawSourceWidth, drawSourceHeight, {
+      left: 0,
+      top: 0,
+      right: drawSourceWidth,
+      bottom: drawSourceHeight
+    }, draft, liveHandleVisualLift(drawSource));
+  }
+  return positionedInfoProductBody(
+    drawSourceWidth,
+    drawSourceHeight,
+    layerBounds,
+    draft,
+    liveHandleVisualLift(drawSource)
+  );
+}
+
 function jdProductShapeProfile(bodyWidth: number, bodyHeight: number, physicalRatio?: number) {
   const visualRatio = bodyWidth / Math.max(1, bodyHeight);
   const ratio = physicalRatio && physicalRatio >= 0.2 && physicalRatio <= 5
@@ -858,14 +1280,15 @@ function jdProductGeometry(
   layer: LiveProductLayer,
   draft: ImageAdjustment,
   productInfo: Record<string, string>,
-  enforceLogoClearance = true
+  enforceLogoClearance = true,
+  clampToSafe = true
 ) {
   const bodyWidth = Math.max(1, layer.body.right - layer.body.left);
   const bodyHeight = Math.max(1, layer.body.bottom - layer.body.top);
-  const lengthMm = (Number.parseFloat(productInfo.product_length || "") || 20) * 10;
+  const lengthMm = Number.parseFloat(productInfo.product_length || "") || 200;
   const providedHeight = Number.parseFloat(productInfo.product_height || "");
   const heightMm = Number.isFinite(providedHeight) && providedHeight > 0
-    ? providedHeight * 10
+    ? providedHeight
     : Math.max(60, lengthMm * bodyHeight / bodyWidth);
   const profile = jdProductShapeProfile(bodyWidth, bodyHeight, lengthMm / Math.max(1, heightMm));
   const preferredBodyWidth = output.width * profile.preferredWidth * Math.max(0.82, Math.min(1.08, lengthMm / 205));
@@ -891,7 +1314,7 @@ function jdProductGeometry(
   const clampOrigin = (position: number, layerSize: number, minimum: number, maximum: number) => layerSize <= maximum - minimum
     ? Math.max(minimum, Math.min(position, maximum - layerSize))
     : Math.max(maximum - layerSize, Math.min(position, minimum));
-  x = clampOrigin(x, width, safe.left, safe.right);
+  if (clampToSafe) x = clampOrigin(x, width, safe.left, safe.right);
   let effectiveSafeTop = safe.top;
   if (enforceLogoClearance) {
     const logo = output.width === 750 && output.height === 1000
@@ -909,7 +1332,7 @@ function jdProductGeometry(
       effectiveSafeTop = Math.max(effectiveSafeTop, logo.top + 60 + clearance);
     }
   }
-  y = clampOrigin(y, height, effectiveSafeTop, safe.bottom);
+  if (clampToSafe) y = clampOrigin(y, height, effectiveSafeTop, safe.bottom);
   return {
     x,
     y,
@@ -924,6 +1347,102 @@ function jdProductGeometry(
     heightMm,
     baseBodyHeight: bodyHeight * baseScale,
     safe
+  };
+}
+
+function jdComparisonProductGeometry(
+  output: { width: number; height: number },
+  layer: LiveProductLayer,
+  draft: ImageAdjustment,
+  productInfo: Record<string, string>
+) {
+  const hasManualLayout = draft.crop_x > 0.0001
+    || draft.crop_y > 0.0001
+    || draft.crop_width < 0.9999
+    || draft.crop_height < 0.9999
+    || Math.abs(draft.zoom - 1) > 0.0001
+    || Math.abs(draft.offset_x) > 0.0001
+    || Math.abs(draft.offset_y) > 0.0001;
+  const baseGeometry = jdProductGeometry(output, layer, {
+    ...draft,
+    zoom: 1,
+    offset_x: 0,
+    offset_y: 0
+  }, productInfo);
+  if (!hasManualLayout) return { geometry: baseGeometry, baseGeometry };
+
+  const rawGeometry = jdProductGeometry(output, layer, draft, productInfo, false, false);
+  const baselineShiftX = (baseGeometry.body.left + baseGeometry.body.right) / 2 - output.width * 0.34;
+  const baselineShiftY = baseGeometry.body.bottom
+    - output.height * (output.height > output.width ? 0.70 : 0.73);
+  return {
+    geometry: {
+      ...rawGeometry,
+      x: rawGeometry.x + baselineShiftX,
+      y: rawGeometry.y + baselineShiftY,
+      body: {
+        left: rawGeometry.body.left + baselineShiftX,
+        top: rawGeometry.body.top + baselineShiftY,
+        right: rawGeometry.body.right + baselineShiftX,
+        bottom: rawGeometry.body.bottom + baselineShiftY
+      }
+    },
+    baseGeometry
+  };
+}
+
+function jdComparisonPhoneLayout(
+  output: { width: number; height: number },
+  geometry: {
+    baseBodyHeight: number;
+    heightMm: number;
+    safe: PixelBounds;
+  },
+  baseGeometry: { body: PixelBounds },
+  draft: ImageAdjustment,
+  phoneReference: HTMLImageElement | null
+) {
+  const phoneRulerGap = Math.max(22, output.width * 0.035);
+  const phoneLabelClearance = Math.max(40, output.width * 0.05);
+  const phoneRightAllowance = phoneRulerGap + phoneLabelClearance;
+  const phoneBottomAllowance = Math.max(28, output.height * 0.055);
+  const phoneHeightForScale = (scale: number) => Math.max(
+    output.height * 0.095,
+    Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * scale)
+  );
+  const phoneWidthForHeight = (height: number) => phoneReference?.naturalWidth && phoneReference.naturalHeight
+    ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
+    : height * 0.78;
+  const basePhoneHeight = phoneHeightForScale(1);
+  const basePhoneWidth = phoneWidthForHeight(basePhoneHeight);
+  let basePhoneLeft = output.width * 0.75 - basePhoneWidth / 2;
+  let basePhoneTop = (draft.phone_alignment || "bottom") === "bottom"
+    ? baseGeometry.body.bottom - basePhoneHeight
+    : (baseGeometry.body.top + baseGeometry.body.bottom - basePhoneHeight) / 2;
+  basePhoneLeft = Math.max(
+    geometry.safe.left,
+    Math.min(basePhoneLeft, geometry.safe.right - basePhoneWidth - phoneRightAllowance)
+  );
+  basePhoneTop = Math.max(
+    geometry.safe.top,
+    Math.min(basePhoneTop, geometry.safe.bottom - basePhoneHeight - phoneBottomAllowance)
+  );
+  const basePhoneCenterX = basePhoneLeft + basePhoneWidth / 2;
+  const basePhoneAnchorY = (draft.phone_alignment || "bottom") === "bottom"
+    ? basePhoneTop + basePhoneHeight
+    : basePhoneTop + basePhoneHeight / 2;
+  const placePhone = (scale: number, offsetX: number, offsetY: number) => {
+    const height = phoneHeightForScale(scale);
+    const width = phoneWidthForHeight(height);
+    const left = basePhoneCenterX + offsetX * output.width * 0.18 - width / 2;
+    const top = basePhoneAnchorY + offsetY * output.height * 0.18
+      - ((draft.phone_alignment || "bottom") === "bottom" ? height : height / 2);
+    return { left, top, width, height };
+  };
+  return {
+    phoneRulerGap,
+    phone: placePhone(draft.phone_scale || 1, draft.phone_offset_x || 0, draft.phone_offset_y || 0),
+    basePhone: placePhone(1, 0, 0)
   };
 }
 
@@ -964,8 +1483,8 @@ function drawCanvasRuler(
 ) {
   const cap = Math.max(7, output.width * 0.011);
   context.save();
-  context.strokeStyle = "#777";
-  context.fillStyle = "#666";
+  context.strokeStyle = "#707070";
+  context.fillStyle = "#707070";
   context.lineWidth = Math.max(1, output.width * 0.002);
   context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
   context.textAlign = "center";
@@ -1007,20 +1526,7 @@ function drawJdComparisonPreview(
   productInfo: Record<string, string>
 ) {
   const layer = liveJdProductLayer(sourceUrl, image, draft);
-  const hasManualProductLayout = draft.crop_x > 0.0001
-    || draft.crop_y > 0.0001
-    || draft.crop_width < 0.9999
-    || draft.crop_height < 0.9999
-    || Math.abs(draft.zoom - 1) > 0.0001
-    || Math.abs(draft.offset_x) > 0.0001
-    || Math.abs(draft.offset_y) > 0.0001;
-  const geometry = jdProductGeometry(output, layer, draft, productInfo, !hasManualProductLayout);
-  const baseGeometry = jdProductGeometry(output, layer, {
-    ...draft,
-    zoom: 1,
-    offset_x: 0,
-    offset_y: 0
-  }, productInfo);
+  const { geometry, baseGeometry } = jdComparisonProductGeometry(output, layer, draft, productInfo);
   context.fillStyle = "#f3f3f3";
   context.fillRect(0, 0, output.width, output.height);
   if (logoReference?.complete && logoReference.naturalWidth) {
@@ -1033,22 +1539,32 @@ function drawJdComparisonPreview(
   const rulerGap = Math.max(28, output.width * 0.045);
   const lengthValue = Number.parseFloat(productInfo.product_length || "");
   const heightValue = Number.parseFloat(productInfo.product_height || "");
-  const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue * 10)}mm` : "200mm";
-  const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue * 10)}mm` : `${Math.round(geometry.heightMm)}mm`;
-  const productRulerBody = draft.product_show_ruler !== false ? geometry.body : baseGeometry.body;
-  const horizontalY = Math.min(output.height - 58, productRulerBody.bottom + rulerGap);
-  const verticalX = Math.max(output.width * 0.04, productRulerBody.left - rulerGap);
-  const lengthRuler = transformCanvasRulerSegment(
+  const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue)}mm` : "200mm";
+  const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue)}mm` : `${Math.round(geometry.heightMm)}mm`;
+  const productRulerBody = storedProductRulerBase(draft) || geometry.body;
+  const horizontalY = Math.min(output.height - 70, productRulerBody.bottom + rulerGap);
+  const verticalX = Math.max(30, productRulerBody.left - rulerGap);
+  const productRulerCenter = {
+    x: (productRulerBody.left + productRulerBody.right) / 2,
+    // JD5 keeps the bag body bottom fixed while the product is scaled.
+    // Use that same anchor so the height ruler does not drift vertically.
+    y: productRulerBody.bottom
+  };
+  const lengthRuler = transformProductRulerSegment(
     { x: productRulerBody.left, y: horizontalY },
     { x: productRulerBody.right, y: horizontalY },
+    productRulerCenter,
+    draft,
     draft.length_ruler_scale || 1,
     draft.length_ruler_offset_x || 0,
     draft.length_ruler_offset_y || 0,
     output
   );
-  const heightRuler = transformCanvasRulerSegment(
+  const heightRuler = transformProductRulerSegment(
     { x: verticalX, y: productRulerBody.top },
     { x: verticalX, y: productRulerBody.bottom },
+    productRulerCenter,
+    draft,
     draft.height_ruler_scale || 1,
     draft.height_ruler_offset_x || 0,
     draft.height_ruler_offset_y || 0,
@@ -1057,33 +1573,22 @@ function drawJdComparisonPreview(
   drawCanvasRuler(context, lengthRuler.start, lengthRuler.end, lengthLabel, output);
   drawCanvasRuler(context, heightRuler.start, heightRuler.end, heightLabel, output, true);
 
-  const phoneRulerGap = Math.max(22, output.width * 0.035);
-  const phoneLabelClearance = Math.max(40, output.width * 0.05);
-  const phoneRightAllowance = draft.phone_show_ruler !== false ? phoneRulerGap + phoneLabelClearance : 8;
-  const phoneBottomAllowance = Math.max(28, output.height * 0.055);
-  const placePhone = (scale: number, offsetX: number, offsetY: number) => {
-    const height = Math.max(
-      output.height * 0.095,
-      Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * scale)
-    );
-    const width = phoneReference?.naturalWidth && phoneReference.naturalHeight
-      ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
-      : height * 0.78;
-    let left = output.width * 0.75 + offsetX * output.width * 0.18 - width / 2;
-    let top = (draft.phone_alignment || "bottom") === "bottom"
-      ? baseGeometry.body.bottom - height
-      : (baseGeometry.body.top + baseGeometry.body.bottom - height) / 2;
-    top += offsetY * output.height * 0.18;
-    left = Math.max(geometry.safe.left, Math.min(left, geometry.safe.right - width - phoneRightAllowance));
-    top = Math.max(geometry.safe.top, Math.min(top, geometry.safe.bottom - height - phoneBottomAllowance));
-    return { left, top, width, height };
-  };
-  const phone = placePhone(draft.phone_scale || 1, draft.phone_offset_x || 0, draft.phone_offset_y || 0);
+  const phoneLayout = jdComparisonPhoneLayout(
+    output,
+    geometry,
+    baseGeometry,
+    draft,
+    phoneReference
+  );
+  const phone = phoneLayout.phone;
   if (phoneReference?.complete && phoneReference.naturalWidth) {
     context.drawImage(phoneReference, phone.left, phone.top, phone.width, phone.height);
   }
-  const phoneRuler = draft.phone_show_ruler !== false ? phone : placePhone(1, 0, 0);
-  const phoneRulerX = Math.min(geometry.safe.right - 12, phoneRuler.left + phoneRuler.width + phoneRulerGap);
+  const phoneRuler = draft.phone_show_ruler !== false ? phone : phoneLayout.basePhone;
+  const phoneRulerX = Math.min(
+    geometry.safe.right - 12,
+    phoneRuler.left + phoneRuler.width + phoneLayout.phoneRulerGap
+  );
   const phoneRulerSegment = transformCanvasRulerSegment(
     { x: phoneRulerX, y: phoneRuler.top },
     { x: phoneRulerX, y: phoneRuler.top + phoneRuler.height },
@@ -1102,16 +1607,18 @@ function drawJdComparisonPreview(
     true
   );
   context.save();
-  context.fillStyle = "#666";
+  context.fillStyle = "#707070";
   context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
   context.textAlign = "center";
   context.fillText("iPhone 17 Pro Max", phone.left + phone.width / 2, phone.top + phone.height + 22);
   context.restore();
 }
 
-function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor }: {
+function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compositePrimaryImageId, templateUrl, slot, draft, platform, sourceIndex, targetFolder, productInfo, logoColor, onLayerInfoChange }: {
   sourceUrl: string;
+  sourceImageId: number;
   compositePrimaryUrl?: string;
+  compositePrimaryImageId?: number;
   templateUrl?: string;
   slot: Slot;
   draft: ImageAdjustment;
@@ -1120,8 +1627,56 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
   targetFolder: PreviewFolder;
   productInfo: Record<string, string>;
   logoColor: LogoColor;
+  onLayerInfoChange?: (info: OrganizerLayerInfo | null) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [layerInfo, setLayerInfo] = useState<OrganizerLayerInfo | null>(null);
+  const [primaryLayerInfo, setPrimaryLayerInfo] = useState<OrganizerLayerInfo | null>(null);
+  const cropKey = `${draft.crop_x.toFixed(6)}:${draft.crop_y.toFixed(6)}:${draft.crop_width.toFixed(6)}:${draft.crop_height.toFixed(6)}`;
+
+  useEffect(() => {
+    if (!slotUsesOrganizerLayer(slot, platform)) {
+      setLayerInfo(null);
+      onLayerInfoChange?.(null);
+      return;
+    }
+    setLayerInfo(null);
+    onLayerInfoChange?.(null);
+    const controller = new AbortController();
+    void api.getVipOrganizerLayerInfo(sourceImageId, {
+      crop_x: draft.crop_x,
+      crop_y: draft.crop_y,
+      crop_width: draft.crop_width,
+      crop_height: draft.crop_height
+    }, controller.signal).then((info) => {
+      setLayerInfo(info);
+      onLayerInfoChange?.(info);
+    }).catch((requestError: any) => {
+      if (requestError?.name !== "AbortError") {
+        setLayerInfo(null);
+        onLayerInfoChange?.(null);
+      }
+    });
+    return () => controller.abort();
+  }, [sourceImageId, cropKey, platform, slot.file_name, onLayerInfoChange]);
+
+  useEffect(() => {
+    if (platform !== "vip" || slot.file_name !== "606.jpg" || !compositePrimaryImageId) {
+      setPrimaryLayerInfo(null);
+      return;
+    }
+    setPrimaryLayerInfo(null);
+    const controller = new AbortController();
+    void api.getVipOrganizerLayerInfo(compositePrimaryImageId, {
+      crop_x: 0,
+      crop_y: 0,
+      crop_width: 1,
+      crop_height: 1
+    }, controller.signal).then(setPrimaryLayerInfo).catch((requestError: any) => {
+      if (requestError?.name !== "AbortError") setPrimaryLayerInfo(null);
+    });
+    return () => controller.abort();
+  }, [compositePrimaryImageId, platform, slot.file_name]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1135,21 +1690,31 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     const compositePrimary = platform === "vip" && slot.file_name === "606.jpg"
       ? livePreviewImage(compositePrimaryUrl || sourceUrl)
       : null;
-    const template = templateUrl && platform !== "jd" ? livePreviewImage(templateUrl) : null;
     const phoneReference = platform === "jd" && slot.file_name === "5.jpg"
       ? livePreviewImage("/organizer-assets/iphone_reference.png")
       : null;
     const logoReference = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name)
       ? livePreviewImage(`/organizer-assets/elle_logo_${logoColor}.png`)
       : null;
+    const preparedUrl = layerInfo?.url || "";
+    const preparedProduct = preparedUrl ? livePreviewImage(preparedUrl) : null;
     const draw = () => {
       if (!image.complete || !image.naturalWidth) return;
       if (compositePrimary && (!compositePrimary.complete || !compositePrimary.naturalWidth)) return;
-      if (template && (!template.complete || !template.naturalWidth)) return;
       context.clearRect(0, 0, output.width, output.height);
       context.fillStyle = slot.file_name === "5.jpg" && platform === "jd" ? "#f3f3f3" : "#fff";
       context.fillRect(0, 0, output.width, output.height);
-      if (template) context.drawImage(template, 0, 0, output.width, output.height);
+      if (platform === "vip" && slot.file_name === "401.jpg") {
+        drawVipInfoStaticPreview(context, productInfo);
+        if (!layerInfo || !preparedProduct?.complete || !preparedProduct.naturalWidth) {
+          drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
+          return;
+        }
+      }
+      if (platform === "vip" && ["604.jpg", "605.jpg"].includes(slot.file_name)) {
+        context.fillStyle = "#fff";
+        context.fillRect(0, output.height * 0.18, output.width, output.height * 0.82);
+      }
       if (platform === "jd" && slot.file_name === "5.jpg") {
         drawJdComparisonPreview(context, output, image, sourceUrl, phoneReference, logoReference, draft, productInfo);
         drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
@@ -1178,12 +1743,15 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         && livePreviewHasLightStudioBorder(sourceUrl, image);
       const usesProductCutout = (platform === "jd"
         ? ["2.jpg", "透明.png"].includes(slot.file_name)
-        : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg", "801.jpg"].includes(slot.file_name))
+        : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg"].includes(slot.file_name))
         || usesAutomaticDetailCutout;
-      // A manual crop is expressed in full-image coordinates. Automatic content
-      // bounds are only useful before the designer chooses an explicit region.
-      const useContentBounds = usesProductCutout && !hasManualCrop;
-      const bounds = useContentBounds ? livePreviewContentBounds(sourceUrl, image) : {
+      if (usesProductCutout && preparedProduct && (!preparedProduct.complete || !preparedProduct.naturalWidth)) return;
+      // The backend applies crop, zoom and offsets to the complete source image
+      // for model, detail and tag slots. Cropping the browser preview to its
+      // detected non-white content changes the coordinate basis and makes the
+      // layer jump when the exact preview arrives. Product slots use their
+      // prepared cutout below; every other slot must retain full-image bounds.
+      const bounds = {
         left: 0,
         top: 0,
         right: image.naturalWidth,
@@ -1195,69 +1763,122 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       const sourceY = Math.max(0, Math.min(image.naturalHeight - 1, bounds.top + draft.crop_y * contentHeight));
       const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, draft.crop_width * contentWidth));
       const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, draft.crop_height * contentHeight));
-      const productLayer = usesProductCutout ? livePreviewProductCutout(sourceUrl, image) : null;
-      const drawSource = productLayer || image;
-      const drawSourceScaleX = productLayer ? productLayer.width / image.naturalWidth : 1;
-      const drawSourceScaleY = productLayer ? productLayer.height / image.naturalHeight : 1;
+      const productLayer = usesProductCutout
+        ? preparedProduct
+          ? preparedProductCutout(preparedUrl, preparedProduct)
+          : livePreviewProductCutout(sourceUrl, image)
+        : null;
+      // The backend removes whitespace again after a manual product crop. Use
+      // the same cropped, tightly bounded layer in the live preview so crop,
+      // zoom and drag do not jump when the exact preview is generated.
+      const croppedProductLayer = usesProductCutout && hasManualCrop && !preparedProduct
+        ? liveJdProductLayer(sourceUrl, image, draft)
+        : null;
+      const drawSource = croppedProductLayer?.canvas || productLayer || image;
+      const drawSourceX = usesProductCutout ? 0 : sourceX;
+      const drawSourceY = usesProductCutout ? 0 : sourceY;
+      const drawSourceWidth = usesProductCutout ? drawSource.width : sourceWidth;
+      const drawSourceHeight = usesProductCutout ? drawSource.height : sourceHeight;
       const fitScale = area.mode === "cover" && !hasManualCrop && !usesAutomaticDetailCutout
-        ? Math.max(areaWidth / sourceWidth, areaHeight / sourceHeight)
-        : Math.min(areaWidth / sourceWidth, areaHeight / sourceHeight);
+        ? Math.max(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight)
+        : Math.min(areaWidth / drawSourceWidth, areaHeight / drawSourceHeight);
       const automaticDetailScale = usesAutomaticDetailCutout
         ? automaticInteriorDetail ? 0.9 : 0.82
         : 1;
-      const detailRatio = contentWidth / Math.max(1, contentHeight);
+      const detailRatio = drawSourceWidth / Math.max(1, drawSourceHeight);
       const vipDetailOffset = detailRatio <= 0.78
         ? -0.105
         : detailRatio <= 1.05 ? -0.11 : detailRatio <= 1.45 ? -0.12 : -0.13;
-      const drawWidth = sourceWidth * fitScale * draft.zoom * automaticDetailScale;
-      const drawHeight = sourceHeight * fitScale * draft.zoom * automaticDetailScale;
-      let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+      const infoProductScale = platform === "vip" && slot.file_name === "401.jpg"
+        ? vipInfoProductScale(
+          layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
+        )
+        : 1;
+      const infoProductLiftY = platform === "vip" && slot.file_name === "401.jpg"
+        ? vipInfoProductLiftY(
+          layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
+        )
+        : 0;
+      const autoHandleLayout = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
+        || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
+      const automaticHandleLift = autoHandleLayout && productLayer && !hasManualCrop
+        ? layerInfo?.handle_lift ?? liveHandleVisualLift(productLayer)
+        : 0;
+      const drawWidth = drawSourceWidth * fitScale * draft.zoom * automaticDetailScale * infoProductScale;
+      const drawHeight = drawSourceHeight * fitScale * draft.zoom * automaticDetailScale * infoProductScale;
+      const productBody = autoHandleLayout && productLayer && !hasManualCrop
+        ? organizerLayerBounds(
+          platform === "vip" && slot.file_name === "401.jpg"
+            ? layerInfo?.product_body_bbox
+            : layerInfo?.measurement_bbox
+        ) || liveInfoMeasurementBounds(productLayer)
+        : null;
+      const productScale = fitScale * draft.zoom * automaticDetailScale * infoProductScale;
+      const bodyCenterOffsetX = productBody && productLayer
+        ? (productLayer.width / 2 - (productBody.left + productBody.right) / 2) * productScale
+        : 0;
+      const bodyCenterOffsetY = productBody && productLayer
+        ? (productLayer.height / 2 - (productBody.top + productBody.bottom) / 2) * productScale
+        : 0;
+      let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth + bodyCenterOffsetX;
       const multiAngleHandleLift = compositePrimary
-        ? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
+        ? primaryLayerInfo?.handle_lift
+          ?? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
         : 0;
       const multiAngleRowShift = multiAngleHandleLift >= 0.55
         ? (sourceIndex < 2 ? 1 : -1) * Math.round(13 * multiAngleHandleLift * output.height / 750)
         : 0;
-      const handleAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
-        || (platform === "jd" && slot.file_name === "2.jpg");
       const tallHandleDropAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
-        || (platform === "jd" && slot.file_name === "2.jpg");
+        || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
+      const productAutoLift = autoHandleLayout ? 0.03 : 0;
       const tallHandleDropRatio = platform === "vip" && slot.file_name === "2.jpg" ? 0.14 : 0.12;
-      const bodyCentered = (handleAware || (platform === "vip" && slot.file_name === "401.jpg"))
-        && productLayer
-        && !hasManualCrop;
       let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
+        + bodyCenterOffsetY
         + multiAngleRowShift
-        + (usesAutomaticDetailCutout && !automaticInteriorDetail ? vipDetailOffset * areaHeight : 0)
-        - (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name) && !hasManualCrop ? 0.03 * areaHeight : 0)
+        - infoProductLiftY * areaHeight
+        + (usesAutomaticDetailCutout && !automaticInteriorDetail ? (vipDetailOffset + 0.02) * areaHeight : 0)
+        - (!hasManualCrop ? productAutoLift * areaHeight : 0)
         + (tallHandleDropAware && productLayer && !hasManualCrop
-          ? tallHandleDropRatio * liveHandleVisualLift(productLayer) * areaHeight
+          ? tallHandleDropRatio * automaticHandleLift * areaHeight
           : 0);
-      if (bodyCentered) {
-        const body = liveInfoMeasurementBounds(productLayer);
-        const cropLeft = sourceX * drawSourceScaleX;
-        const cropTop = sourceY * drawSourceScaleY;
-        const cropWidth = sourceWidth * drawSourceScaleX;
-        const cropHeight = sourceHeight * drawSourceScaleY;
-        drawX += (cropLeft + cropWidth / 2 - (body.left + body.right) / 2) * drawWidth / Math.max(1, cropWidth);
-        drawY += (cropTop + cropHeight / 2 - (body.top + body.bottom) / 2) * drawHeight / Math.max(1, cropHeight);
-      }
+      const automaticBaseX = drawX - draft.offset_x * areaWidth;
+      const automaticBaseY = drawY - draft.offset_y * areaHeight;
       const editorArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
       const safeLeft = editorArea.x * output.width;
       const safeTop = editorArea.y * output.height;
       const safeRight = (editorArea.x + editorArea.width) * output.width;
       const safeBottom = (editorArea.y + editorArea.height) * output.height;
-      if (drawWidth <= safeRight - safeLeft) drawX = Math.max(safeLeft, Math.min(drawX, safeRight - drawWidth));
-      if (drawHeight <= safeBottom - safeTop) drawY = Math.max(safeTop, Math.min(drawY, safeBottom - drawHeight));
+      // Keep automatic placement constrained, but do not re-clamp a layer
+      // after the designer explicitly moves, crops or zooms it. Re-clamping
+      // made dragging asymmetric and caused the zoom anchor to jump from one
+      // edge to the other. This applies equally to VIP and JD manual edits.
+      const allowFreeMovement = hasManualLayout;
+      const jdProductManualAnchor = platform === "jd"
+        && slot.file_name === "2.jpg"
+        && hasManualLayout
+        && !hasManualCrop;
+      if (jdProductManualAnchor) {
+        const anchoredX = clampLayerOrigin(automaticBaseX, drawWidth, safeLeft, safeRight);
+        let anchoredY = clampLayerOrigin(automaticBaseY, drawHeight, safeTop, safeBottom);
+        const minimumTop = output.width === 800 && output.height === 800
+          ? 162
+          : 175;
+        const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
+        anchoredY = drawHeight <= maximumBottom - minimumTop
+          ? Math.max(minimumTop, Math.min(anchoredY, maximumBottom - drawHeight))
+          : Math.max(anchoredY, minimumTop);
+        drawX += anchoredX - automaticBaseX;
+        drawY += anchoredY - automaticBaseY;
+      }
+      if (!allowFreeMovement) {
+        drawX = clampLayerOrigin(drawX, drawWidth, safeLeft, safeRight);
+      }
+      if (!allowFreeMovement) {
+        drawY = clampLayerOrigin(drawY, drawHeight, safeTop, safeBottom);
+      }
       if (platform === "jd" && slot.file_name === "2.jpg" && !hasManualLayout) {
-        const body = productLayer ? liveInfoMeasurementBounds(productLayer) : null;
-        const isTallHandleBag = productLayer && body
-          ? (body.right - body.left) / Math.max(1, body.bottom - body.top) <= 1.15
-            && liveHandleVisualLift(productLayer) >= 0.55
-          : false;
         const baseSafeTop = output.width === 800 && output.height === 800 ? 162 : 175;
-        const tallHandleSafeTop = output.width === 800 && output.height === 800 ? 180 : 185;
-        const minimumTop = isTallHandleBag ? tallHandleSafeTop : baseSafeTop;
+        const minimumTop = baseSafeTop;
         const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
         drawY = drawHeight <= maximumBottom - minimumTop
           ? Math.max(minimumTop, Math.min(drawY, maximumBottom - drawHeight))
@@ -1275,10 +1896,10 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       context.clip();
       context.drawImage(
         drawSource,
-        sourceX * drawSourceScaleX,
-        sourceY * drawSourceScaleY,
-        sourceWidth * drawSourceScaleX,
-        sourceHeight * drawSourceScaleY,
+        drawSourceX,
+        drawSourceY,
+        drawSourceWidth,
+        drawSourceHeight,
         drawX,
         drawY,
         drawWidth,
@@ -1289,68 +1910,36 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
       if (platform === "vip" && slot.file_name === "401.jpg") {
         const scaleX = output.width / 750;
         const scaleY = output.height / 665;
-        const lineColor = "#777";
-        const layerBounds = productLayer ? liveInfoMeasurementBounds(productLayer) : {
-          left: sourceX,
-          top: sourceY,
-          right: sourceX + sourceWidth,
-          bottom: sourceY + sourceHeight
+        const lineColor = VIP_INFO_RULER_COLOR;
+        const storedBaseBody = storedProductRulerBase(draft);
+        const baseBody = storedBaseBody || liveInfoProductBody(
+          sourceUrl,
+          image,
+          draft,
+          productLayer || undefined,
+          organizerLayerBounds(layerInfo?.product_body_bbox) || undefined
+        );
+        const ruler = infoRulerGeometry(baseBody, draft.product_ruler_gap_scale || 1);
+        const productRulerCenter = {
+          x: areaX + areaWidth / 2,
+          y: areaY + areaHeight / 2
         };
-        const cropLeft = sourceX * drawSourceScaleX;
-        const cropTop = sourceY * drawSourceScaleY;
-        const cropRight = (sourceX + sourceWidth) * drawSourceScaleX;
-        const cropBottom = (sourceY + sourceHeight) * drawSourceScaleY;
-        const measuredLeft = Math.max(cropLeft, layerBounds.left);
-        const measuredTop = Math.max(cropTop, layerBounds.top);
-        const measuredRight = Math.min(cropRight, layerBounds.right);
-        const measuredBottom = Math.min(cropBottom, layerBounds.bottom);
-        const sourcePixelWidth = Math.max(1, cropRight - cropLeft);
-        const sourcePixelHeight = Math.max(1, cropBottom - cropTop);
-        const adjustedBody = measuredRight > measuredLeft && measuredBottom > measuredTop ? {
-          left: drawX + (measuredLeft - cropLeft) / sourcePixelWidth * drawWidth,
-          top: drawY + (measuredTop - cropTop) / sourcePixelHeight * drawHeight,
-          right: drawX + (measuredRight - cropLeft) / sourcePixelWidth * drawWidth,
-          bottom: drawY + (measuredBottom - cropTop) / sourcePixelHeight * drawHeight
-        } : { left: drawX, top: drawY, right: drawX + drawWidth, bottom: drawY + drawHeight };
-        const baseCropLeft = bounds.left * drawSourceScaleX;
-        const baseCropTop = bounds.top * drawSourceScaleY;
-        const baseCropRight = bounds.right * drawSourceScaleX;
-        const baseCropBottom = bounds.bottom * drawSourceScaleY;
-        const baseFitScale = Math.min(areaWidth / Math.max(1, contentWidth), areaHeight / Math.max(1, contentHeight));
-        const baseDrawWidth = contentWidth * baseFitScale;
-        const baseDrawHeight = contentHeight * baseFitScale;
-        let baseDrawX = areaX + (areaWidth - baseDrawWidth) / 2;
-        let baseDrawY = areaY + (areaHeight - baseDrawHeight) / 2;
-        if (productLayer && !hasManualCrop) {
-          baseDrawX += (baseCropLeft + (baseCropRight - baseCropLeft) / 2 - (layerBounds.left + layerBounds.right) / 2)
-            * baseDrawWidth / Math.max(1, baseCropRight - baseCropLeft);
-          baseDrawY += (baseCropTop + (baseCropBottom - baseCropTop) / 2 - (layerBounds.top + layerBounds.bottom) / 2)
-            * baseDrawHeight / Math.max(1, baseCropBottom - baseCropTop);
-        }
-        const baseMeasuredLeft = Math.max(baseCropLeft, layerBounds.left);
-        const baseMeasuredTop = Math.max(baseCropTop, layerBounds.top);
-        const baseMeasuredRight = Math.min(baseCropRight, layerBounds.right);
-        const baseMeasuredBottom = Math.min(baseCropBottom, layerBounds.bottom);
-        const baseBody = baseMeasuredRight > baseMeasuredLeft && baseMeasuredBottom > baseMeasuredTop ? {
-          left: baseDrawX + (baseMeasuredLeft - baseCropLeft) / Math.max(1, baseCropRight - baseCropLeft) * baseDrawWidth,
-          top: baseDrawY + (baseMeasuredTop - baseCropTop) / Math.max(1, baseCropBottom - baseCropTop) * baseDrawHeight,
-          right: baseDrawX + (baseMeasuredRight - baseCropLeft) / Math.max(1, baseCropRight - baseCropLeft) * baseDrawWidth,
-          bottom: baseDrawY + (baseMeasuredBottom - baseCropTop) / Math.max(1, baseCropBottom - baseCropTop) * baseDrawHeight
-        } : { left: baseDrawX, top: baseDrawY, right: baseDrawX + baseDrawWidth, bottom: baseDrawY + baseDrawHeight };
-        const linkedRulers = draft.product_show_ruler !== false;
-        const ruler = infoRulerGeometry(linkedRulers ? adjustedBody : baseBody);
-        const widthRuler = infoWidthRulerGeometry(baseBody, draft);
-        const lengthRuler = transformCanvasRulerSegment(
+        const widthRuler = infoWidthRulerGeometry(baseBody, productRulerCenter, draft, output);
+        const lengthRuler = transformProductRulerSegment(
           { x: ruler.left, y: ruler.horizontalY },
           { x: ruler.right, y: ruler.horizontalY },
+          productRulerCenter,
+          draft,
           draft.length_ruler_scale || 1,
           draft.length_ruler_offset_x || 0,
           draft.length_ruler_offset_y || 0,
           output
         );
-        const heightRuler = transformCanvasRulerSegment(
-          { x: ruler.verticalX, y: ruler.top },
-          { x: ruler.verticalX, y: ruler.bottom },
+        const heightRuler = transformProductRulerSegment(
+          { x: ruler.verticalX, y: ruler.top + VIP_INFO_HEIGHT_RULER_SHIFT_Y },
+          { x: ruler.verticalX, y: ruler.bottom + VIP_INFO_HEIGHT_RULER_SHIFT_Y },
+          productRulerCenter,
+          draft,
           draft.height_ruler_scale || 1,
           draft.height_ruler_offset_x || 0,
           draft.height_ruler_offset_y || 0,
@@ -1359,7 +1948,7 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         const lengthValue = Number.parseFloat(productInfo.product_length || "");
         const widthValue = Number.parseFloat(productInfo.product_width || "");
         const heightValue = Number.parseFloat(productInfo.product_height || "");
-        const dimensionLabel = (value: number) => Number.isFinite(value) ? `${Math.round(value * 10)}mm` : "--mm";
+        const dimensionLabel = (value: number) => Number.isFinite(value) ? `${Math.round(value)}mm` : "--mm";
         context.save();
         context.strokeStyle = lineColor;
         context.fillStyle = "#555";
@@ -1393,6 +1982,7 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
         context.save();
         context.translate(widthRuler.text.x * scaleX, widthRuler.text.y * scaleY);
         context.rotate(-26 * Math.PI / 180);
+        context.textBaseline = "middle";
         context.fillText(dimensionLabel(widthValue), 0, 0);
         context.restore();
         context.restore();
@@ -1407,16 +1997,16 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     };
     image.addEventListener("load", draw);
     if (compositePrimary) compositePrimary.addEventListener("load", draw);
-    if (template) template.addEventListener("load", draw);
     if (phoneReference) phoneReference.addEventListener("load", draw);
     if (logoReference) logoReference.addEventListener("load", draw);
+    if (preparedProduct) preparedProduct.addEventListener("load", draw);
     draw();
     return () => {
       image.removeEventListener("load", draw);
       if (compositePrimary) compositePrimary.removeEventListener("load", draw);
-      if (template) template.removeEventListener("load", draw);
       if (phoneReference) phoneReference.removeEventListener("load", draw);
       if (logoReference) logoReference.removeEventListener("load", draw);
+      if (preparedProduct) preparedProduct.removeEventListener("load", draw);
     };
   }, [
     draft,
@@ -1425,13 +2015,20 @@ function LiveSlotPreview({ sourceUrl, compositePrimaryUrl, templateUrl, slot, dr
     slot.size,
     sourceIndex,
     sourceUrl,
+    sourceImageId,
     compositePrimaryUrl,
+    compositePrimaryImageId,
+    layerInfo,
+    primaryLayerInfo,
     targetFolder,
     templateUrl,
     logoColor,
     productInfo.product_length,
     productInfo.product_width,
-    productInfo.product_height
+    productInfo.product_height,
+    productInfo.main_material,
+    productInfo.lining_material,
+    productInfo.wearing_method
   ]);
 
   return <canvas ref={canvasRef} aria-label={`${slot.file_name} 前端即时预览`} />;
@@ -1463,13 +2060,14 @@ function jdComparisonDimensionsReady(productInfo: Record<string, string>) {
   return Number.isFinite(length) && length > 0 && Number.isFinite(height) && height > 0;
 }
 
-function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onPreview }: {
+function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onDelete, onPreview }: {
   title: string;
   hint: string;
   items: UploadItem[];
   multiple?: boolean;
   disabled?: boolean;
   onUpload: (files: FileList | File[] | null, skipped?: number) => void;
+  onDelete: (item: UploadItem) => void;
   onPreview: (url: string) => void;
 }) {
   const [dragging, setDragging] = useState(false);
@@ -1478,6 +2076,7 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
     const incoming = Array.from(files);
     const supported = incoming.filter((file) => SUPPORTED_IMAGE_NAME.test(file.name));
     const selected = multiple ? supported : supported.slice(0, 1);
+    if (!selected.length) return;
     onUpload(selected, incoming.length - selected.length);
   }
 
@@ -1498,7 +2097,10 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
       }}
       onDrop={handleDrop}
     >
-      <div><strong>{title}</strong><span>{hint}</span></div>
+      <div className="organizer-upload-heading">
+        <div><strong>{title}</strong><span>{hint}</span></div>
+        <small>{items.length ? `${items.length} 张` : "尚未上传"}</small>
+      </div>
       <label className="organizer-upload-button">
         <UploadCloud size={22} />
         <span>{dragging ? "松开即可上传" : items.length ? `已上传 ${items.length} 张，可继续拖入或点击添加` : multiple ? "拖入多张图片，或点击选择" : "拖入图片，或点击选择"}</span>
@@ -1514,9 +2116,19 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
         />
       </label>
       {items.length > 0 && <div className="organizer-thumb-row">{items.map((item) => (
-        <div key={item.image_id} title={item.file_name}>
-          <button type="button" onClick={() => onPreview(item.original_url || item.preview_url)} aria-label={`预览 ${item.file_name}`}>
+        <div className="organizer-thumb-item" key={item.image_id} title={item.file_name}>
+          <button className="organizer-thumb-preview" type="button" onClick={() => onPreview(item.original_url || item.preview_url)} aria-label={`预览 ${item.file_name}`}>
             <img src={item.preview_url} alt={item.file_name} />
+          </button>
+          <button
+            className="organizer-thumb-delete"
+            type="button"
+            disabled={disabled}
+            onClick={() => onDelete(item)}
+            aria-label={`删除 ${item.file_name}`}
+            title={`删除 ${item.file_name}`}
+          >
+            <X size={13} />
           </button>
           <small>{item.file_name}</small>
         </div>
@@ -1529,8 +2141,10 @@ function SlotAdjustmentEditor({
   sessionId,
   slot,
   sourceIndex,
+  sourceImageId,
   sourceUrl,
   compositePrimaryUrl,
+  compositePrimaryImageId,
   displaySourceUrl,
   initialPreview,
   productInfo,
@@ -1543,8 +2157,10 @@ function SlotAdjustmentEditor({
   sessionId: string;
   slot: Slot;
   sourceIndex: number;
+  sourceImageId: number;
   sourceUrl: string;
   compositePrimaryUrl?: string;
+  compositePrimaryImageId?: number;
   displaySourceUrl?: string;
   initialPreview?: string;
   productInfo: Record<string, string>;
@@ -1552,21 +2168,43 @@ function SlotAdjustmentEditor({
   targetFolder: PreviewFolder;
   initialMoveTarget?: "product" | "phone";
   onClose: () => void;
-  onSave: (adjustment: ImageAdjustment, logoColor: LogoColor, previewUrl?: string) => void;
+  onSave: (
+    adjustment: ImageAdjustment,
+    logoColor: LogoColor,
+    previewUrl?: string,
+    syncJdFolders?: boolean
+  ) => void;
 }) {
-  const initial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
+  const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
+  const storedInitial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
+  const initial = isInfoPage && storedInitial.product_show_ruler !== false ? {
+    ...storedInitial,
+    product_ruler_base_left: undefined,
+    product_ruler_base_top: undefined,
+    product_ruler_base_right: undefined,
+    product_ruler_base_bottom: undefined,
+    product_ruler_group_scale: 1,
+    product_ruler_group_offset_x: 0,
+    product_ruler_group_offset_y: 0
+  } : storedInitial;
+  // Always rebuild 401 so its handle-aware product scale and ruler geometry
+  // match the live canvas and the final export.
+  const usableInitialPreview = isInfoPage ? "" : (initialPreview || "");
   const supportsLogoColor = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name);
   const [draft, setDraft] = useState<ImageAdjustment>(initial);
+  const [editorLayerInfo, setEditorLayerInfo] = useState<OrganizerLayerInfo | null>(null);
   const [logoColor, setLogoColor] = useState<LogoColor>(slot.logo_color === "white" ? "white" : "black");
-  const [renderedPreview, setRenderedPreview] = useState(initialPreview || "");
-  const [previewSynced, setPreviewSynced] = useState(Boolean(initialPreview));
+  const [renderedPreview, setRenderedPreview] = useState(usableInitialPreview);
+  const [previewSynced, setPreviewSynced] = useState(Boolean(usableInitialPreview));
   const [holdExactPreview, setHoldExactPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [cropMode, setCropMode] = useState(false);
   const isPhoneComparison = platform === "jd" && slot.file_name === "5.jpg";
+  const supportsJdFolderSync = platform === "jd" && previewFoldersForSlot(slot, platform).length > 1;
+  const [syncJdFolders, setSyncJdFolders] = useState(false);
   const isPhoneObjectEditor = isPhoneComparison && initialMoveTarget === "phone";
-  const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
   const [moveTarget, setMoveTarget] = useState<AdjustmentTarget>(initialMoveTarget);
   const [infoMoveTarget, setInfoMoveTarget] = useState<InfoMoveTarget>(
     initial.product_show_ruler === false ? "product" : "product_rulers"
@@ -1582,17 +2220,195 @@ function SlotAdjustmentEditor({
   const moveFrameRef = useRef<number | null>(null);
   const draftRef = useRef<ImageAdjustment>(initial);
   const logoColorRef = useRef<LogoColor>(slot.logo_color === "white" ? "white" : "black");
-  const renderedPreviewRef = useRef(initialPreview || "");
+  const renderedPreviewRef = useRef(usableInitialPreview);
   const draftVersionRef = useRef(0);
   const syncedVersionRef = useRef(initialPreview ? 0 : -1);
   const previewRequestRef = useRef(0);
   const previewAbortRef = useRef<AbortController | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
   const moveTargetRef = useRef<AdjustmentTarget>("product");
+  const linkedProductRulersRef = useRef(false);
 
   const activeMoveTarget: AdjustmentTarget = isInfoPage
     ? (infoMoveTarget === "product_rulers" ? "product" : infoMoveTarget)
     : moveTarget;
   moveTargetRef.current = activeMoveTarget;
+  linkedProductRulersRef.current = activeMoveTarget === "product" && (
+    isInfoPage
+      ? infoMoveTarget === "product_rulers"
+      : isPhoneComparison && draft.product_show_ruler !== false
+  );
+
+  function updateTargetScale(current: ImageAdjustment, target: AdjustmentTarget, scale: number) {
+    return target === "product" && linkedProductRulersRef.current
+      ? withLinkedProductScale(current, scale)
+      : withTargetScale(current, target, scale);
+  }
+
+  function updateTargetOffset(current: ImageAdjustment, target: AdjustmentTarget, x: number, y: number) {
+    if (target !== "product" || !linkedProductRulersRef.current) {
+      return withTargetOffset(current, target, x, y);
+    }
+    return withLinkedProductOffset(
+      current,
+      x,
+      y
+    );
+  }
+
+  function withPhoneRulerLinkPreservingPosition(
+    current: ImageAdjustment,
+    linked: boolean
+  ): ImageAdjustment {
+    const currentlyLinked = current.phone_show_ruler !== false;
+    if (currentlyLinked === linked) return current;
+    const productImage = livePreviewImage(sourceUrl);
+    const phoneReference = livePreviewImage("/organizer-assets/iphone_reference.png");
+    if (!productImage.complete || !productImage.naturalWidth) {
+      return { ...current, phone_show_ruler: linked };
+    }
+
+    const output = slotCanvasSize(slot.size, platform, targetFolder);
+    const layer = liveJdProductLayer(sourceUrl, productImage, current);
+    const { geometry, baseGeometry } = jdComparisonProductGeometry(
+      output,
+      layer,
+      current,
+      productInfo
+    );
+    const phoneLayout = jdComparisonPhoneLayout(
+      output,
+      geometry,
+      baseGeometry,
+      current,
+      phoneReference
+    );
+    const rawSegment = (useLinkedPhone: boolean) => {
+      const box = useLinkedPhone ? phoneLayout.phone : phoneLayout.basePhone;
+      const x = Math.min(
+        geometry.safe.right - 12,
+        box.left + box.width + phoneLayout.phoneRulerGap
+      );
+      return {
+        start: { x, y: box.top },
+        end: { x, y: box.top + box.height }
+      };
+    };
+    const previousBase = rawSegment(currentlyLinked);
+    const desired = transformCanvasRulerSegment(
+      previousBase.start,
+      previousBase.end,
+      current.phone_ruler_scale || 1,
+      current.phone_ruler_offset_x || 0,
+      current.phone_ruler_offset_y || 0,
+      output
+    );
+    const nextBase = rawSegment(linked);
+    const nextBaseLength = Math.max(1, nextBase.end.y - nextBase.start.y);
+    const desiredLength = Math.max(1, desired.end.y - desired.start.y);
+    const nextBaseCenter = {
+      x: (nextBase.start.x + nextBase.end.x) / 2,
+      y: (nextBase.start.y + nextBase.end.y) / 2
+    };
+    const desiredCenter = {
+      x: (desired.start.x + desired.end.x) / 2,
+      y: (desired.start.y + desired.end.y) / 2
+    };
+    return {
+      ...current,
+      phone_show_ruler: linked,
+      phone_ruler_scale: desiredLength / nextBaseLength,
+      phone_ruler_offset_x: (desiredCenter.x - nextBaseCenter.x) / (output.width * 0.18),
+      phone_ruler_offset_y: (desiredCenter.y - nextBaseCenter.y) / (output.height * 0.18)
+    };
+  }
+
+  function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
+    if (!isInfoPage && !isPhoneComparison) return null;
+    if (isInfoPage) {
+      const body = organizerLayerBounds(editorLayerInfo?.product_body_bbox);
+      return body && editorLayerInfo
+        ? positionedInfoProductBody(
+          editorLayerInfo.width,
+          editorLayerInfo.height,
+          body,
+          nextDraft,
+          editorLayerInfo.handle_lift
+        )
+        : null;
+    }
+    if (!sourceImageRef.current?.naturalWidth) return null;
+    const output = slotCanvasSize(slot.size, platform, targetFolder);
+    const layer = liveJdProductLayer(sourceUrl, sourceImageRef.current, nextDraft);
+    if (isPhoneComparison) {
+      const { geometry } = jdComparisonProductGeometry(output, layer, nextDraft, productInfo);
+      return geometry.body;
+    }
+    return null;
+  }
+
+  function withSyncedProductRulerBody(nextDraft: ImageAdjustment): ImageAdjustment {
+    if (isPhoneObjectEditor) return nextDraft;
+    if (isInfoPage) {
+      const body = productRulerBodyForDraft(nextDraft);
+      return {
+        ...nextDraft,
+        product_ruler_base_left: body?.left,
+        product_ruler_base_top: body?.top,
+        product_ruler_base_right: body?.right,
+        product_ruler_base_bottom: body?.bottom,
+        product_ruler_gap_scale: nextDraft.zoom,
+        product_ruler_group_scale: 1,
+        product_ruler_group_offset_x: 0,
+        product_ruler_group_offset_y: 0
+      };
+    }
+    const current = draftRef.current;
+    const currentBody = storedProductRulerBase(current);
+    const cropUnchanged = current.crop_x === nextDraft.crop_x
+      && current.crop_y === nextDraft.crop_y
+      && current.crop_width === nextDraft.crop_width
+      && current.crop_height === nextDraft.crop_height;
+    const hasLegacyGroupTransform = Math.abs((current.product_ruler_group_scale || 1) - 1) > 0.0001
+      || Math.abs(current.product_ruler_group_offset_x || 0) > 0.0001
+      || Math.abs(current.product_ruler_group_offset_y || 0) > 0.0001;
+    if (currentBody && cropUnchanged && !hasLegacyGroupTransform) {
+      const currentProductBody = productRulerBodyForDraft(current);
+      const nextProductBody = productRulerBodyForDraft(nextDraft);
+      if (currentProductBody && nextProductBody) {
+        const currentWidth = Math.max(1, currentProductBody.right - currentProductBody.left);
+        const currentHeight = Math.max(1, currentProductBody.bottom - currentProductBody.top);
+        const scaleX = (nextProductBody.right - nextProductBody.left) / currentWidth;
+        const scaleY = (nextProductBody.bottom - nextProductBody.top) / currentHeight;
+        const currentCenterX = (currentProductBody.left + currentProductBody.right) / 2;
+        const nextCenterX = (nextProductBody.left + nextProductBody.right) / 2;
+        const transformX = (value: number) => nextCenterX + (value - currentCenterX) * scaleX;
+        const transformY = (value: number) => nextProductBody.bottom
+          + (value - currentProductBody.bottom) * scaleY;
+        return {
+          ...nextDraft,
+          product_ruler_base_left: transformX(currentBody.left),
+          product_ruler_base_top: transformY(currentBody.top),
+          product_ruler_base_right: transformX(currentBody.right),
+          product_ruler_base_bottom: transformY(currentBody.bottom),
+          product_ruler_group_scale: 1,
+          product_ruler_group_offset_x: 0,
+          product_ruler_group_offset_y: 0
+        };
+      }
+    }
+    const body = productRulerBodyForDraft(nextDraft);
+    return body ? {
+      ...nextDraft,
+      product_ruler_base_left: body.left,
+      product_ruler_base_top: body.top,
+      product_ruler_base_right: body.right,
+      product_ruler_base_bottom: body.bottom,
+      product_ruler_group_scale: 1,
+      product_ruler_group_offset_x: 0,
+      product_ruler_group_offset_y: 0
+    } : nextDraft;
+  }
 
   function slotWithDraft(nextDraft: ImageAdjustment) {
     const adjustments = [...(slot.adjustments || [])];
@@ -1602,6 +2418,10 @@ function SlotAdjustmentEditor({
   }
 
   function cancelStalePreview() {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
     if (!previewAbortRef.current) return;
     previewAbortRef.current.abort();
     previewAbortRef.current = null;
@@ -1609,13 +2429,31 @@ function SlotAdjustmentEditor({
     setBusy(false);
   }
 
-  function applyDraft(nextDraft: ImageAdjustment) {
+  function scheduleExactPreview(nextDraft: ImageAdjustment, version: number) {
+    if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      void refreshPreview(nextDraft, version);
+    }, 320);
+  }
+
+  function applyDraft(
+    nextDraft: ImageAdjustment,
+    syncProductRulerBody = linkedProductRulersRef.current,
+    requestExactPreview = true
+  ) {
+    const preparedDraft = syncProductRulerBody
+      ? withSyncedProductRulerBody(nextDraft)
+      : nextDraft;
     cancelStalePreview();
     setHoldExactPreview(false);
     draftVersionRef.current += 1;
-    draftRef.current = nextDraft;
-    setDraft(nextDraft);
+    draftRef.current = preparedDraft;
+    setDraft(preparedDraft);
     setPreviewSynced(false);
+    if (requestExactPreview) {
+      scheduleExactPreview(preparedDraft, draftVersionRef.current);
+    }
   }
 
   function changeLogoColor(nextColor: LogoColor) {
@@ -1651,6 +2489,10 @@ function SlotAdjustmentEditor({
     nextDraft: ImageAdjustment = draftRef.current,
     version = draftVersionRef.current
   ): Promise<string | undefined> {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
     const requestId = ++previewRequestRef.current;
     previewAbortRef.current?.abort();
     const controller = new AbortController();
@@ -1688,11 +2530,12 @@ function SlotAdjustmentEditor({
   }
 
   useEffect(() => {
-    if (!initialPreview) void refreshPreview(initial, 0);
+    if (!usableInitialPreview) void refreshPreview(initial, 0);
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = previousOverflow;
+      if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
       previewAbortRef.current?.abort();
       if (moveFrameRef.current !== null) window.cancelAnimationFrame(moveFrameRef.current);
     };
@@ -1708,7 +2551,7 @@ function SlotAdjustmentEditor({
       const target = moveTargetRef.current;
       const maximum = target === "product" ? 4 : target === "phone" ? 1.8 : 2;
       const nextScale = Math.max(0.5, Math.min(maximum, Math.round((targetScale(current, target) + delta) * 100) / 100));
-      applyDraft(withTargetScale(current, target, nextScale));
+      applyDraft(updateTargetScale(current, target, nextScale));
     };
     stage.addEventListener("wheel", handleWheel, { passive: false });
     return () => stage.removeEventListener("wheel", handleWheel);
@@ -1751,17 +2594,17 @@ function SlotAdjustmentEditor({
   }
 
   function cropAspectRatio() {
+    const isProductCrop = platform === "jd"
+      ? ["2.jpg", "5.jpg", "透明.png"].includes(slot.file_name)
+      : ["2.jpg", "3.jpg", "30.png", "401.jpg", "606.jpg", "801.jpg"].includes(slot.file_name);
+    if (isProductCrop) return null;
     const output = slotCanvasSize(slot.size, platform, targetFolder);
     const area = slotPreviewLayout(slot, platform, sourceIndex, targetFolder);
     return (area.width * output.width) / Math.max(1, area.height * output.height);
   }
 
-  function finishCrop() {
-    const selection = cropSelectionRef.current;
-    const imageRect = displayedImageRect();
-    cropStartRef.current = null;
-    if (!selection || !imageRect || selection.width < 8 || selection.height < 8) return;
-    applyDraft({
+  function cropAdjustment(selection: CropSelection, imageRect: CropSelection) {
+    const nextDraft: ImageAdjustment = {
       ...draftRef.current,
       crop_x: (selection.left - imageRect.left) / imageRect.width,
       crop_y: (selection.top - imageRect.top) / imageRect.height,
@@ -1769,8 +2612,26 @@ function SlotAdjustmentEditor({
       crop_height: selection.height / imageRect.height,
       zoom: 1,
       offset_x: 0,
-      offset_y: 0
-    });
+      offset_y: 0,
+      product_ruler_base_left: undefined,
+      product_ruler_base_top: undefined,
+      product_ruler_base_right: undefined,
+      product_ruler_base_bottom: undefined
+    };
+    return linkedProductRulersRef.current ? {
+      ...nextDraft,
+      product_ruler_group_scale: 1,
+      product_ruler_group_offset_x: 0,
+      product_ruler_group_offset_y: 0
+    } : nextDraft;
+  }
+
+  function finishCrop() {
+    const selection = cropSelectionRef.current;
+    const imageRect = displayedImageRect();
+    cropStartRef.current = null;
+    if (!selection || !imageRect || selection.width < 8 || selection.height < 8) return;
+    applyDraft(cropAdjustment(selection, imageRect));
     setCropMode(false);
     cropSelectionRef.current = null;
     setCropSelection(null);
@@ -1801,16 +2662,7 @@ function SlotAdjustmentEditor({
       const selection = fitCropSelectionToTemplate(previousSelection, imageRect, cropAspectRatio());
       cropSelectionRef.current = selection;
       setCropSelection(selection);
-      applyDraft({
-        ...draftRef.current,
-        crop_x: (selection.left - imageRect.left) / imageRect.width,
-        crop_y: (selection.top - imageRect.top) / imageRect.height,
-        crop_width: selection.width / imageRect.width,
-        crop_height: selection.height / imageRect.height,
-        zoom: 1,
-        offset_x: 0,
-        offset_y: 0
-      });
+      applyDraft(cropAdjustment(selection, imageRect));
     });
   }
 
@@ -1818,7 +2670,7 @@ function SlotAdjustmentEditor({
     const current = draftRef.current;
     const maximum = activeMoveTarget === "product" ? 4 : activeMoveTarget === "phone" ? 1.8 : 2;
     const nextScale = Math.max(0.5, Math.min(maximum, Math.round((targetScale(current, activeMoveTarget) + delta) * 100) / 100));
-    applyDraft(withTargetScale(current, activeMoveTarget, nextScale));
+    applyDraft(updateTargetScale(current, activeMoveTarget, nextScale));
   }
 
   function reset() {
@@ -1826,14 +2678,8 @@ function SlotAdjustmentEditor({
       logoColorRef.current = "black";
       setLogoColor("black");
     }
-    if (activeMoveTarget !== "product") {
-      let next = withTargetScale(draftRef.current, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
-      next = withTargetOffset(next, activeMoveTarget, 0, 0);
-      if (activeMoveTarget === "phone") next = { ...next, phone_alignment: "bottom", phone_show_ruler: false };
-      applyDraft(next);
-    } else if (isPhoneComparison || isInfoPage) {
-      applyDraft({
-        ...draftRef.current,
+    const resetProduct = (current: ImageAdjustment) => ({
+        ...current,
         zoom: DEFAULT_ADJUSTMENT.zoom,
         offset_x: DEFAULT_ADJUSTMENT.offset_x,
         offset_y: DEFAULT_ADJUSTMENT.offset_y,
@@ -1841,10 +2687,75 @@ function SlotAdjustmentEditor({
         crop_y: DEFAULT_ADJUSTMENT.crop_y,
         crop_width: DEFAULT_ADJUSTMENT.crop_width,
         crop_height: DEFAULT_ADJUSTMENT.crop_height,
-        product_show_ruler: isInfoPage
-          ? infoMoveTarget === "product_rulers"
-          : draftRef.current.product_show_ruler
-      });
+        product_ruler_base_left: undefined,
+        product_ruler_base_top: undefined,
+        product_ruler_base_right: undefined,
+        product_ruler_base_bottom: undefined
+    });
+    const resetProductRulers = (current: ImageAdjustment) => ({
+        ...current,
+        product_ruler_group_scale: 1,
+        product_ruler_group_offset_x: 0,
+        product_ruler_group_offset_y: 0,
+        product_ruler_gap_scale: 1,
+        length_ruler_scale: 1,
+        length_ruler_offset_x: 0,
+        length_ruler_offset_y: 0,
+        height_ruler_scale: 1,
+        height_ruler_offset_x: 0,
+        height_ruler_offset_y: 0,
+        width_ruler_scale: 1,
+        width_ruler_offset_x: 0,
+        width_ruler_offset_y: 0
+    });
+    let next = draftRef.current;
+
+    if (isInfoPage) {
+      if (infoMoveTarget === "product_rulers") {
+        next = resetProductRulers({
+          ...resetProduct(next),
+          product_show_ruler: true
+        });
+      } else if (infoMoveTarget === "product") {
+        next = {
+          ...resetProduct(next),
+          product_show_ruler: false
+        };
+      } else {
+        next = withTargetScale(next, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
+        next = withTargetOffset(next, activeMoveTarget, 0, 0);
+      }
+      applyDraft(next, false);
+    } else if (isPhoneComparison) {
+      if (activeMoveTarget === "product") {
+        next = {
+          ...resetProduct(next),
+          product_show_ruler: next.product_show_ruler
+        };
+        if (linkedProductRulersRef.current) next = resetProductRulers(next);
+      } else if (activeMoveTarget === "phone") {
+        const phoneRulerLinked = next.phone_show_ruler !== false;
+        next = {
+          ...next,
+          phone_scale: DEFAULT_ADJUSTMENT.phone_scale,
+          phone_offset_x: DEFAULT_ADJUSTMENT.phone_offset_x,
+          phone_offset_y: DEFAULT_ADJUSTMENT.phone_offset_y,
+          phone_alignment: "bottom",
+          ...(phoneRulerLinked ? {
+            phone_ruler_scale: DEFAULT_ADJUSTMENT.phone_ruler_scale,
+            phone_ruler_offset_x: DEFAULT_ADJUSTMENT.phone_ruler_offset_x,
+            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y
+          } : {})
+        };
+      } else {
+        next = withTargetScale(next, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
+        next = withTargetOffset(next, activeMoveTarget, 0, 0);
+      }
+      applyDraft(next, false);
+    } else if (activeMoveTarget !== "product") {
+      next = withTargetScale(next, activeMoveTarget, targetScale(DEFAULT_ADJUSTMENT, activeMoveTarget));
+      next = withTargetOffset(next, activeMoveTarget, 0, 0);
+      applyDraft(next, false);
     } else {
       applyDraft({ ...DEFAULT_ADJUSTMENT });
     }
@@ -1853,48 +2764,81 @@ function SlotAdjustmentEditor({
     setCropMode(false);
   }
 
-  function flushPendingMove() {
+  function flushPendingMove(requestExactPreview = false) {
     if (moveFrameRef.current !== null) {
       window.cancelAnimationFrame(moveFrameRef.current);
       moveFrameRef.current = null;
     }
     const nextDraft = pendingMoveRef.current;
     pendingMoveRef.current = null;
-    if (nextDraft) applyDraft(nextDraft);
+    if (nextDraft) applyDraft(nextDraft, linkedProductRulersRef.current, requestExactPreview);
   }
 
   function finishMove() {
-    flushPendingMove();
+    flushPendingMove(false);
     moveStartRef.current = null;
+    scheduleExactPreview(draftRef.current, draftVersionRef.current);
   }
 
   async function saveAdjustment() {
+    flushPendingMove();
     const currentDraft = draftRef.current;
     let previewUrl = renderedPreviewRef.current;
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
     if (syncedVersionRef.current !== draftVersionRef.current) {
       previewUrl = await refreshPreview(currentDraft, draftVersionRef.current) || "";
     }
-    if (previewUrl) onSave(currentDraft, logoColorRef.current, previewUrl);
+    if (previewUrl) onSave(currentDraft, logoColorRef.current, previewUrl, syncJdFolders);
+  }
+
+  function requestClose() {
+    flushPendingMove();
+    const changed = draftVersionRef.current > 0
+      || logoColorRef.current !== (slot.logo_color === "white" ? "white" : "black");
+    if (changed) {
+      setShowCloseConfirm(true);
+      return;
+    }
+    onClose();
   }
 
   return (
     <div className="slot-adjustment-modal" role="dialog" aria-modal="true" aria-label={`调整 ${slot.file_name}`} onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onClose();
+      if (event.target === event.currentTarget) requestClose();
     }}>
       <section className="slot-adjustment-dialog">
         <header>
           <div>
             <strong>{slot.file_name} · {slot.title}</strong>
-            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? "手机" : moveTarget === "phone_ruler" ? "手机高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "商品图和长高标线"}` : "当前输出位置独立调整"}</span>
+            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? (draft.phone_show_ruler !== false ? "手机和高标线" : "手机") : moveTarget === "phone_ruler" ? "高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
           </div>
-          <button type="button" className="icon-button" onClick={onClose} title="关闭"><X size={21} /></button>
+          <button type="button" className="icon-button" onClick={requestClose} title="关闭"><X size={21} /></button>
         </header>
+
+        {showCloseConfirm && <div className="slot-close-confirm" role="alertdialog" aria-label="未保存调整提示">
+          <div><strong>调整尚未保存</strong><span>保存会生成最终预览并退出；右上角 × 会放弃本次调整</span></div>
+          <div className="slot-save-actions">
+            {supportsJdFolderSync && <label className="slot-sync-toggle">
+              <input
+                type="checkbox"
+                checked={syncJdFolders}
+                onChange={(event) => setSyncJdFolders(event.target.checked)}
+              />
+              <span>同步 800/750</span>
+            </label>}
+            <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="不保存并退出" title="不保存并退出"><X size={20} /></button>
+        </div>}
 
         <div className="slot-adjustment-workspace">
           <div className="slot-adjustment-source">
             <div className="slot-adjustment-heading">
               <strong>{isPhoneObjectEditor ? "手机参照图" : "原始图片"}</strong>
-              <span>{isPhoneObjectEditor ? "在右侧预览中调整手机或手机高标线" : cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
+              <span>{isPhoneObjectEditor ? "在右侧预览中调整手机或高标线" : cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
             </div>
             <div
               ref={sourceStageRef}
@@ -1933,6 +2877,9 @@ function SlotAdjustmentEditor({
               ref={resultStageRef}
               className={`slot-result-stage${busy ? " is-loading" : ""}`}
               onPointerDown={(event) => {
+                cancelStalePreview();
+                setHoldExactPreview(false);
+                setPreviewSynced(false);
                 event.currentTarget.setPointerCapture(event.pointerId);
                 const currentOffset = targetOffset(draftRef.current, activeMoveTarget);
                 moveStartRef.current = {
@@ -1947,15 +2894,34 @@ function SlotAdjustmentEditor({
                 const start = moveStartRef.current;
                 if (!start) return;
                 const bounds = event.currentTarget.getBoundingClientRect();
-                const nextOffsetX = Math.max(-1.5, Math.min(1.5, start.offsetX + (event.clientX - start.x) / bounds.width));
-                const nextOffsetY = Math.max(-1.5, Math.min(1.5, start.offsetY + (event.clientY - start.y) / bounds.height));
-                pendingMoveRef.current = withTargetOffset(draftRef.current, start.target, nextOffsetX, nextOffsetY);
+                const output = slotCanvasSize(slot.size, platform, targetFolder);
+                const basis = adjustmentOffsetBasis(slot, platform, sourceIndex, targetFolder, start.target);
+                const dragSensitivity = start.target === "product" && slot.kind === "model"
+                  ? 0.6
+                  : platform === "jd" && slot.file_name === "2.jpg" && start.target === "product"
+                    ? 0.65
+                    : 1;
+                const canvasDeltaX = (event.clientX - start.x) * output.width / Math.max(1, bounds.width) * dragSensitivity;
+                const canvasDeltaY = (event.clientY - start.y) * output.height / Math.max(1, bounds.height) * dragSensitivity;
+                const rawOffsetX = start.offsetX + canvasDeltaX / basis.x;
+                const rawOffsetY = start.offsetY + canvasDeltaY / basis.y;
+                const nextOffsetX = Math.max(-1.5, Math.min(1.5,
+                  slot.kind === "model"
+                    ? modelDragOffsetWithBoundaryResistance(start.offsetX, rawOffsetX - start.offsetX)
+                    : rawOffsetX
+                ));
+                const nextOffsetY = Math.max(-1.5, Math.min(1.5,
+                  slot.kind === "model"
+                    ? modelDragOffsetWithBoundaryResistance(start.offsetY, rawOffsetY - start.offsetY)
+                    : rawOffsetY
+                ));
+                pendingMoveRef.current = updateTargetOffset(draftRef.current, start.target, nextOffsetX, nextOffsetY);
                 if (moveFrameRef.current === null) {
                   moveFrameRef.current = window.requestAnimationFrame(() => {
                     moveFrameRef.current = null;
                     const nextDraft = pendingMoveRef.current;
                     pendingMoveRef.current = null;
-                    if (nextDraft) applyDraft(nextDraft);
+                    if (nextDraft) applyDraft(nextDraft, linkedProductRulersRef.current, false);
                   });
                 }
               }}
@@ -1964,8 +2930,10 @@ function SlotAdjustmentEditor({
             >
               <LiveSlotPreview
                 sourceUrl={sourceUrl}
+                sourceImageId={sourceImageId}
                 compositePrimaryUrl={compositePrimaryUrl}
-                templateUrl={renderedPreview || initialPreview}
+                compositePrimaryImageId={compositePrimaryImageId}
+                templateUrl={renderedPreview || usableInitialPreview}
                 slot={slot}
                 draft={draft}
                 platform={platform}
@@ -1973,6 +2941,7 @@ function SlotAdjustmentEditor({
                 targetFolder={targetFolder}
                 productInfo={productInfo}
                 logoColor={logoColor}
+                onLayerInfoChange={setEditorLayerInfo}
               />
               {renderedPreview && <img
                 className={`slot-exact-preview${previewSynced || holdExactPreview ? " is-visible" : ""}`}
@@ -1998,59 +2967,83 @@ function SlotAdjustmentEditor({
           {(isPhoneComparison || isInfoPage) && <div className="slot-phone-controls" role="group" aria-label={isInfoPage ? "产品信息图调整" : "手机对比调整"}>
             <span>调整对象</span>
             {isPhoneObjectEditor ? <>
-              <button type="button" className={moveTarget === "phone" ? "active-tool" : ""} onClick={() => {
+              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler !== false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone");
                 setCropMode(false);
-                if (draftRef.current.phone_show_ruler !== false) applyDraft({ ...draftRef.current, phone_show_ruler: false });
+                if (draftRef.current.phone_show_ruler === false) {
+                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, true));
+                }
+              }}>全部</button>
+              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler === false ? "active-tool" : ""} onClick={() => {
+                setMoveTarget("phone");
+                setCropMode(false);
+                if (draftRef.current.phone_show_ruler !== false) {
+                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, false));
+                }
               }}>手机</button>
               <button type="button" className={moveTarget === "phone_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone_ruler");
                 setCropMode(false);
-                if (draftRef.current.phone_show_ruler !== false) applyDraft({ ...draftRef.current, phone_show_ruler: false });
-              }}>手机高标线</button>
+                if (draftRef.current.phone_show_ruler !== false) {
+                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, false));
+                }
+              }}>高标线</button>
               <span>对齐</span>
               <button type="button" className={draft.phone_alignment === "center" ? "active-tool" : ""} onClick={() => changePhoneAlignment("center")}>中心同高</button>
               <button type="button" className={(draft.phone_alignment || "bottom") === "bottom" ? "active-tool" : ""} onClick={() => changePhoneAlignment("bottom")}>底部齐平</button>
             </> : isInfoPage ? <>
-              <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
-                setInfoMoveTarget("product");
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
-              }}>仅商品图</button>
               <button type="button" className={infoMoveTarget === "product_rulers" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product_rulers");
-                if (draftRef.current.product_show_ruler === false) applyDraft({ ...draftRef.current, product_show_ruler: true });
-              }}>商品图和长高标线</button>
+                linkedProductRulersRef.current = true;
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
+              }}>全部</button>
+              <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
+                setInfoMoveTarget("product");
+                linkedProductRulersRef.current = false;
+                if (draftRef.current.product_show_ruler !== false) {
+                  applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+                }
+              }}>商品图</button>
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("length_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
               }}>长标线</button>
               <button type="button" className={infoMoveTarget === "height_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("height_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
               }}>高标线</button>
               <button type="button" className={infoMoveTarget === "width_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("width_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
               }}>宽标线</button>
             </> : <>
-              <button type="button" className={moveTarget === "product" && draft.product_show_ruler === false ? "active-tool" : ""} onClick={() => {
-                setMoveTarget("product");
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
-              }}>商品图</button>
               <button type="button" className={moveTarget === "product" && draft.product_show_ruler !== false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("product");
-                if (draftRef.current.product_show_ruler === false) applyDraft({ ...draftRef.current, product_show_ruler: true });
-              }}>商品图和长高标线</button>
+                linkedProductRulersRef.current = true;
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
+              }}>全部</button>
+              <button type="button" className={moveTarget === "product" && draft.product_show_ruler === false ? "active-tool" : ""} onClick={() => {
+                setMoveTarget("product");
+                linkedProductRulersRef.current = false;
+                if (draftRef.current.product_show_ruler !== false) {
+                  applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+                }
+              }}>商品图</button>
               <button type="button" className={moveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("length_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
-              }}>商品长标线</button>
+                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+              }}>长标线</button>
               <button type="button" className={moveTarget === "height_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("height_ruler");
+                linkedProductRulersRef.current = false;
                 setCropMode(false);
-                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false });
-              }}>商品高标线</button>
+                if (draftRef.current.product_show_ruler !== false) applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+              }}>高标线</button>
             </>}
           </div>}
           {activeMoveTarget === "product" && <button type="button" className={cropMode ? "active-tool" : ""} onClick={toggleCropMode}><Crop size={18} />裁剪</button>}
@@ -2067,19 +3060,26 @@ function SlotAdjustmentEditor({
             </button>
           </div>}
           <button type="button" onClick={reset}><RotateCcw size={18} />恢复自动</button>
-          <button
-            type="button"
-            className={!previewSynced ? "confirm-preview" : ""}
-            disabled={busy || previewSynced}
-            onClick={() => void refreshPreview(draftRef.current, draftVersionRef.current)}
-          ><CheckCircle2 size={18} />{previewSynced ? "预览已确认" : "确认预览"}</button>
           <span className="slot-drag-hint"><Move size={16} />位置 {
             Math.round(targetOffset(draft, activeMoveTarget).x * 100)
           } / {
             Math.round(targetOffset(draft, activeMoveTarget).y * 100)
           }</span>
-          {!previewSynced && <span className="slot-preview-pending">调整后请先确认预览</span>}
-          <button type="button" className="primary" disabled={busy || !previewSynced} onClick={() => void saveAdjustment()}><Save size={18} />保存调整</button>
+          {!previewSynced && <span className="slot-preview-pending">保存时会自动生成精确预览</span>}
+          <div className="slot-save-actions">
+            {supportsJdFolderSync && <label
+              className="slot-sync-toggle"
+              title={syncJdFolders ? "本次调整会同时保存到 800 和 750" : `本次调整只保存到 ${targetFolder}`}
+            >
+              <input
+                type="checkbox"
+                checked={syncJdFolders}
+                onChange={(event) => setSyncJdFolders(event.target.checked)}
+              />
+              <span>同步 800/750</span>
+            </label>}
+            <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : "保存并退出"}</button>
+          </div>
         </div>
         {error && <div className="alert warning">{error}</div>}
       </section>
@@ -2087,7 +3087,160 @@ function SlotAdjustmentEditor({
   );
 }
 
-export default function VipOrganizer() {
+type VipOrganizerProps = {
+  active: boolean;
+  initialProductFile?: File | null;
+  onInitialProductFileConsumed?: () => void;
+};
+
+function ZoomableImagePreview({ url, onClose }: { url: string; onClose: () => void }) {
+  const [zoom, setZoom] = useState(1);
+  const [baseSize, setBaseSize] = useState<{ width: number; height: number } | null>(null);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+
+  function clampZoom(value: number) {
+    return Math.min(IMAGE_PREVIEW_ZOOM_MAX, Math.max(IMAGE_PREVIEW_ZOOM_MIN, value));
+  }
+
+  function resetPreview() {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }
+
+  function adjustZoom(delta: number) {
+    setZoom((current) => {
+      const next = clampZoom(Number((current + delta).toFixed(2)));
+      if (next === current) return current;
+      const ratio = next / current;
+      setPan((currentPan) => ({ x: currentPan.x * ratio, y: currentPan.y * ratio }));
+      return next;
+    });
+  }
+
+  function zoomAtPointer(event: ReactWheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const anchorX = event.clientX - (rect.left + rect.width / 2);
+    const anchorY = event.clientY - (rect.top + rect.height / 2);
+    const delta = event.deltaY < 0 ? IMAGE_PREVIEW_ZOOM_STEP : -IMAGE_PREVIEW_ZOOM_STEP;
+    setZoom((current) => {
+      const next = clampZoom(Number((current + delta).toFixed(2)));
+      if (next === current) return current;
+      const ratio = next / current;
+      setPan((currentPan) => ({
+        x: anchorX - (anchorX - currentPan.x) * ratio,
+        y: anchorY - (anchorY - currentPan.y) * ratio
+      }));
+      return next;
+    });
+  }
+
+  function startDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: pan.x,
+      originY: pan.y
+    };
+    setDragging(true);
+  }
+
+  function movePreview(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    setPan({
+      x: drag.originX + event.clientX - drag.startX,
+      y: drag.originY + event.clientY - drag.startY
+    });
+  }
+
+  function finishDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    dragRef.current = null;
+    setDragging(false);
+  }
+
+  function measureImage(image: HTMLImageElement) {
+    const availableWidth = Math.min(window.innerWidth * 0.92, 1600);
+    const availableHeight = Math.max(240, window.innerHeight - 160);
+    const fitScale = Math.min(
+      availableWidth / Math.max(1, image.naturalWidth),
+      availableHeight / Math.max(1, image.naturalHeight),
+      1
+    );
+    setBaseSize({
+      width: Math.max(1, Math.round(image.naturalWidth * fitScale)),
+      height: Math.max(1, Math.round(image.naturalHeight * fitScale))
+    });
+  }
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "+" || event.key === "=") adjustZoom(IMAGE_PREVIEW_ZOOM_STEP);
+      if (event.key === "-") adjustZoom(-IMAGE_PREVIEW_ZOOM_STEP);
+      if (event.key === "0") resetPreview();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  return <div className="image-modal image-modal-zoomable" role="dialog" aria-modal="true" aria-label="放大图片预览" onClick={onClose}>
+    <button className="image-modal-close" type="button" onClick={onClose} aria-label="关闭预览"><X size={22} /></button>
+    <div
+      className={`image-modal-viewport${dragging ? " is-dragging" : ""}`}
+      onClick={(event) => event.stopPropagation()}
+      onWheel={zoomAtPointer}
+      onPointerDown={startDrag}
+      onPointerMove={movePreview}
+      onPointerUp={finishDrag}
+      onPointerCancel={finishDrag}
+      onDoubleClick={resetPreview}
+      title="滚轮缩放，按住左键拖动查看，双击复位"
+    >
+      <div className="image-modal-canvas">
+        <img
+          src={url}
+          alt="图片预览"
+          draggable={false}
+          onLoad={(event) => measureImage(event.currentTarget)}
+          style={baseSize ? {
+            width: `${baseSize.width}px`,
+            height: `${baseSize.height}px`,
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`
+          } : undefined}
+        />
+      </div>
+    </div>
+    <div className="image-modal-zoom-controls" role="group" aria-label="图片缩放" onClick={(event) => event.stopPropagation()}>
+      <button type="button" disabled={zoom <= IMAGE_PREVIEW_ZOOM_MIN} onClick={() => adjustZoom(-IMAGE_PREVIEW_ZOOM_STEP)} aria-label="缩小图片"><ZoomOut size={20} /></button>
+      <output aria-live="polite">{Math.round(zoom * 100)}%</output>
+      <button type="button" disabled={zoom >= IMAGE_PREVIEW_ZOOM_MAX} onClick={() => adjustZoom(IMAGE_PREVIEW_ZOOM_STEP)} aria-label="放大图片"><ZoomIn size={20} /></button>
+      <button type="button" onClick={resetPreview} aria-label="恢复原始缩放" title="恢复 100%"><RotateCcw size={18} /></button>
+    </div>
+  </div>;
+}
+
+export default function VipOrganizer({ active, initialProductFile, onInitialProductFileConsumed }: VipOrganizerProps) {
   const sessionStorageKey = "vip-organizer-session-id";
   const [sessionId, setSessionId] = useState("");
   const sessionIdRef = useRef("");
@@ -2149,6 +3302,35 @@ export default function VipOrganizer() {
   const allAssets = useMemo(() => [...(assets.product || []), ...(assets.model || []), ...(assets.tag || [])], [assets]);
 
   useEffect(() => {
+    if (active) void api.prewarmHeavyTask("organizer").catch(() => undefined);
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) return;
+    const pasteTagScreenshot = (event: globalThis.ClipboardEvent) => {
+      if (busy || !event.clipboardData) return;
+      const images = Array.from(event.clipboardData.items).flatMap((item, index) => {
+        if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
+        const blob = item.getAsFile();
+        if (!blob) return [];
+        const extension = blob.type === "image/jpeg" ? "jpg" : blob.type === "image/webp" ? "webp" : "png";
+        return [new File([blob], `粘贴吊牌-${Date.now()}-${index + 1}.${extension}`, { type: blob.type })];
+      });
+      if (!images.length) return;
+      event.preventDefault();
+      void upload("tag", images.slice(0, 1));
+    };
+    window.addEventListener("paste", pasteTagScreenshot);
+    return () => window.removeEventListener("paste", pasteTagScreenshot);
+  }, [active, busy]);
+
+  useEffect(() => {
+    if (!initialProductFile) return;
+    onInitialProductFileConsumed?.();
+    void upload("product", [initialProductFile]);
+  }, [initialProductFile]);
+
+  useEffect(() => {
     slotsRef.current = slots;
   }, [slots]);
 
@@ -2157,7 +3339,7 @@ export default function VipOrganizer() {
       .map((value) => value.trim())
       .filter(Boolean)
       .join(" × ");
-    return { ...info, dimensions: dimensions ? `${dimensions} cm` : "" };
+    return { ...info, dimensions: dimensions ? `${dimensions} mm` : "" };
   }
 
   useEffect(() => {
@@ -2170,6 +3352,7 @@ export default function VipOrganizer() {
     const productInfo = organizerProductInfo();
     const jdSizeReady = jdComparisonDimensionsReady(productInfo);
     const previewTargets = slots.flatMap((slot) => {
+      if (!slot.image_ids[0] || (slot.file_name === "606.jpg" && slot.image_ids.length < 4)) return [];
       if (platform === "jd" && slot.file_name === "5.jpg" && !jdSizeReady) return [];
       if (platform === "vip" && slot.file_name === "401.jpg" && !jdSizeReady) return [];
       return previewFoldersForSlot(slot, platform).map((targetFolder) => ({
@@ -2180,7 +3363,12 @@ export default function VipOrganizer() {
     });
     const signatures = Object.fromEntries(previewTargets.map((target) => [
       target.key,
-      slotPreviewSignature(target.slot, productInfo, platform, target.targetFolder)
+      slotPreviewSignature(
+        slotForPreviewFolder(target.slot, platform, target.targetFolder),
+        productInfo,
+        platform,
+        target.targetFolder
+      )
     ]));
     const changedTargets = previewTargets.filter((target) =>
       !slotPreviews[target.key]
@@ -2202,7 +3390,7 @@ export default function VipOrganizer() {
           const groupedResults = await Promise.allSettled(folders.map(async (targetFolder) => {
             const result = await api.previewVipOrganizer({
               session_id: sessionId,
-              slots,
+              slots: slotsForPreviewFolder(slots, platform, targetFolder),
               product_info: productInfo,
               platform,
               target_folder: targetFolder
@@ -2247,7 +3435,7 @@ export default function VipOrganizer() {
           const results = await Promise.allSettled(changedTargets.map(async (target) => {
             const result = await api.previewVipOrganizerSlot({
               session_id: sessionId,
-              slots: [target.slot],
+              slots: [slotForPreviewFolder(target.slot, platform, target.targetFolder)],
               product_info: productInfo,
               file_name: target.slot.file_name,
               platform,
@@ -2348,7 +3536,12 @@ export default function VipOrganizer() {
         const signatures = Object.fromEntries(backgroundSlots.flatMap((slot: Slot) =>
           previewFoldersForSlot(slot, "jd").map((targetFolder) => [
             slotPreviewKey("jd", slot.file_name, targetFolder),
-            slotPreviewSignature(slot, productInfo, "jd", targetFolder)
+            slotPreviewSignature(
+              slotForPreviewFolder(slot, "jd", targetFolder),
+              productInfo,
+              "jd",
+              targetFolder
+            )
           ])
         ));
         platformWorkspaceRef.current.jd = {
@@ -2466,7 +3659,7 @@ export default function VipOrganizer() {
     try {
       const session = await api.startVipOrganizerSession(sessionIdRef.current || undefined);
       applyNewSession(session.session_id);
-      setMessage("已开始新一轮，上一轮自动化整理素材和ZIP已删除。AI生成记录不受影响。");
+      setMessage("已开始新一轮，上一轮自动化整理素材和 ZIP 已删除；AI 生成记录不受影响");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -2477,7 +3670,7 @@ export default function VipOrganizer() {
   async function upload(kind: "product" | "model" | "tag", files: FileList | File[] | null, preSkipped = 0) {
     const fileItems = Array.from(files || []);
     if (!fileItems.length) {
-      if (preSkipped) setMessage(`已跳过 ${preSkipped} 个不支持或未导入的文件。`);
+      if (preSkipped) setMessage(`已跳过 ${preSkipped} 个不支持或未导入的文件`);
       return;
     }
     pendingUploadsRef.current += 1;
@@ -2515,13 +3708,117 @@ export default function VipOrganizer() {
           false
         );
       } else {
-        setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件。` : `已上传 ${uploaded.length} 张图片。`);
+        setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件` : `已上传 ${uploaded.length} 张图片`);
       }
     } catch (error: any) {
       setMessage(error.message);
     } finally {
       pendingUploadsRef.current -= 1;
       if (pendingUploadsRef.current === 0) setBusy(false);
+    }
+  }
+
+  async function deleteUploadedAsset(kind: "product" | "model" | "tag", item: UploadItem) {
+    const currentSession = sessionIdRef.current || sessionId;
+    if (!currentSession) return;
+    setBusy(true);
+    setMessage(`正在删除 ${item.file_name} 并刷新后续成品……`);
+    try {
+      await api.deleteVipOrganizerAsset(currentSession, item.image_id);
+
+      const nextProducts = kind === "product"
+        ? productsRef.current.filter((entry) => entry.image_id !== item.image_id)
+        : productsRef.current;
+      const nextModels = kind === "model"
+        ? modelsRef.current.filter((entry) => entry.image_id !== item.image_id)
+        : modelsRef.current;
+      const nextTags = kind === "tag"
+        ? tagsRef.current.filter((entry) => entry.image_id !== item.image_id)
+        : tagsRef.current;
+      productsRef.current = nextProducts;
+      modelsRef.current = nextModels;
+      tagsRef.current = nextTags;
+      setProducts(nextProducts);
+      setModels(nextModels);
+      setTags(nextTags);
+
+      const nextRoles = { ...assetRolesRef.current };
+      const nextAssetTags = { ...assetTagsRef.current };
+      delete nextRoles[item.image_id];
+      delete nextAssetTags[item.image_id];
+      assetRolesRef.current = nextRoles;
+      assetTagsRef.current = nextAssetTags;
+      setAssetRoles(nextRoles);
+      setAssetTags(nextAssetTags);
+      setManualAssetIds((current) => {
+        const next = new Set(current);
+        next.delete(item.image_id);
+        return next;
+      });
+      setApiRoleNotes((current) => {
+        const next = { ...current };
+        delete next[item.image_id];
+        return next;
+      });
+      setAssets((current) => ({
+        product: (current.product || []).filter((asset: any) => (asset.id ?? asset.image_id) !== item.image_id),
+        model: (current.model || []).filter((asset: any) => (asset.id ?? asset.image_id) !== item.image_id),
+        tag: (current.tag || []).filter((asset: any) => (asset.id ?? asset.image_id) !== item.image_id)
+      }));
+
+      const previousSlots = slotsRef.current;
+      const nextSlotState = previousSlots.map((slot) => {
+        const keptIndexes = slot.image_ids
+          .map((imageId, index) => ({ imageId, index }))
+          .filter(({ imageId }) => imageId !== item.image_id);
+        if (keptIndexes.length === slot.image_ids.length) return slot;
+        return {
+          ...slot,
+          image_ids: keptIndexes.map(({ imageId }) => imageId),
+          adjustments: slot.adjustments
+            ? keptIndexes.map(({ index }) => slot.adjustments?.[index] || { ...DEFAULT_ADJUSTMENT })
+            : undefined
+        };
+      });
+      slotsRef.current = nextSlotState;
+      setSlots(nextSlotState);
+      setAdjustmentEditor((current) => {
+        if (!current) return current;
+        const editedSlot = previousSlots.find((slot) => slot.file_name === current.fileName);
+        return editedSlot?.image_ids[current.sourceIndex] === item.image_id ? null : current;
+      });
+      setPreview((current) => (
+        current === item.preview_url || current === item.original_url ? null : current
+      ));
+
+      previewAbortRef.current?.abort();
+      previewRequestRef.current += 1;
+      clearLivePreviewCaches();
+      setSlotPreviews({});
+      slotPreviewSignaturesRef.current = {};
+      platformWorkspaceRef.current = {};
+      jdBackgroundPreparedRef.current = false;
+
+      if (!nextProducts.length) {
+        slotsRef.current = [];
+        setSlots([]);
+        setAssets({ product: [], model: [], tag: [] });
+        setMessage("商品原图已删除，请重新上传后再自动整理");
+        return;
+      }
+      await analyze(
+        nextRoles,
+        platform,
+        nextAssetTags,
+        { products: nextProducts, models: nextModels, tags: nextTags },
+        undefined,
+        false,
+        true
+      );
+    } catch (error: any) {
+      setMessage(error.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -2541,6 +3838,7 @@ export default function VipOrganizer() {
     if (manageBusy) setBusy(true);
     setMessage("");
     try {
+      void api.prewarmHeavyTask("organizer").catch(() => undefined);
       const result = await api.analyzeVipOrganizer({
         session_id: sessionIdRef.current || sessionId,
         product_image_ids: productItems.map((item) => item.image_id),
@@ -2588,7 +3886,7 @@ export default function VipOrganizer() {
       }
       setAssets(result.assets);
       setAdjustmentEditor(null);
-      setMessage(incrementalKind === "tag" ? "吊牌相关输出已增量更新，其他预览保持不变。" : "已生成自动整理初稿。黄色或红色可信度项目需要重点确认。");
+      setMessage(incrementalKind === "tag" ? "吊牌相关输出已增量更新，其他预览保持不变" : "已生成自动整理初稿；黄色或红色可信度项目需要重点确认");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -2660,7 +3958,7 @@ export default function VipOrganizer() {
       setSlots(nextSlots);
       setAssets(result.assets);
       setAdjustmentEditor(null);
-      setMessage("API 已完成一次素材分类，并按固定标签重新整理。请检查低可信度位置。");
+      setMessage("API 已完成一次素材分类，并按固定标签重新整理；请检查低可信度位置");
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -2687,7 +3985,7 @@ export default function VipOrganizer() {
       return updated;
     });
     scheduleReanalyze(next, assetTagsRef.current);
-    setMessage("固定标签已修改，正在只更新受影响的输出位置。");
+    setMessage("固定标签已修改，正在只更新受影响的输出位置");
   }
 
   function effectiveAssetTags(asset: any) {
@@ -2702,7 +4000,7 @@ export default function VipOrganizer() {
     setAssetTags(next);
     setManualAssetIds((current) => new Set(current).add(asset.id));
     scheduleReanalyze(assetRolesRef.current, next);
-    setMessage("细节标签已修改，正在只更新受影响的输出位置。");
+    setMessage("细节标签已修改，正在只更新受影响的输出位置");
   }
 
   function resetAssetTags(imageId: number) {
@@ -2766,6 +4064,7 @@ export default function VipOrganizer() {
           ...slot,
           image_ids: next.filter(Boolean),
           adjustments,
+          folder_adjustments: undefined,
           confidence: 100,
           reason: linkedModelSlot ? `${linkedNames.join("与")}已同步使用同一张模特图` : "已由设计师人工确认",
         };
@@ -2795,14 +4094,40 @@ export default function VipOrganizer() {
     targetFolder: PreviewFolder,
     adjustment: ImageAdjustment,
     logoColor: LogoColor,
-    previewUrl?: string
+    previewUrl?: string,
+    syncJdFolders = false
   ) {
-    const currentSlot = slots.find((slot) => slot.file_name === fileName);
+    const currentSlot = slotsRef.current.find((slot) => slot.file_name === fileName);
     if (!currentSlot) return;
-    const adjustments = [...(currentSlot.adjustments || [])];
+    const currentFolderSlot = slotForPreviewFolder(currentSlot, platform, targetFolder);
+    const adjustments = [...(currentFolderSlot.adjustments || [])];
     while (adjustments.length <= sourceIndex) adjustments.push({ ...DEFAULT_ADJUSTMENT });
     adjustments[sourceIndex] = normalizeAdjustment(adjustment);
-    const updatedSlot = { ...currentSlot, adjustments, logo_color: logoColor };
+    const normalizedAdjustments = adjustments.map((item) => normalizeAdjustment(item));
+    const foldersToUpdate = platform === "jd" && syncJdFolders
+      ? previewFoldersForSlot(currentSlot, platform)
+      : [targetFolder];
+    const baseAdjustments = (currentSlot.adjustments || [])
+      .map((item) => normalizeAdjustment(item));
+    const folderAdjustments = { ...(currentSlot.folder_adjustments || {}) };
+    if (platform === "jd") {
+      previewFoldersForSlot(currentSlot, platform).forEach((folder) => {
+        if (!folderAdjustments[folder]) {
+          folderAdjustments[folder] = baseAdjustments.map((item) => ({ ...item }));
+        }
+      });
+    }
+    foldersToUpdate.forEach((folder) => {
+      folderAdjustments[folder] = normalizedAdjustments.map((item) => ({ ...item }));
+    });
+    const updatedSlot: Slot = {
+      ...currentSlot,
+      adjustments: targetFolder === "800" || syncJdFolders
+        ? normalizedAdjustments
+        : currentSlot.adjustments,
+      folder_adjustments: platform === "jd" ? folderAdjustments : currentSlot.folder_adjustments,
+      logo_color: logoColor
+    };
     setSlots((current) => {
       const nextSlots = current.map((slot) => slot.file_name === fileName ? updatedSlot : slot);
       slotsRef.current = nextSlots;
@@ -2811,7 +4136,7 @@ export default function VipOrganizer() {
     if (previewUrl) {
       const previewKey = slotPreviewKey(platform, fileName, targetFolder);
       slotPreviewSignaturesRef.current[previewKey] = slotPreviewSignature(
-        updatedSlot,
+        slotForPreviewFolder(updatedSlot, platform, targetFolder),
         organizerProductInfo(),
         platform,
         targetFolder
@@ -2819,7 +4144,7 @@ export default function VipOrganizer() {
       setSlotPreviews((current) => ({ ...current, [previewKey]: previewUrl }));
     }
     setAdjustmentEditor(null);
-    setMessage(`${fileName} 的裁剪、缩放和位置已保存`);
+    setMessage("");
   }
 
   function selectedAsset(id?: number) {
@@ -2862,7 +4187,7 @@ export default function VipOrganizer() {
       anchor.click();
       anchor.remove();
       const platformName = platform === "jd" ? "京东" : "唯品会";
-      setMessage(result.missing.length ? `ZIP 已下载，共 ${result.generated_count} 张，缺少：${result.missing.join("、")}` : `${platformName}套图 ZIP 已开始下载。`);
+      setMessage(result.missing.length ? `ZIP 已下载，共 ${result.generated_count} 张，缺少：${result.missing.join("、")}` : `${platformName}套图 ZIP 已开始下载`);
     } catch (error: any) {
       setMessage(error.message);
     } finally {
@@ -2892,7 +4217,7 @@ export default function VipOrganizer() {
       setSlotPreviews({ ...cached.previews });
       slotPreviewSignaturesRef.current = { ...cached.signatures };
       setPlatform(nextPlatform);
-      setMessage(`已切换到${nextPlatform === "jd" ? "京东" : "唯品会"}，已恢复该平台预览；缺失项会单独补充。`);
+      setMessage(`已切换到${nextPlatform === "jd" ? "京东" : "唯品会"}，已恢复该平台预览；缺失项会单独补充`);
       window.requestAnimationFrame(() => window.scrollTo({ top: scrollTop, left: 0, behavior: "auto" }));
       return;
     }
@@ -2944,7 +4269,12 @@ export default function VipOrganizer() {
   }
 
   const activeEditorSlot = adjustmentEditor
-    ? slots.find((slot) => slot.file_name === adjustmentEditor.fileName)
+    ? (() => {
+      const slot = slots.find((item) => item.file_name === adjustmentEditor.fileName);
+      return slot
+        ? slotForPreviewFolder(slot, platform, adjustmentEditor.targetFolder)
+        : undefined;
+    })()
     : undefined;
   const activeEditorAsset = activeEditorSlot && adjustmentEditor
     ? selectedAsset(activeEditorSlot.image_ids[adjustmentEditor.sourceIndex])
@@ -2979,14 +4309,17 @@ export default function VipOrganizer() {
 
   return (
     <section className="page organizer-page">
-      <header className="page-header">
+      <header className="page-header organizer-page-header">
         <h1>自动化整理</h1>
       </header>
 
       <section className="panel organizer-source-panel">
-        <div className="section-title-row">
-          <h2>1. 上传素材</h2>
-          <div className="button-row">
+        <div className="organizer-step-header">
+          <div className="organizer-step-heading">
+            <h2>1. 上传素材</h2>
+            <p>上传商品原图和模特图，吊牌图可按需补充</p>
+          </div>
+          <div className="button-row organizer-step-actions">
             {sessionId && <button disabled={busy} onClick={startNewSession}><RefreshCw size={18} />开始新一轮</button>}
             <button className="primary" disabled={busy || !products.length} onClick={() => analyze()}>
               {busy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}自动整理初稿
@@ -2994,17 +4327,20 @@ export default function VipOrganizer() {
           </div>
         </div>
         <div className="organizer-upload-columns">
-          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onPreview={setPreview} />
-          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onPreview={setPreview} />
-          <UploadSection title="吊牌图" hint="可选" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onPreview={setPreview} />
+          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
+          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
+          <UploadSection title="吊牌图" hint="可选 · 支持 Ctrl+V" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
         </div>
       </section>
 
       {slots.length > 0 && <>
         <section className="panel organizer-analysis-panel">
-          <div className="organizer-analysis-header">
-            <h2>2. 素材分析</h2>
-            <div className="organizer-analysis-toolbar">
+          <div className="organizer-step-header organizer-analysis-header">
+            <div className="organizer-step-heading">
+              <h2>2. 素材分析</h2>
+              <p>核对自动分类和细节标签，确认后可按最新结果重新整理</p>
+            </div>
+            <div className="organizer-analysis-toolbar organizer-step-actions">
               <label className="organizer-api-select">
                 <span>图文分析 API</span>
                 <select value={analysisConfigId} onChange={(event) => setAnalysisConfigId(Number(event.target.value) || "")}>
@@ -3060,12 +4396,17 @@ export default function VipOrganizer() {
         </section>
 
         <section className="panel organizer-info-panel">
-          <div className="section-title-row"><h2>3. 商品信息</h2></div>
+          <div className="organizer-step-header organizer-step-header-simple">
+            <div className="organizer-step-heading">
+              <h2>3. 商品信息</h2>
+              <p>尺寸统一填写毫米（mm），用于产品信息图和尺寸对比图</p>
+            </div>
+          </div>
           <div className="organizer-info-grid">
             <label>商品名称<input value={info.product_name} onChange={(event) => setInfo({ ...info, product_name: event.target.value })} /></label>
-            <label>长（cm）<input inputMode="decimal" placeholder="例如：20" value={info.product_length} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
-            <label>宽（cm）<input inputMode="decimal" placeholder="例如：8" value={info.product_width} onChange={(event) => setInfo({ ...info, product_width: event.target.value })} /></label>
-            <label>高（cm）<input inputMode="decimal" placeholder="例如：14" value={info.product_height} onChange={(event) => setInfo({ ...info, product_height: event.target.value })} /></label>
+            <label>长（mm）<input inputMode="decimal" placeholder="例如：200" value={info.product_length} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
+            <label>宽（mm）<input inputMode="decimal" placeholder="例如：80" value={info.product_width} onChange={(event) => setInfo({ ...info, product_width: event.target.value })} /></label>
+            <label>高（mm）<input inputMode="decimal" placeholder="例如：140" value={info.product_height} onChange={(event) => setInfo({ ...info, product_height: event.target.value })} /></label>
             <label>主要材质<input value={info.main_material} onChange={(event) => setInfo({ ...info, main_material: event.target.value })} /></label>
             <label>里料材质<input value={info.lining_material} onChange={(event) => setInfo({ ...info, lining_material: event.target.value })} /></label>
             <label>包型背法<input placeholder="例如：单肩/斜挎" value={info.wearing_method} onChange={(event) => setInfo({ ...info, wearing_method: event.target.value })} /></label>
@@ -3104,7 +4445,13 @@ export default function VipOrganizer() {
               </button>
             </div>
           </div>
-          <div className="section-title-row"><h2>4. 检查{platform === "jd" ? "京东7个输出位置" : "15个输出位置"}</h2>{(previewBusy || platformSwitching || platformRegenerating) && <span className="organizer-preview-status"><LoaderCircle className="spin" size={16} />{platformSwitching ? "正在切换输出平台" : platformRegenerating ? "正在重新生成当前平台" : "正在更新成品预览"}</span>}</div>
+          <div className="organizer-step-header">
+            <div className="organizer-step-heading">
+              <h2>4. 检查{platform === "jd" ? "京东 7 个" : "15 个"}输出位置</h2>
+              <p>逐项确认成品、来源图片和调整结果后再导出</p>
+            </div>
+            {(previewBusy || platformSwitching || platformRegenerating) && <span className="organizer-preview-status organizer-step-actions"><LoaderCircle className="spin" size={16} />{platformSwitching ? "正在切换输出平台" : platformRegenerating ? "正在重新生成当前平台" : "正在更新成品预览"}</span>}
+          </div>
           <div className="organizer-preview-groups">
             {previewGroups.map((group) => <section className="organizer-preview-group" key={group.folder}>
               {group.label && <header className="organizer-preview-group-header">
@@ -3114,9 +4461,8 @@ export default function VipOrganizer() {
               <div className="organizer-slot-grid">
                 {group.slots.map((slot) => {
                   const count = slot.file_name === "606.jpg" ? 4 : 1;
-                  const isLockedJdFront = platform === "jd" && slot.file_name === "5.jpg";
                   const isLockedInfoFront = platform === "vip" && slot.file_name === "401.jpg";
-                  const editableSource = !isLockedJdFront && !isLockedInfoFront && slot.kind !== "generated";
+                  const editableSource = !isLockedInfoFront && slot.kind !== "generated";
                   const previewKey = slotPreviewKey(platform, slot.file_name, group.folder);
                   const dimensionsReady = jdComparisonDimensionsReady(organizerProductInfo());
                   const outputReady = !((platform === "jd" && slot.file_name === "5.jpg")
@@ -3129,19 +4475,33 @@ export default function VipOrganizer() {
                       style={{ aspectRatio: `${outputSize.width} / ${outputSize.height}` }}
                     >
                       {renderedPreview
-                        ? <button type="button" onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} onError={() => {
-                            setSlotPreviews((current) => {
-                              const next = { ...current };
-                              delete next[previewKey];
-                              return next;
-                            });
-                            delete slotPreviewSignaturesRef.current[previewKey];
-                            setPreviewRetryVersion((current) => current + 1);
-                          }} /></button>
+                        ? <>
+                          <button className="organizer-slot-edit-preview" type="button" onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} onError={() => {
+                              setSlotPreviews((current) => {
+                                const next = { ...current };
+                                delete next[previewKey];
+                                return next;
+                              });
+                              delete slotPreviewSignaturesRef.current[previewKey];
+                              setPreviewRetryVersion((current) => current + 1);
+                            }} /></button>
+                          <button
+                            className="organizer-slot-view-preview"
+                            type="button"
+                            title={`查看 ${slot.file_name} 大图`}
+                            aria-label={`查看 ${slot.file_name} 放大图片`}
+                            onClick={() => setPreview(renderedPreview)}
+                          >
+                            <Eye size={18} />
+                          </button>
+                        </>
                         : <div className="generated-placeholder"><FileImage size={30} /><span>{!outputReady ? "请先填写商品长和高" : previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                     </div>
                     <div className="organizer-slot-body">
-                      <div className="organizer-slot-title"><strong>{slot.file_name}</strong><span>{slot.title}</span><small>{outputSize.width}×{outputSize.height}</small></div>
+                      <div className="organizer-slot-title">
+                        <span className="organizer-slot-title-text"><strong>{slot.file_name}</strong><span title={slot.title}>{slotDisplayTitle(platform, slot.file_name, slot.title)}</span></span>
+                        <small>{outputSize.width}×{outputSize.height}</small>
+                      </div>
                       {count === 1 && platform === "jd" && slot.file_name === "5.jpg" ? <div className="organizer-object-adjustments" role="group" aria-label="尺寸对比图调整对象">
                         <button
                           type="button"
@@ -3161,10 +4521,10 @@ export default function VipOrganizer() {
                         disabled={!slot.image_ids[0] || !outputReady}
                         onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)}
                       ><Crop size={16} />调整成品</button>}
-                      {(isLockedJdFront || isLockedInfoFront) && <label>来源图片
+                      {isLockedInfoFront && <label>来源图片
                         <span className="organizer-source-picker">
-                          <select value={slot.image_ids[0] || ""} disabled aria-label={isLockedInfoFront ? "401固定优先使用透明正面图" : "京东5固定使用正面主图"}>
-                            <option value={slot.image_ids[0] || ""}>{selectedAsset(slot.image_ids[0]) ? assetOptionLabel(selectedAsset(slot.image_ids[0]), "product") : isLockedInfoFront ? "透明正面图" : "正面主图"}</option>
+                          <select value={slot.image_ids[0] || ""} disabled aria-label="401固定优先使用透明正面图">
+                            <option value={slot.image_ids[0] || ""}>{selectedAsset(slot.image_ids[0]) ? assetOptionLabel(selectedAsset(slot.image_ids[0]), "product") : "透明正面图"}</option>
                           </select>
                         </span>
                       </label>}
@@ -3196,24 +4556,22 @@ export default function VipOrganizer() {
             </section>)}
           </div>
           <div className="organizer-export-bar">
-            <span><CheckCircle2 size={18} />导出前请确认所有低可信度项目</span>
             <button className="primary" disabled={busy || previewBusy} onClick={exportZip}>{busy ? <LoaderCircle className="spin" size={18} /> : <Download size={18} />}下载 ZIP</button>
           </div>
         </section>
       </>}
 
-      {message && <div className="alert warning">{message}</div>}
-      {preview && <div className="image-modal" role="dialog" aria-modal="true" aria-label="成品图片预览" onClick={() => setPreview(null)}>
-        <button className="image-modal-close" type="button" onClick={() => setPreview(null)} aria-label="关闭预览"><X size={22} /></button>
-        <img src={preview} alt="图片预览" onClick={(event) => event.stopPropagation()} />
-      </div>}
+      {message && <div className="alert warning organizer-status-message" role="status">{message}</div>}
+      {preview && <ZoomableImagePreview url={preview} onClose={() => setPreview(null)} />}
       {adjustmentEditor && activeEditorSlot && activeEditorAsset && <SlotAdjustmentEditor
         key={`${platform}:${adjustmentEditor.targetFolder}:${activeEditorSlot.file_name}:${adjustmentEditor.sourceIndex}:${adjustmentEditor.targetObject}:${activeEditorAsset.id}`}
         sessionId={sessionId}
         slot={activeEditorSlot}
         sourceIndex={adjustmentEditor.sourceIndex}
+        sourceImageId={activeEditorAsset.id}
         sourceUrl={activeEditorAsset.original_url || activeEditorAsset.preview_url}
         compositePrimaryUrl={activeEditorPrimaryAsset?.original_url || activeEditorPrimaryAsset?.preview_url}
+        compositePrimaryImageId={activeEditorPrimaryAsset?.id}
         displaySourceUrl={adjustmentEditor.targetObject === "phone" ? "/organizer-assets/iphone_reference.png" : undefined}
         initialPreview={slotPreviews[slotPreviewKey(platform, activeEditorSlot.file_name, adjustmentEditor.targetFolder)]}
         productInfo={organizerProductInfo()}
@@ -3221,13 +4579,14 @@ export default function VipOrganizer() {
         targetFolder={adjustmentEditor.targetFolder}
         initialMoveTarget={adjustmentEditor.targetObject}
         onClose={() => setAdjustmentEditor(null)}
-        onSave={(adjustment, logoColor, previewUrl) => saveSlotAdjustment(
+        onSave={(adjustment, logoColor, previewUrl, syncJdFolders) => saveSlotAdjustment(
           activeEditorSlot.file_name,
           adjustmentEditor.sourceIndex,
           adjustmentEditor.targetFolder,
           adjustment,
           logoColor,
-          previewUrl
+          previewUrl,
+          syncJdFolders
         )}
       />}
     </section>

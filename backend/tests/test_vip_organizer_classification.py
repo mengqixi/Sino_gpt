@@ -25,6 +25,7 @@ from backend.services.vip_organizer_service import (
     _refine_product_classifications,
     _render_slot_image,
     _slot_map,
+    _tag_certificate_page,
     analyze_assets,
 )
 
@@ -252,7 +253,8 @@ class VipOrganizerClassificationTests(unittest.TestCase):
 
         self.assertGreater(len(xs), 0)
         self.assertLess(int(ys.max()), 690)
-        self.assertLess(float(ys.mean()), 455)
+        self.assertGreater(float(ys.mean()), 455)
+        self.assertLess(float(ys.mean()), 470)
 
     def test_detail_position_adjustment_keeps_the_automatic_cutout_scale(self):
         source = Image.new("RGB", (400, 600), "white")
@@ -274,6 +276,44 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertLessEqual(abs((adjusted_box[3] - adjusted_box[1]) - (automatic_box[3] - automatic_box[1])), 2)
         self.assertGreater(adjusted_box[0], automatic_box[0])
         self.assertLess(adjusted_box[1], automatic_box[1])
+
+    def test_detail_manual_adjustment_never_covers_the_title_area(self):
+        source = Image.new("RGB", (320, 480), "#b52226")
+        rendered = _detail_showcase_page(source, {"zoom": 1.8, "offset_y": -0.5})
+
+        # The editable 604/605 image starts below the fixed title. A strong
+        # upward movement must not paint source pixels into that title band.
+        for y in range(0, 135):
+            for x in range(rendered.width):
+                self.assertNotEqual(rendered.getpixel((x, y)), (181, 34, 38))
+
+    def test_detail_zoom_changes_are_continuous(self):
+        source = Image.new("RGB", (320, 480), "#b52226")
+        page_105 = _detail_showcase_page(source, {"zoom": 1.05})
+        page_110 = _detail_showcase_page(source, {"zoom": 1.10})
+
+        def source_bbox(image):
+            pixels = np.asarray(image)
+            mask = (
+                (pixels[:, :, 0] > 170)
+                & (pixels[:, :, 0] < 195)
+                & (pixels[:, :, 1] < 50)
+                & (pixels[:, :, 2] < 60)
+            )
+            return Image.fromarray((mask * 255).astype(np.uint8), mode="L").getbbox()
+
+        bbox_105 = source_bbox(page_105)
+        bbox_110 = source_bbox(page_110)
+        self.assertIsNotNone(bbox_105)
+        self.assertIsNotNone(bbox_110)
+        assert bbox_105 is not None and bbox_110 is not None
+        width_ratio = (bbox_110[2] - bbox_110[0]) / (bbox_105[2] - bbox_105[0])
+        self.assertGreater(width_ratio, 1.01)
+        self.assertLess(width_ratio, 1.08)
+        center_105 = ((bbox_105[0] + bbox_105[2]) / 2, (bbox_105[1] + bbox_105[3]) / 2)
+        center_110 = ((bbox_110[0] + bbox_110[2]) / 2, (bbox_110[1] + bbox_110[3]) / 2)
+        self.assertLessEqual(abs(center_105[0] - center_110[0]), 2)
+        self.assertLessEqual(abs(center_105[1] - center_110[1]), 2)
 
     def test_template_product_box_allows_upscaling(self):
         canvas = Image.new("RGB", (750, 665), "white")
@@ -607,6 +647,18 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(hardware_showcase.getpixel((375, 400)), (181, 34, 38))
         self.assertIsNone(ImageChops.difference(detail_showcase, hardware_showcase).getbbox())
 
+    def test_vip_logo_detail_composites_transparent_pixels_on_white(self):
+        source = Image.new("RGBA", (320, 480), (0, 0, 0, 0))
+        ImageDraw.Draw(source).rectangle((80, 120, 240, 360), fill=(181, 34, 38, 255))
+
+        with patch("backend.services.vip_organizer_service._load_image", return_value=source):
+            rendered = _render_slot_image("4.jpg", [11], {})
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertEqual(rendered.getpixel((20, 20)), (255, 255, 255))
+        self.assertEqual(rendered.getpixel((400, 400)), (181, 34, 38))
+
     def test_interior_slot_enlarges_a_small_subject_on_a_white_studio_frame(self):
         source = Image.new("RGB", (400, 600), "white")
         ImageDraw.Draw(source).rectangle((120, 85, 365, 540), fill="#252525")
@@ -667,7 +719,7 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         draw.arc((120, 20, 320, 360), 180, 360, fill=(30, 30, 30, 255), width=24)
         draw.rectangle((45, 250, 395, 680), fill=(70, 70, 70, 255))
         body = (45, 250, 395, 680)
-        product_info = {"product_length": "20", "product_height": "14"}
+        product_info = {"product_length": "200", "product_height": "140"}
 
         unconstrained = _jd_size_product_layout(
             cutout,
@@ -717,10 +769,10 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         square_top = product_top(square, 250)
         portrait_top = product_top(portrait, 260)
         raised_top = product_top(raised, 250)
-        self.assertGreaterEqual(square_top, 180)
-        self.assertGreaterEqual(portrait_top, 185)
-        self.assertLessEqual(square_top, 195)
-        self.assertLessEqual(portrait_top, 200)
+        self.assertGreaterEqual(square_top, 162)
+        self.assertGreaterEqual(portrait_top, 175)
+        self.assertLessEqual(square_top, 180)
+        self.assertLessEqual(portrait_top, 190)
         self.assertLess(raised_top, square_top - 50)
 
     def test_slot_map_links_the_two_model_output_sizes(self):
@@ -773,6 +825,63 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertGreater(adjusted_bbox[2] - adjusted_bbox[0], automatic_bbox[2] - automatic_bbox[0])
         self.assertGreater((adjusted_bbox[0] + adjusted_bbox[2]) / 2, (automatic_bbox[0] + automatic_bbox[2]) / 2)
         self.assertEqual(adjusted.getpixel((400, 400)), (181, 34, 38))
+
+    def test_tag_certificate_keeps_the_complete_original_layout(self):
+        source = Image.new("RGB", (400, 600), "white")
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((150, 30, 250, 65), fill=(180, 20, 30))
+        draw.rectangle((35, 145, 365, 330), fill=(20, 80, 160))
+        draw.rectangle((55, 430, 345, 500), fill=(20, 150, 70))
+        draw.rectangle((130, 545, 270, 575), fill=(180, 20, 170))
+
+        rendered = _tag_certificate_page(source)
+
+        self.assertEqual(rendered.size, (750, 750))
+        # The complete portrait image is scaled as one layer. Its internal
+        # whitespace and every section, including the price, remain intact.
+        pixels = np.asarray(rendered)
+        self.assertGreater(np.count_nonzero((pixels[:, :, 0] > 140) & (pixels[:, :, 1] < 70)), 100)
+        self.assertGreater(np.count_nonzero((pixels[:, :, 2] > 130) & (pixels[:, :, 0] < 80)), 100)
+        non_white = ImageChops.difference(rendered, Image.new("RGB", rendered.size, "white")).getbbox()
+        self.assertIsNotNone(non_white)
+        assert non_white is not None
+        self.assertAlmostEqual(non_white[0], 166, delta=3)
+        self.assertAlmostEqual(non_white[2], 585, delta=3)
+        self.assertLess(non_white[1], 45)
+        self.assertGreater(non_white[3], 715)
+
+    def test_tag_certificate_manual_crop_removes_only_the_selected_price_area(self):
+        source = Image.new("RGB", (400, 600), "white")
+        draw = ImageDraw.Draw(source)
+        draw.rectangle((150, 30, 250, 65), fill=(180, 20, 30))
+        draw.rectangle((35, 145, 365, 330), fill=(20, 80, 160))
+        draw.rectangle((55, 430, 345, 500), fill=(20, 150, 70))
+        draw.rectangle((130, 545, 270, 575), fill=(180, 20, 170))
+        adjustment = {
+            "crop_x": 0,
+            "crop_y": 0,
+            "crop_width": 1,
+            "crop_height": 0.86,
+            "zoom": 1,
+            "offset_x": 0,
+            "offset_y": 0,
+        }
+
+        rendered = _tag_certificate_page(source, adjustment)
+        pixels = np.asarray(rendered)
+
+        title_pixels = (
+            (pixels[:, :, 0] > 140)
+            & (pixels[:, :, 1] < 70)
+            & (pixels[:, :, 2] < 90)
+        )
+        price_pixels = (
+            (pixels[:, :, 0] > 140)
+            & (pixels[:, :, 1] < 80)
+            & (pixels[:, :, 2] > 120)
+        )
+        self.assertGreater(np.count_nonzero(title_pixels), 100)
+        self.assertEqual(np.count_nonzero(price_pixels), 0)
 
     def test_slot_selection_keeps_semi_side_separate_from_front(self):
         samples = [

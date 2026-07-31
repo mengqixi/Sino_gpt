@@ -1,17 +1,41 @@
 import base64
+import ctypes
+import gc
+import os
 import re
 import uuid
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 from PIL import Image, ImageFilter
 
 from ..config import RESULT_DIR
 from .file_service import public_url_for
+from .heavy_task_service import run_heavy_task
 
 
 SEGMENTATION_BACKEND = "opencv"
+_RECOLOR_LOCK = Lock()
+
+
+@contextmanager
+def _recolor_job_slot():
+    """Keep memory-heavy image operations serial on a low-memory server."""
+    with _RECOLOR_LOCK:
+        try:
+            yield
+        finally:
+            gc.collect()
+            if os.name == "posix":
+                try:
+                    trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+                    if trim is not None:
+                        trim(0)
+                except (AttributeError, OSError):
+                    pass
 
 
 def _require_cv2():
@@ -340,21 +364,26 @@ def _hardware_mask(image: Image.Image, subject: Image.Image) -> Image.Image:
     return Image.fromarray(clean, mode="L").filter(ImageFilter.GaussianBlur(0.8))
 
 
-def analyze_recolor_masks(image_path: str) -> dict:
-    image = _load_rgb(image_path)
-    subject = _subject_mask(image)
-    hardware = _hardware_mask(image, subject)
-    overlay = image.convert("RGBA")
-    subject_overlay = Image.new("RGBA", image.size, (37, 120, 90, 80))
-    hardware_overlay = Image.new("RGBA", image.size, (244, 183, 64, 135))
-    overlay = Image.composite(subject_overlay, overlay, subject)
-    overlay = Image.composite(hardware_overlay, overlay, hardware)
-    return {
-        "segmentation_backend": SEGMENTATION_BACKEND,
-        "subject_mask": _mask_to_data_url(subject),
-        "protect_mask": _mask_to_data_url(hardware),
-        "overlay_preview": _image_to_data_url(overlay),
-    }
+def _analyze_recolor_masks(image_path: str) -> dict:
+    with _recolor_job_slot():
+        image = _load_rgb(image_path)
+        working = image.copy()
+        working.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        working_subject = _subject_mask(working)
+        working_hardware = _hardware_mask(working, working_subject)
+        subject = working_subject.resize(image.size, Image.Resampling.BILINEAR)
+        hardware = working_hardware.resize(image.size, Image.Resampling.BILINEAR)
+        overlay = image.convert("RGBA")
+        subject_overlay = Image.new("RGBA", image.size, (37, 120, 90, 80))
+        hardware_overlay = Image.new("RGBA", image.size, (244, 183, 64, 135))
+        overlay = Image.composite(subject_overlay, overlay, subject)
+        overlay = Image.composite(hardware_overlay, overlay, hardware)
+        return {
+            "segmentation_backend": SEGMENTATION_BACKEND,
+            "subject_mask": _mask_to_data_url(subject),
+            "protect_mask": _mask_to_data_url(hardware),
+            "overlay_preview": _image_to_data_url(overlay),
+        }
 
 
 def _local_selection_mask(image: Image.Image, box: tuple[int, int, int, int]) -> Image.Image:
@@ -439,28 +468,29 @@ def _local_selection_mask(image: Image.Image, box: tuple[int, int, int, int]) ->
     return Image.fromarray(selected, mode="L")
 
 
-def select_hardware_region(
+def _select_hardware_region(
     image_path: str,
     protect_mask: str,
     box: tuple[int, int, int, int],
     action: str = "add",
 ) -> dict:
-    image = _load_rgb(image_path)
-    current = np.array(_data_url_to_mask(protect_mask, image.size))
-    selected_image = _local_selection_mask(image, box)
-    selected = np.array(selected_image)
-    if action == "remove":
-        merged = np.where(selected > 24, 0, current)
-    elif action == "add":
-        merged = np.maximum(current, selected)
-    else:
-        raise ValueError("智能框选操作必须是 add 或 remove")
-    merged_image = Image.fromarray(merged.astype(np.uint8), mode="L")
-    return {
-        "protect_mask": _mask_to_data_url(merged_image),
-        "selection_mask": _mask_to_data_url(selected_image),
-        "selected_pixels": int(np.count_nonzero(selected > 24)),
-    }
+    with _recolor_job_slot():
+        image = _load_rgb(image_path)
+        current = np.array(_data_url_to_mask(protect_mask, image.size))
+        selected_image = _local_selection_mask(image, box)
+        selected = np.array(selected_image)
+        if action == "remove":
+            merged = np.where(selected > 24, 0, current)
+        elif action == "add":
+            merged = np.maximum(current, selected)
+        else:
+            raise ValueError("智能框选操作必须是 add 或 remove")
+        merged_image = Image.fromarray(merged.astype(np.uint8), mode="L")
+        return {
+            "protect_mask": _mask_to_data_url(merged_image),
+            "selection_mask": _mask_to_data_url(selected_image),
+            "selected_pixels": int(np.count_nonzero(selected > 24)),
+        }
 
 
 def render_recolor_image(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> Image.Image:
@@ -485,17 +515,87 @@ def render_recolor_image(image_path: str, target_color: str, subject_mask: str, 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), mode="RGB")
 
 
-def preview_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> dict:
-    result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
-    return {"preview_image": _image_to_data_url(result_image)}
+def _preview_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> dict:
+    with _recolor_job_slot():
+        result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
+        return {"preview_image": _image_to_data_url(result_image)}
 
 
-def apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
-    result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
-    RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    output = RESULT_DIR / f"recolor_{uuid.uuid4().hex[:12]}.png"
-    result_image.save(output)
-    return str(output)
+def _apply_recolor(image_path: str, target_color: str, subject_mask: str, protect_mask: str) -> str:
+    with _recolor_job_slot():
+        result_image = render_recolor_image(image_path, target_color, subject_mask, protect_mask)
+        RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        output = RESULT_DIR / f"recolor_{uuid.uuid4().hex[:12]}.png"
+        result_image.save(output)
+        return str(output)
+
+
+def analyze_recolor_masks(image_path: str) -> dict:
+    return run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "analyze",
+            "image_path": image_path,
+        },
+        timeout=300,
+    )
+
+
+def select_hardware_region(
+    image_path: str,
+    protect_mask: str,
+    box: tuple[int, int, int, int],
+    action: str = "add",
+) -> dict:
+    return run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "select",
+            "image_path": image_path,
+            "protect_mask": protect_mask,
+            "box": list(box),
+            "action": action,
+        },
+        timeout=300,
+    )
+
+
+def preview_recolor(
+    image_path: str,
+    target_color: str,
+    subject_mask: str,
+    protect_mask: str,
+) -> dict:
+    return run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "preview",
+            "image_path": image_path,
+            "target_color": target_color,
+            "subject_mask": subject_mask,
+            "protect_mask": protect_mask,
+        },
+        timeout=300,
+    )
+
+
+def apply_recolor(
+    image_path: str,
+    target_color: str,
+    subject_mask: str,
+    protect_mask: str,
+) -> str:
+    return str(run_heavy_task(
+        "backend.services.recolor_worker",
+        {
+            "operation": "apply",
+            "image_path": image_path,
+            "target_color": target_color,
+            "subject_mask": subject_mask,
+            "protect_mask": protect_mask,
+        },
+        timeout=300,
+    ))
 
 
 def result_payload(path: str) -> dict:

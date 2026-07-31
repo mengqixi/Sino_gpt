@@ -8,14 +8,19 @@ from pydantic import BaseModel, Field
 from ..services.vip_organizer_service import (
     analysis_config_status,
     asset_original,
+    asset_organizer_layer,
+    asset_organizer_layer_info,
     asset_thumbnail,
     analyze_assets,
     analyze_assets_with_api,
+    delete_asset,
     delete_session,
     export_package,
     export_file,
     export_zip,
     preview_file,
+    prepare_product_cutout,
+    prepared_cutout_file,
     render_previews,
     render_slot_preview,
     save_analysis_config,
@@ -90,6 +95,38 @@ def upload_assets(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.delete("/assets/{image_id}")
+def remove_asset(image_id: int, session_id: str):
+    try:
+        delete_asset(session_id, image_id)
+        return {"deleted": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/prepare-cutout")
+def prepare_cutout(session_id: str = Form(...), file: UploadFile = File(...)):
+    try:
+        return prepare_product_cutout(session_id, file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/prepared/{session_id}/{prepared_id}/{variant}")
+def get_prepared_cutout(session_id: str, prepared_id: str, variant: str):
+    try:
+        path = prepared_cutout_file(session_id, prepared_id, variant)
+        download = variant == "download"
+        return FileResponse(
+            path,
+            media_type="image/png",
+            filename="product-transparent.png" if download else None,
+            headers={"Cache-Control": "private, no-store"},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/assets/{image_id}/thumbnail")
 def get_asset_thumbnail(image_id: int):
     try:
@@ -104,6 +141,49 @@ def get_asset_original(image_id: int):
     try:
         path = asset_original(image_id)
         return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/assets/{image_id}/organizer-layer")
+def get_asset_organizer_layer(
+    image_id: int,
+    crop_x: float = 0.0,
+    crop_y: float = 0.0,
+    crop_width: float = 1.0,
+    crop_height: float = 1.0,
+):
+    try:
+        path = asset_organizer_layer(image_id, {
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_width": crop_width,
+            "crop_height": crop_height,
+        })
+        return FileResponse(
+            path,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/assets/{image_id}/organizer-layer-info")
+def get_asset_organizer_layer_info(
+    image_id: int,
+    crop_x: float = 0.0,
+    crop_y: float = 0.0,
+    crop_width: float = 1.0,
+    crop_height: float = 1.0,
+):
+    try:
+        return asset_organizer_layer_info(image_id, {
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_width": crop_width,
+            "crop_height": crop_height,
+        })
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

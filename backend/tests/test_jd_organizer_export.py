@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from backend.services import vip_organizer_service as service
 
@@ -22,7 +22,7 @@ def test_jd_export_uses_separate_800_and_750_folders(tmp_path, monkeypatch):
         for file_name, *_ in service.JD_SLOT_DEFINITIONS
     ]
     session_id = "a" * 32
-    result = service.export_package(session_id, slots, {}, "jd")
+    result = service._export_package(session_id, slots, {}, "jd")
     export_id = result["download_url"].split("/")[-2]
     zip_path = service.export_zip(session_id, export_id)
 
@@ -100,6 +100,82 @@ def test_jd_logo_color_is_stored_per_output_slot():
     assert slot_map["2.jpg"]["logo_color"] == "black"
 
 
+def test_jd_folder_adjustments_are_normalized_and_kept_separately():
+    slot_map = service._slot_map(
+        [
+            {
+                "file_name": "2.jpg",
+                "image_ids": [2],
+                "adjustments": [{"zoom": 1.0}],
+                "folder_adjustments": {
+                    "800": [{"zoom": 1.24, "offset_x": 0.12}],
+                    "750": [{"zoom": 0.91, "offset_y": -0.08}],
+                    "unknown": [{"zoom": 9}],
+                },
+            }
+        ],
+        "jd",
+    )
+
+    slot = slot_map["2.jpg"]
+    assert set(slot["folder_adjustments"]) == {"800", "750"}
+    assert service._slot_adjustments_for_folder(slot, "800")[0]["zoom"] == 1.24
+    assert service._slot_adjustments_for_folder(slot, "800")[0]["offset_x"] == 0.12
+    assert service._slot_adjustments_for_folder(slot, "750")[0]["zoom"] == 0.91
+    assert service._slot_adjustments_for_folder(slot, "750")[0]["offset_y"] == -0.08
+
+
+def test_jd_export_uses_the_adjustments_for_each_target_folder(tmp_path, monkeypatch):
+    captured: dict[str, list[dict]] = {}
+    monkeypatch.setattr(service, "_session_result_dir", lambda _session_id: tmp_path)
+    monkeypatch.setattr(service, "_validate_slot_map", lambda *_args, **_kwargs: None)
+
+    def render_slot(
+        file_name,
+        _image_ids,
+        _product_info,
+        adjustments,
+        _platform,
+        target_folder,
+        _logo_color,
+    ):
+        if file_name == "2.jpg":
+            captured[target_folder] = adjustments
+        return Image.new("RGB", (32, 32), "white")
+
+    monkeypatch.setattr(service, "_render_slot_image", render_slot)
+    slots = [
+        {
+            "file_name": file_name,
+            "image_ids": [1],
+            "adjustments": [{"zoom": 1.0}],
+            **(
+                {
+                    "folder_adjustments": {
+                        "800": [{"zoom": 1.28, "offset_x": 0.11}],
+                        "750": [{"zoom": 0.94, "offset_x": -0.07}],
+                    }
+                }
+                if file_name == "2.jpg"
+                else {}
+            ),
+        }
+        for file_name, *_ in service.JD_SLOT_DEFINITIONS
+    ]
+
+    service._export_package(
+        "a" * 32,
+        slots,
+        {"product_length": "200", "product_height": "140"},
+        "jd",
+    )
+
+    assert captured["800"][0]["zoom"] == 1.28
+    assert captured["800"][0]["offset_x"] == 0.11
+    assert captured["750"][0]["zoom"] == 0.94
+    assert captured["750"][0]["offset_x"] == -0.07
+
+
 def test_jd_logo_detail_fills_the_canvas_without_white_border():
     source = Image.new("RGB", (800, 800), (181, 34, 38))
     with patch.object(service, "_load_image", return_value=source):
@@ -109,6 +185,85 @@ def test_jd_logo_detail_fills_the_canvas_without_white_border():
     assert rendered.size == (800, 800)
     assert rendered.getpixel((2, 400)) == (181, 34, 38)
     assert rendered.getpixel((797, 400)) == (181, 34, 38)
+
+
+def test_jd_logo_detail_manual_offset_moves_the_image_horizontally():
+    source = Image.new("RGB", (800, 800), "white")
+    ImageDraw.Draw(source).rectangle((300, 300, 499, 499), fill="black")
+    with (
+        patch.object(service, "_load_image", return_value=source),
+        patch.object(service, "_draw_jd_elle_logo"),
+    ):
+        automatic = service._render_jd_slot_image("3.jpg", [1], {}, [])
+        moved_left = service._render_jd_slot_image("3.jpg", [1], {}, [{"offset_x": -0.25}])
+        moved_right = service._render_jd_slot_image("3.jpg", [1], {}, [{"offset_x": 0.25}])
+
+    assert automatic is not None
+    assert moved_left is not None
+    assert moved_right is not None
+    assert _dark_pixel_bbox(automatic) == (300, 300, 500, 500)
+    assert _dark_pixel_bbox(moved_left) == (100, 300, 300, 500)
+    assert _dark_pixel_bbox(moved_right) == (500, 300, 700, 500)
+
+
+def test_jd_model_manual_offset_moves_freely_on_both_axes():
+    source = Image.new("RGB", (800, 800), "white")
+    ImageDraw.Draw(source).rectangle((300, 300, 499, 499), fill="black")
+    with patch.object(service, "_draw_jd_elle_logo"):
+        automatic = service._jd_model_page(source, (800, 800), None, with_logo=True)
+        moved = service._jd_model_page(
+            source,
+            (800, 800),
+            {"offset_x": -0.25, "offset_y": -0.25},
+            with_logo=True,
+        )
+
+    assert _dark_pixel_bbox(automatic) == (300, 300, 500, 500)
+    assert _dark_pixel_bbox(moved) == (100, 100, 300, 300)
+
+
+def test_jd_product_first_manual_move_starts_from_automatic_position():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+
+    with (
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_draw_jd_elle_logo"),
+    ):
+        automatic = service._jd_product_page(source, (800, 800), None)
+        moved = service._jd_product_page(source, (800, 800), {"offset_y": -0.01})
+
+    automatic_box = _dark_pixel_bbox(automatic)
+    moved_box = _dark_pixel_bbox(moved)
+    assert moved_box[0] == automatic_box[0]
+    assert moved_box[2] == automatic_box[2]
+    assert -8 <= moved_box[1] - automatic_box[1] <= -4
+    assert -8 <= moved_box[3] - automatic_box[3] <= -4
+
+
+def test_jd_long_handle_product_and_transparent_slots_are_lifted():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+
+    with (
+        patch.object(service, "_load_image", return_value=source),
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_draw_jd_elle_logo"),
+    ):
+        product = service._render_jd_slot_image("2.jpg", [1], {}, [])
+        transparent = service._render_jd_slot_image("透明.png", [1], {}, [])
+
+    assert product is not None
+    assert transparent is not None
+    product_box = _dark_pixel_bbox(product)
+    transparent_box = transparent.getchannel("A").getbbox()
+    assert transparent_box is not None
+    assert 168 <= product_box[1] <= 175
+    assert (transparent_box[1] + transparent_box[3]) / 2 < (170 + 710) / 2
 
 
 def test_jd_interior_detail_fills_the_canvas_without_white_border():
@@ -167,15 +322,16 @@ def test_jd_shape_profiles_cover_extreme_and_common_handbag_proportions():
 
 def test_jd_phone_comparison_waits_for_length_and_height():
     assert not service._jd_size_dimensions_ready({})
-    assert not service._jd_size_dimensions_ready({"product_length": "20"})
-    assert service._jd_size_dimensions_ready({"product_length": "20", "product_height": "14"})
+    assert not service._jd_size_dimensions_ready({"product_length": "200"})
+    assert service._jd_size_dimensions_ready({"product_length": "200", "product_height": "140"})
 
 
 def test_vip_info_page_waits_for_length_and_height_and_formats_mm():
     assert not service._vip_info_ready({})
-    assert not service._vip_info_ready({"product_length": "19.5"})
-    assert service._vip_info_ready({"product_length": "19.5", "product_height": "14"})
-    assert service._dimension_mm("19.5") == "195mm"
+    assert not service._vip_info_ready({"product_length": "195"})
+    assert service._vip_info_ready({"product_length": "195", "product_height": "140"})
+    assert service._dimension_mm("195") == "195mm"
+    assert service._dimension_mm("19.5cm") == "195mm"
     assert service._dimension_mm("163mm") == "163mm"
 
 
@@ -321,27 +477,279 @@ def test_vip_info_product_and_rulers_share_zoom_and_movement():
     assert adjusted_width["text"] != base_width["text"]
 
 
-def test_vip_info_centers_the_bag_body_instead_of_the_handle_layer():
+def test_vip_info_rulers_start_with_one_shared_gap():
+    body = (360.0, 280.0, 560.0, 470.0)
+    ruler = service._info_ruler_geometry(body)
+    width_ruler = service._info_width_ruler_geometry(body)
+    width_start = width_ruler["segments"][0][0]
+
+    height_gap = ruler["left"] - ruler["vertical_x"]
+    length_gap = ruler["horizontal_y"] - ruler["bottom"]
+    width_gap = round(((width_start[0] - body[2]) ** 2 + (width_start[1] - body[3]) ** 2) ** 0.5)
+
+    assert height_gap == 34
+    assert length_gap == 34
+    assert width_gap == 34
+
+
+def test_vip_info_ruler_gaps_expand_with_linked_product_zoom():
+    body = (360.0, 280.0, 560.0, 470.0)
+    gap_scale = 1.25
+    ruler = service._info_ruler_geometry(body, gap_scale)
+    width_ruler = service._info_width_ruler_geometry(
+        body,
+        {"product_ruler_gap_scale": gap_scale},
+    )
+    width_start = width_ruler["segments"][0][0]
+
+    height_gap = ruler["left"] - ruler["vertical_x"]
+    length_gap = ruler["horizontal_y"] - ruler["bottom"]
+    width_gap = round(((width_start[0] - body[2]) ** 2 + (width_start[1] - body[3]) ** 2) ** 0.5)
+
+    expected_gap = 34 * gap_scale
+    assert abs(height_gap - expected_gap) <= 1
+    assert abs(length_gap - expected_gap) <= 1
+    assert abs(width_gap - expected_gap) <= 1
+
+
+def test_vip_info_enlarged_rulers_never_fold_back_into_product():
+    body = (80.0, 180.0, 690.0, 590.0)
+    gap_scale = 2.0
+    ruler = service._info_ruler_geometry(body, gap_scale)
+    width_ruler = service._info_width_ruler_geometry(
+        body,
+        {"product_ruler_gap_scale": gap_scale},
+    )
+    width_start = width_ruler["segments"][0][0]
+
+    assert ruler["horizontal_y"] > body[3]
+    assert ruler["vertical_x"] < body[0]
+    assert width_start[0] > body[2]
+    assert width_start[1] > body[3]
+
+
+def test_vip_info_rulers_use_calibrated_body_insets():
+    body = (360.4, 280.4, 559.6, 469.6)
+
+    ruler = service._info_ruler_geometry(body)
+
+    assert ruler["top"] == round(body[1] - 5)
+    assert ruler["bottom"] == round(body[3] - 9)
+    assert service.INFO_HEIGHT_RULER_SHIFT_Y == 5
+
+
+def test_vip_info_width_ruler_stays_rigid_after_repeated_adjustments():
+    body = (360.0, 280.0, 560.0, 470.0)
+    geometry = service._info_width_ruler_geometry(
+        body,
+        {
+            "product_ruler_group_scale": 1.18,
+            "product_ruler_group_offset_x": -0.12,
+            "product_ruler_group_offset_y": 0.09,
+            "width_ruler_scale": 1.7,
+            "width_ruler_offset_x": 0.16,
+            "width_ruler_offset_y": -0.11,
+        },
+        product_center=(500.0, 390.0),
+    )
+    main, start_cap, end_cap = geometry["segments"]
+    start_cap_center = (
+        (start_cap[0][0] + start_cap[1][0]) / 2,
+        (start_cap[0][1] + start_cap[1][1]) / 2,
+    )
+    end_cap_center = (
+        (end_cap[0][0] + end_cap[1][0]) / 2,
+        (end_cap[0][1] + end_cap[1][1]) / 2,
+    )
+    main_center = (
+        (main[0][0] + main[1][0]) / 2,
+        (main[0][1] + main[1][1]) / 2,
+    )
+    text_distance = (
+        (geometry["text"][0] - main_center[0]) ** 2
+        + (geometry["text"][1] - main_center[1]) ** 2
+    ) ** 0.5
+
+    assert abs(start_cap_center[0] - main[0][0]) <= 1
+    assert abs(start_cap_center[1] - main[0][1]) <= 1
+    assert abs(end_cap_center[0] - main[1][0]) <= 1
+    assert abs(end_cap_center[1] - main[1][1]) <= 1
+    assert abs(text_distance - 26) <= 1
+
+
+def test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product():
     source = _vip_info_test_source()
-    body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
+    base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
+    product_adjustment = {"zoom": 1.1, "offset_x": 0.08, "offset_y": -0.04}
+    adjusted_body = service._paste_info_product(
+        Image.new("RGB", (750, 665), "white"),
+        source,
+        product_adjustment,
+    )
+    base_ruler = service._info_ruler_geometry(base_body)
+    product_dx = product_adjustment["offset_x"] * (
+        service.INFO_PRODUCT_BOX[2] - service.INFO_PRODUCT_BOX[0]
+    )
+    product_dy = product_adjustment["offset_y"] * (
+        service.INFO_PRODUCT_BOX[3] - service.INFO_PRODUCT_BOX[1]
+    )
+    normalized = service._normalize_adjustment({
+        "product_ruler_group_scale": 1.1,
+        "product_ruler_group_offset_x": product_dx / (750 * 0.18),
+        "product_ruler_group_offset_y": product_dy / (665 * 0.18),
+    })
+    start, end = service._transform_product_ruler_segment(
+        (base_ruler["left"], base_ruler["horizontal_y"]),
+        (base_ruler["right"], base_ruler["horizontal_y"]),
+        (
+            (service.INFO_PRODUCT_BOX[0] + service.INFO_PRODUCT_BOX[2]) / 2,
+            (service.INFO_PRODUCT_BOX[1] + service.INFO_PRODUCT_BOX[3]) / 2,
+        ),
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(750, 665),
+    )
+
+    origin_x = (service.INFO_PRODUCT_BOX[0] + service.INFO_PRODUCT_BOX[2]) / 2
+    origin_y = (service.INFO_PRODUCT_BOX[1] + service.INFO_PRODUCT_BOX[3]) / 2
+    expected_left = origin_x + (base_ruler["left"] - origin_x) * 1.1 + product_dx
+    expected_right = origin_x + (base_ruler["right"] - origin_x) * 1.1 + product_dx
+    expected_horizontal_y = origin_y + (base_ruler["horizontal_y"] - origin_y) * 1.1 + product_dy
+    assert abs(start[0] - expected_left) <= 2
+    assert abs(end[0] - expected_right) <= 2
+    assert abs(start[1] - expected_horizontal_y) <= 2
+    vertical_start, vertical_end = service._transform_product_ruler_segment(
+        (base_ruler["vertical_x"], base_ruler["top"]),
+        (base_ruler["vertical_x"], base_ruler["bottom"]),
+        (
+            (service.INFO_PRODUCT_BOX[0] + service.INFO_PRODUCT_BOX[2]) / 2,
+            (service.INFO_PRODUCT_BOX[1] + service.INFO_PRODUCT_BOX[3]) / 2,
+        ),
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(750, 665),
+    )
+    expected_vertical_x = origin_x + (base_ruler["vertical_x"] - origin_x) * 1.1 + product_dx
+    expected_top = origin_y + (base_ruler["top"] - origin_y) * 1.1 + product_dy
+    expected_bottom = origin_y + (base_ruler["bottom"] - origin_y) * 1.1 + product_dy
+    assert abs(vertical_start[0] - expected_vertical_x) <= 2
+    assert abs(vertical_start[1] - expected_top) <= 2
+    assert abs(vertical_end[1] - expected_bottom) <= 2
+
+    base_width = service._info_width_ruler_geometry(base_body)
+    grouped_width = service._info_width_ruler_geometry(
+        base_body,
+        {
+            "product_ruler_group_scale": 1.1,
+            "product_ruler_group_offset_x": product_dx / (750 * 0.18),
+            "product_ruler_group_offset_y": product_dy / (665 * 0.18),
+        },
+        product_center=(origin_x, origin_y),
+    )
+    for base_point, grouped_point in zip(base_width["segments"][0], grouped_width["segments"][0]):
+        expected_x = origin_x + (base_point[0] - origin_x) * 1.1 + product_dx
+        expected_y = origin_y + (base_point[1] - origin_y) * 1.1 + product_dy
+        assert abs(grouped_point[0] - expected_x) <= 2
+        assert abs(grouped_point[1] - expected_y) <= 2
+
+
+def test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size():
+    # 604/605 use the 30..720 editable interval. Crossing from one pixel
+    # smaller to one pixel larger must not jump back to an unclamped origin.
+    just_inside = service._clamp_layer_origin(200, 689, 30, 720)
+    just_outside = service._clamp_layer_origin(200, 691, 30, 720)
+
+    assert just_inside == 31
+    assert just_outside == 30
+    assert abs(just_inside - just_outside) == 1
+
+
+def test_vip_info_centers_and_lifts_the_complete_product_layer():
+    source = _vip_info_test_source()
+    canvas = Image.new("RGB", (750, 665), "white")
+    service._paste_info_product(canvas, source, None)
+    left, top, right, bottom = service.INFO_PRODUCT_BOX
+    product = ImageChops.difference(canvas, Image.new("RGB", canvas.size, "white")).getbbox()
+    expected_lift = (
+        service.INFO_PRODUCT_HANDLE_LIFT_Y
+        * service._handle_visual_lift(source)
+        * (bottom - top)
+    )
+
+    assert product is not None
+    assert abs((product[0] + product[2]) / 2 - (left + right) / 2) <= 1
+    assert abs((product[1] + product[3]) / 2 - ((top + bottom) / 2 - expected_lift)) <= 1
+
+
+def test_vip_info_template_box_is_fifty_percent_larger():
     left, top, right, bottom = service.INFO_PRODUCT_BOX
 
-    assert abs((body[0] + body[2]) / 2 - (left + right) / 2) <= 1
-    assert abs((body[1] + body[3]) / 2 - (top + bottom) / 2) <= 1
+    assert right - left == round(262 * 1.5)
+    assert bottom - top == round(182 * 1.5)
+
+
+def test_vip_info_exact_renderer_uses_full_product_scale():
+    source = Image.new("RGBA", (200, 100), (80, 90, 100, 255))
+    with (
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_jd_product_body_bbox", return_value=(0, 0, 200, 100)),
+    ):
+        body = service._paste_info_product(
+            Image.new("RGB", (750, 665), "white"),
+            source,
+            None,
+        )
+
+    box_width = service.INFO_PRODUCT_BOX[2] - service.INFO_PRODUCT_BOX[0]
+    expected_width = box_width * service.INFO_PRODUCT_SCALE
+    assert abs((body[2] - body[0]) - expected_width) <= 1
+
+
+def test_vip_info_long_handles_receive_extra_product_scale():
+    ordinary = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    ImageDraw.Draw(ordinary).rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+    long_handle = ordinary.copy()
+    ImageDraw.Draw(long_handle).arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+
+    ordinary_lift = service._handle_visual_lift(ordinary)
+    long_handle_lift = service._handle_visual_lift(long_handle)
+    ordinary_scale = service.INFO_PRODUCT_SCALE * (1 + service.INFO_PRODUCT_HANDLE_SCALE * ordinary_lift)
+    long_handle_scale = service.INFO_PRODUCT_SCALE * (1 + service.INFO_PRODUCT_HANDLE_SCALE * long_handle_lift)
+
+    assert ordinary_lift == 0
+    assert long_handle_lift > 0.5
+    assert long_handle_scale > ordinary_scale
+
+
+def test_vip_info_long_handles_are_lifted_away_from_footer():
+    ordinary = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    ImageDraw.Draw(ordinary).rounded_rectangle((45, 145, 255, 410), radius=18, fill=(45, 45, 45, 255))
+    long_handle = ordinary.copy()
+    ImageDraw.Draw(long_handle).arc((70, 10, 230, 250), 180, 360, fill=(35, 35, 35, 255), width=12)
+
+    ordinary_lift_y = service.INFO_PRODUCT_HANDLE_LIFT_Y * service._handle_visual_lift(ordinary)
+    long_handle_lift_y = service.INFO_PRODUCT_HANDLE_LIFT_Y * service._handle_visual_lift(long_handle)
+
+    assert ordinary_lift_y == 0
+    assert abs(long_handle_lift_y - 0.04) < 0.001
 
 
 def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
-    info = {"product_length": "19.5", "product_width": "5.5", "product_height": "14"}
+    info = {"product_length": "195", "product_width": "55", "product_height": "140"}
     source = _vip_info_test_source()
     adjustment = {"zoom": 1.1, "offset_x": 0.08, "offset_y": -0.04}
 
     product_only = service._info_page(info, source, {**adjustment, "product_show_ruler": False})
     linked = service._info_page(info, source, {**adjustment, "product_show_ruler": True})
-    base_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, None)
-    fixed_ruler = service._info_ruler_geometry(base_body)
+    adjusted_body = service._paste_info_product(Image.new("RGB", (750, 665), "white"), source, adjustment)
+    adjusted_ruler = service._info_ruler_geometry(adjusted_body)
 
-    assert product_only.getpixel((fixed_ruler["left"] + 5, fixed_ruler["horizontal_y"])) != (255, 255, 255)
-    assert linked.getpixel((fixed_ruler["left"] + 5, fixed_ruler["horizontal_y"])) == (255, 255, 255)
+    assert product_only.getpixel((adjusted_ruler["left"] + 5, adjusted_ruler["horizontal_y"])) != (255, 255, 255)
+    assert np.array_equal(np.asarray(product_only), np.asarray(linked))
 
 
 def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
@@ -353,12 +761,12 @@ def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
     ]
     for size, body_box in cases:
         layer = Image.new("RGBA", size, (0, 0, 0, 0))
-        base = service._jd_size_product_layout(layer, body_box, (800, 800), {"product_length": "20", "product_height": "14"}, None)
+        base = service._jd_size_product_layout(layer, body_box, (800, 800), {"product_length": "200", "product_height": "140"}, None)
         zoomed = service._jd_size_product_layout(
             layer,
             body_box,
             (800, 800),
-            {"product_length": "20", "product_height": "14"},
+            {"product_length": "200", "product_height": "140"},
             {"zoom": 1.1},
         )
 
@@ -366,6 +774,30 @@ def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():
         assert zoomed["base_body_height"] == base["base_body_height"]
         assert zoomed["body_box"][2] - zoomed["body_box"][0] > base["body_box"][2] - base["body_box"][0]
         assert zoomed["body_box"][3] - zoomed["body_box"][1] > base["body_box"][3] - base["body_box"][1]
+
+
+def test_jd_comparison_product_first_zoom_step_keeps_automatic_anchor():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
+    body_box = service._jd_product_body_bbox(source)
+    info = {"product_length": "200", "product_height": "140"}
+
+    base, _ = service._jd_comparison_product_layout(source, body_box, (800, 800), info, None)
+    zoomed, _ = service._jd_comparison_product_layout(
+        source,
+        body_box,
+        (800, 800),
+        info,
+        {"zoom": 1.02},
+    )
+    base_body = base["body_box"]
+    zoomed_body = zoomed["body_box"]
+
+    assert abs((base_body[0] + base_body[2]) / 2 - (zoomed_body[0] + zoomed_body[2]) / 2) <= 1
+    assert abs(base_body[3] - zoomed_body[3]) <= 1
+    assert zoomed_body[2] - zoomed_body[0] > base_body[2] - base_body[0]
 
 
 def test_jd_phone_alignment_uses_current_rendered_body():
@@ -386,7 +818,7 @@ def test_jd_product_movement_does_not_move_the_phone():
     draw = ImageDraw.Draw(source)
     draw.arc((120, 15, 300, 205), 180, 360, fill=(40, 40, 40, 255), width=12)
     draw.rounded_rectangle((45, 130, 375, 300), radius=18, fill=(150, 160, 175, 255))
-    info = {"product_length": "20", "product_height": "14"}
+    info = {"product_length": "200", "product_height": "140"}
     phone_positions: list[tuple[int, int, int]] = []
 
     def capture_phone(_canvas, center_x, top, height):
@@ -411,7 +843,7 @@ def test_jd_manual_product_movement_can_cross_the_automatic_logo_clearance():
     draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
     draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
     body_box = service._jd_product_body_bbox(source)
-    info = {"product_length": "20", "product_height": "14"}
+    info = {"product_length": "200", "product_height": "140"}
 
     automatic = service._jd_size_product_layout(source, body_box, (800, 800), info, None)
     raised = service._jd_size_product_layout(
@@ -419,12 +851,78 @@ def test_jd_manual_product_movement_can_cross_the_automatic_logo_clearance():
         body_box,
         (800, 800),
         info,
-        {"offset_y": -0.35},
+        {"offset_y": -0.8},
         enforce_logo_clearance=False,
     )
 
     assert raised["paste_y"] < automatic["paste_y"] - 40
     assert raised["paste_y"] >= raised["safe_box"][1]
+
+    freely_raised = service._jd_size_product_layout(
+        source,
+        body_box,
+        (800, 800),
+        info,
+        {"offset_y": -0.8},
+        enforce_logo_clearance=False,
+        clamp_to_safe=False,
+    )
+    assert freely_raised["paste_y"] < freely_raised["safe_box"][1]
+
+
+def test_jd_size_linked_rulers_use_the_same_canvas_transform_as_product():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
+    body_box = service._jd_product_body_bbox(source)
+    info = {"product_length": "200", "product_height": "140"}
+    base = service._jd_size_product_layout(source, body_box, (800, 800), info, None)
+    adjusted = service._jd_size_product_layout(
+        source,
+        body_box,
+        (800, 800),
+        info,
+        {"zoom": 1.12, "offset_x": 0.09, "offset_y": -0.06},
+        enforce_logo_clearance=False,
+        clamp_to_safe=False,
+    )
+    base_body = base["body_box"]
+    adjusted_body = adjusted["body_box"]
+    dx = (adjusted_body[0] + adjusted_body[2] - base_body[0] - base_body[2]) / 2
+    dy = adjusted_body[3] - base_body[3]
+    normalized = service._normalize_adjustment({
+        "product_ruler_group_scale": 1.12,
+        "product_ruler_group_offset_x": dx / (800 * 0.18),
+        "product_ruler_group_offset_y": dy / (800 * 0.18),
+    })
+    center = ((base_body[0] + base_body[2]) / 2, base_body[3])
+    horizontal_y = min(800 - 70, base_body[3] + max(28, round(800 * 0.045)))
+    start, end = service._transform_product_ruler_segment(
+        (base_body[0], horizontal_y),
+        (base_body[2], horizontal_y),
+        center,
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(800, 800),
+    )
+    assert abs(start[0] - adjusted_body[0]) <= 2
+    assert abs(end[0] - adjusted_body[2]) <= 2
+    vertical_x = max(30, base_body[0] - max(28, round(800 * 0.045)))
+    vertical_start, vertical_end = service._transform_product_ruler_segment(
+        (vertical_x, base_body[1]),
+        (vertical_x, base_body[3]),
+        center,
+        normalized,
+        scale=1,
+        offset_x=0,
+        offset_y=0,
+        canvas_size=(800, 800),
+    )
+    assert abs(vertical_start[1] - adjusted_body[1]) <= 2
+    assert abs(vertical_end[1] - adjusted_body[3]) <= 2
 
 
 def test_jd_phone_alignment_uses_the_same_automatic_product_baseline():
@@ -432,7 +930,7 @@ def test_jd_phone_alignment_uses_the_same_automatic_product_baseline():
     draw = ImageDraw.Draw(source)
     draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
     draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
-    info = {"product_length": "20", "product_height": "14"}
+    info = {"product_length": "200", "product_height": "140"}
     cutout = service._product_cutout(source)
     body_box = service._jd_product_body_bbox(cutout)
     baseline = service._jd_size_product_layout(cutout, body_box, (800, 800), info, None)
@@ -460,12 +958,48 @@ def test_jd_phone_alignment_uses_the_same_automatic_product_baseline():
     assert phone_positions[1][1] == center_top
 
 
+def test_jd_phone_first_zoom_step_keeps_the_automatic_anchor():
+    source = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(source)
+    draw.arc((70, 10, 230, 250), 180, 360, fill=(40, 40, 40, 255), width=12)
+    draw.rounded_rectangle((45, 145, 255, 410), radius=18, fill=(150, 160, 175, 255))
+    info = {"product_length": "200", "product_height": "140"}
+
+    for alignment in ("bottom", "center"):
+        phone_positions: list[tuple[int, int, int, int]] = []
+
+        def capture_phone(_canvas, center_x, top, phone_height):
+            reference = service._jd_phone_reference_layer()
+            ratio = reference.width / reference.height if reference is not None else 0.83
+            phone_width = max(42, round(phone_height * ratio))
+            left = round(center_x - phone_width / 2)
+            phone_positions.append((left, round(top), phone_width, round(phone_height)))
+            return left, round(top), left + phone_width, round(top + phone_height)
+
+        with patch.object(service, "_draw_jd_phone_reference", side_effect=capture_phone):
+            service._jd_size_comparison_page(source, (800, 800), info, {
+                "phone_alignment": alignment,
+                "phone_scale": 1.0,
+            })
+            service._jd_size_comparison_page(source, (800, 800), info, {
+                "phone_alignment": alignment,
+                "phone_scale": 1.02,
+            })
+
+        base, zoomed = phone_positions
+        assert abs((base[0] + base[2] / 2) - (zoomed[0] + zoomed[2] / 2)) <= 1
+        if alignment == "bottom":
+            assert abs((base[1] + base[3]) - (zoomed[1] + zoomed[3])) <= 1
+        else:
+            assert abs((base[1] + base[3] / 2) - (zoomed[1] + zoomed[3] / 2)) <= 1
+
+
 def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
     source = Image.new("RGBA", (420, 320), (0, 0, 0, 0))
     draw = ImageDraw.Draw(source)
     draw.arc((120, 15, 300, 205), 180, 360, fill=(40, 40, 40, 255), width=12)
     draw.rounded_rectangle((45, 130, 375, 300), radius=18, fill=(150, 160, 175, 255))
-    info = {"product_length": "20", "product_height": "14"}
+    info = {"product_length": "200", "product_height": "140"}
 
     linked = service._jd_size_comparison_page(
         source,
@@ -492,11 +1026,15 @@ def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
 
 def test_independent_ruler_adjustments_are_normalized_and_transformed():
     normalized = service._normalize_adjustment({
+        "product_ruler_group_scale": 9,
+        "product_ruler_group_offset_x": 0.2,
         "length_ruler_scale": 9,
         "height_ruler_offset_x": -9,
         "phone_ruler_offset_y": 0.25,
     })
 
+    assert normalized["product_ruler_group_scale"] == 4.0
+    assert normalized["product_ruler_group_offset_x"] == 0.2
     assert normalized["length_ruler_scale"] == 2.0
     assert normalized["height_ruler_offset_x"] == -1.5
     assert normalized["phone_ruler_offset_y"] == 0.25
@@ -619,7 +1157,39 @@ def test_jd_size_slot_prefers_transparent_front_when_available():
     assert size_slot["confidence"] == 98
 
 
+def test_product_ruler_base_is_preserved_for_exact_preview():
+    normalized = service._normalize_adjustment({
+        "product_ruler_base_left": 321.25,
+        "product_ruler_base_top": 278.5,
+        "product_ruler_base_right": 612.75,
+        "product_ruler_base_bottom": 489.5,
+    })
+    assert service._stored_product_ruler_base(normalized) == (321.25, 278.5, 612.75, 489.5)
+    invalid = service._normalize_adjustment({
+        "product_ruler_base_left": 500,
+        "product_ruler_base_top": 300,
+        "product_ruler_base_right": 400,
+        "product_ruler_base_bottom": 450,
+    })
+    assert service._stored_product_ruler_base(invalid) is None
+
+
 class JdOrganizerGeometryTests(unittest.TestCase):
+    def test_product_ruler_base_is_preserved(self):
+        test_product_ruler_base_is_preserved_for_exact_preview()
+
+    def test_jd_logo_detail_manual_horizontal_movement(self):
+        test_jd_logo_detail_manual_offset_moves_the_image_horizontally()
+
+    def test_jd_model_manual_movement(self):
+        test_jd_model_manual_offset_moves_freely_on_both_axes()
+
+    def test_jd_product_first_manual_move_is_continuous(self):
+        test_jd_product_first_manual_move_starts_from_automatic_position()
+
+    def test_jd_long_handle_product_slots_are_lifted(self):
+        test_jd_long_handle_product_and_transparent_slots_are_lifted()
+
     def test_jd_interior_detail_is_full_bleed(self):
         test_jd_interior_detail_fills_the_canvas_without_white_border()
 
@@ -638,6 +1208,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_zoom_uses_one_baseline_transform(self):
         test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape()
 
+    def test_product_first_zoom_step_keeps_anchor(self):
+        test_jd_comparison_product_first_zoom_step_keeps_automatic_anchor()
+
     def test_phone_alignment_tracks_rendered_body(self):
         test_jd_phone_alignment_uses_current_rendered_body()
 
@@ -653,11 +1226,23 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_phone_alignment_uses_automatic_product_baseline(self):
         test_jd_phone_alignment_uses_the_same_automatic_product_baseline()
 
+    def test_phone_first_zoom_step_keeps_anchor(self):
+        test_jd_phone_first_zoom_step_keeps_the_automatic_anchor()
+
     def test_jd_object_only_modes_keep_rulers_visible(self):
         test_jd_size_rulers_stay_visible_when_adjusting_objects_only()
 
     def test_independent_ruler_adjustments(self):
         test_independent_ruler_adjustments_are_normalized_and_transformed()
+
+    def test_linked_rulers_share_product_canvas_transform(self):
+        test_vip_info_linked_rulers_use_the_same_canvas_transform_as_product()
+
+    def test_jd_linked_rulers_share_product_canvas_transform(self):
+        test_jd_size_linked_rulers_use_the_same_canvas_transform_as_product()
+
+    def test_safe_area_zoom_transition_is_continuous(self):
+        test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size()
 
     def test_phone_comparison_dimension_gate(self):
         test_jd_phone_comparison_waits_for_length_and_height()
@@ -683,8 +1268,26 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_vip_info_rulers_follow_product(self):
         test_vip_info_product_and_rulers_share_zoom_and_movement()
 
-    def test_vip_info_centers_bag_body(self):
-        test_vip_info_centers_the_bag_body_instead_of_the_handle_layer()
+    def test_vip_info_ruler_gaps_follow_product_zoom(self):
+        test_vip_info_ruler_gaps_expand_with_linked_product_zoom()
+
+    def test_vip_info_enlarged_rulers_stay_outside_product(self):
+        test_vip_info_enlarged_rulers_never_fold_back_into_product()
+
+    def test_vip_info_centers_complete_product(self):
+        test_vip_info_centers_and_lifts_the_complete_product_layer()
+
+    def test_vip_info_template_box_is_larger(self):
+        test_vip_info_template_box_is_fifty_percent_larger()
+
+    def test_vip_info_exact_renderer_uses_full_scale(self):
+        test_vip_info_exact_renderer_uses_full_product_scale()
+
+    def test_vip_info_long_handles_receive_extra_scale(self):
+        test_vip_info_long_handles_receive_extra_product_scale()
+
+    def test_vip_info_long_handles_are_lifted_from_footer(self):
+        test_vip_info_long_handles_are_lifted_away_from_footer()
 
     def test_vip_info_rulers_stay_visible(self):
         test_vip_info_rulers_remain_visible_in_both_adjustment_modes()
