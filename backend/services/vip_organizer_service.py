@@ -87,6 +87,12 @@ INFO_PRODUCT_BOX = (294, 238, 687, 511)
 INFO_PRODUCT_SCALE = 1.0
 INFO_PRODUCT_HANDLE_SCALE = 0.08
 INFO_PRODUCT_HANDLE_LIFT_Y = 0.04
+INFO_PRODUCT_NO_HANDLE_DROP_Y = 0.028
+INFO_PRODUCT_WIDTH_EDGE_SAFE_RIGHT = 714
+INFO_PRODUCT_WIDTH_RULER_ALLOWANCE = 84
+INFO_PRODUCT_WIDTH_EDGE_RANGE = 36
+INFO_PRODUCT_WIDTH_EDGE_MAX_SHRINK = 0.08
+INFO_PRODUCT_WIDTH_EDGE_MAX_SHIFT_X = 16
 INFO_TEXT_X = 53
 INFO_HEIGHT_RULER_SHIFT_Y = 5
 INFO_LENGTH_LINE_Y = 528
@@ -1711,6 +1717,81 @@ def _predict_product_matte(source: Image.Image) -> np.ndarray | None:
             return None
 
 
+def _decontaminate_pale_studio_edge(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    *,
+    lab_distance: np.ndarray,
+    saturation: np.ndarray,
+    value: np.ndarray,
+    hardware: np.ndarray,
+) -> np.ndarray:
+    """Reduce white-studio colour mixed into the edge of pale products.
+
+    Pale leather cannot use the normal colour-key alpha solve: its real pixels
+    are close to the white backdrop.  Keep alpha unchanged and borrow colour
+    only from a nearby, opaque pale-material seed when an outer edge pixel is
+    measurably closer to the backdrop and brighter than that seed.
+    """
+    if rgb.ndim != 3 or rgb.shape[:2] != alpha.shape:
+        return rgb
+    foreground = alpha > 8
+    if not np.any(foreground):
+        return rgb
+    inside = cv2.distanceTransform(
+        foreground.astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+    )
+    boundary = foreground & (inside <= 4.5) & ~hardware
+    seed = (
+        (alpha >= 245)
+        & (inside >= 5.0)
+        & (saturation <= 42)
+        & (value >= 135)
+        & (lab_distance >= 4)
+        & ~hardware
+    )
+    if not np.any(boundary) or not np.any(seed):
+        return rgb
+    _, nearest_labels = cv2.distanceTransformWithLabels(
+        (~seed).astype(np.uint8),
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    seed_colours = rgb[seed].astype(np.float32)
+    nearest_indices = np.clip(
+        nearest_labels.astype(np.int64) - 1,
+        0,
+        len(seed_colours) - 1,
+    )
+    nearest_colours = seed_colours[nearest_indices]
+    nearest_value = nearest_colours.max(axis=2)
+    current_value = rgb.max(axis=2).astype(np.float32)
+    contaminated = (
+        boundary
+        & (saturation <= 38)
+        & (value >= 214)
+        & (lab_distance <= 42)
+        & (current_value >= nearest_value + 3.0)
+    )
+    if not np.any(contaminated):
+        return rgb
+    strength = np.clip(
+        (current_value - nearest_value - 2.0) / 18.0,
+        0.25,
+        0.82,
+    )[:, :, None]
+    result = rgb.astype(np.float32)
+    result[contaminated] = (
+        result[contaminated]
+        * (1.0 - strength[contaminated])
+        + nearest_colours[contaminated] * strength[contaminated]
+    )
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def _clean_bottom_against_body_contour(
     alpha: np.ndarray,
     rgb: np.ndarray,
@@ -2690,6 +2771,16 @@ def _prepared_product_cutout(
                     round(np.count_nonzero(upper_silver_seed) * 0.015),
                 )
             )
+            if (
+                _use_historical_bottom_pipeline is None
+                and restore_source_silver
+            ):
+                # Pale bags normally use the conservative body-contour path.
+                # A repeated silver-chain signature is different: side chain
+                # shadows sit outside that central contour and are cleaned
+                # more reliably by the established material-tail pass. The
+                # silver seed itself remains protected below.
+                use_historical_bottom_pipeline = True
             strict_silver_hardware = silver_seed
             silver_neighbourhood = cv2.dilate(
                 silver_seed.astype(np.uint8),
@@ -3974,6 +4065,16 @@ def _prepared_product_cutout(
             alpha = np.round(new_alpha * 255.0).astype(np.uint8)
             alpha[white_mixed_edge & (new_alpha <= 0.025)] = 0
 
+        if pale_product:
+            cropped_rgb = _decontaminate_pale_studio_edge(
+                np.clip(cropped_rgb, 0, 255).astype(np.uint8),
+                alpha,
+                lab_distance=cropped_lab_distance,
+                saturation=cropped_saturation,
+                value=cropped_value,
+                hardware=cropped_tight_hardware,
+            ).astype(np.float32)
+
         # A verified silver seed has model support, strong local contrast and
         # is already excluded from the connected white studio background.
         # Keep that metal core opaque after floor/fringe cleanup; only the
@@ -4243,6 +4344,10 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
             & (hsv[:, :, 2] >= 35)
             & (hsv[:, :, 2] <= 245)
             & (alpha > 8)
+            # Warm/neutral cast shadows can have the same local gradient as
+            # silver edges. Real silver in these white-studio photos keeps a
+            # cool-channel lead; require it before shielding a floor pixel.
+            & (blue >= red - 2)
             & (
                 (gradient >= 22)
                 | (local_value_range >= 17)
@@ -4511,7 +4616,7 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                         & background_like_floor
                         & ~verified_floor_metal
                     )
-                ) & (xx >= central_left) & (xx < central_right)
+                ) & (xx >= main_left) & (xx < main_left + main_width)
                 alpha[lateral_floor_residue] = 0
                 if has_substantial_floor_residue:
                     alpha[connected_floor_residue] = 0
@@ -4604,8 +4709,15 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 # *below* the detected floor.  Opaque side pixels are product
                 # evidence and must survive even when their colour is neutral.
                 if (
-                    has_confident_terminal_collapse
-                    and median_material_saturation >= 28
+                    (
+                        has_confident_terminal_collapse
+                        or has_substantial_floor_residue
+                    )
+                    # White leather can have a single-digit median
+                    # saturation. It still needs the same side-shadow pass;
+                    # the metal mask above, rather than product saturation,
+                    # is what protects real silver links.
+                    and median_material_saturation >= 10
                 ):
                     tight_terminal_metal = cv2.dilate(
                         verified_floor_metal.astype(np.uint8),
@@ -4617,7 +4729,7 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     ).astype(bool)
                     side_neutral_shadow = (
                         main_pixels
-                        & (yy > floor_row + 1)
+                        & (yy > floor_row + 2)
                         & (
                             (xx < central_left)
                             | (xx >= central_right)
@@ -5437,23 +5549,36 @@ def _paste_info_product(
     # Keep the exact/final 401 renderer on the same handle-aware baseline as
     # the live editor so the product does not jump when exact preview arrives.
     handle_lift = _handle_visual_lift(cutout)
+    body_left, body_top, body_right, body_bottom = _jd_product_body_bbox(cutout)
+    automatic_layout = _info_product_auto_layout(
+        cutout.width,
+        cutout.height,
+        (body_left, body_top, body_right, body_bottom),
+        handle_lift,
+    )
     scale = (
         min(box_width / cutout.width, box_height / cutout.height)
         * normalized["zoom"]
         * INFO_PRODUCT_SCALE
         * (1.0 + INFO_PRODUCT_HANDLE_SCALE * handle_lift)
+        * automatic_layout["scale"]
     )
     rendered = cutout.resize(
         (max(1, round(cutout.width * scale)), max(1, round(cutout.height * scale))),
         Image.Resampling.LANCZOS,
     )
-    body_left, body_top, body_right, body_bottom = _jd_product_body_bbox(cutout)
-    x = left + (box_width - rendered.width) // 2 + round(normalized["offset_x"] * box_width)
+    x = (
+        left
+        + (box_width - rendered.width) // 2
+        + round(normalized["offset_x"] * box_width)
+        + round(automatic_layout["shift_x"])
+    )
     y = (
         top
         + (box_height - rendered.height) // 2
         + round(normalized["offset_y"] * box_height)
         - round(INFO_PRODUCT_HANDLE_LIFT_Y * handle_lift * box_height)
+        + round(automatic_layout["drop_y"] * box_height)
     )
     canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
     return (
@@ -5555,6 +5680,45 @@ def _stored_product_ruler_base(
         return None
     left, top, right, bottom = (float(value) for value in values)
     return (left, top, right, bottom) if right > left and bottom > top else None
+
+
+def _info_product_auto_layout(
+    layer_width: int,
+    layer_height: int,
+    body: tuple[float, float, float, float],
+    handle_lift: float,
+) -> dict[str, float]:
+    """Return a stable 401 baseline independent of manual zoom and movement."""
+    left, top, right, bottom = INFO_PRODUCT_BOX
+    box_width = right - left
+    box_height = bottom - top
+    bounded_handle_lift = max(0.0, min(1.0, handle_lift))
+    base_scale = (
+        min(box_width / max(1, layer_width), box_height / max(1, layer_height))
+        * INFO_PRODUCT_SCALE
+        * (1.0 + INFO_PRODUCT_HANDLE_SCALE * bounded_handle_lift)
+    )
+    base_x = left + (box_width - layer_width * base_scale) / 2
+    projected_width_ruler_right = (
+        base_x
+        + body[2] * base_scale
+        + INFO_PRODUCT_WIDTH_RULER_ALLOWANCE
+    )
+    edge_pressure = max(
+        0.0,
+        min(
+            1.0,
+            (projected_width_ruler_right - INFO_PRODUCT_WIDTH_EDGE_SAFE_RIGHT)
+            / INFO_PRODUCT_WIDTH_EDGE_RANGE,
+        ),
+    )
+    no_handle_weight = 1.0 - min(1.0, bounded_handle_lift / 0.35)
+    return {
+        "scale": 1.0 - INFO_PRODUCT_WIDTH_EDGE_MAX_SHRINK * edge_pressure,
+        "shift_x": -INFO_PRODUCT_WIDTH_EDGE_MAX_SHIFT_X * edge_pressure,
+        "drop_y": INFO_PRODUCT_NO_HANDLE_DROP_Y * no_handle_weight,
+        "edge_pressure": edge_pressure,
+    }
 
 
 def _info_width_ruler_geometry(
@@ -6592,7 +6756,10 @@ def _jd_size_comparison_page(
             + normalized["phone_offset_y"] * height * 0.18
             - phone_height / 2
         )
-    phone_center_x = phone_left + phone_width / 2
+    phone_center_x = (
+        base_phone_center_x
+        + normalized["phone_offset_x"] * width * 0.18
+    )
     phone_box = _draw_jd_phone_reference(
         canvas,
         round(phone_center_x),
@@ -6674,7 +6841,7 @@ def _jd_size_comparison_page(
         vertical=True,
         vertical_label_side="right",
     )
-    label_font = _font(max(13, round(min(size) * 0.02)))
+    label_font = _font(max(13, round(min(size) * 0.02)), bold=True)
     phone_label = JD_PHONE_LABEL
     label_box = draw.textbbox((0, 0), phone_label, font=label_font)
     draw.text(

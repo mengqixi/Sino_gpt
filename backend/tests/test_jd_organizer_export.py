@@ -670,19 +670,33 @@ def test_layer_clamp_is_continuous_when_zoom_crosses_safe_area_size():
 
 def test_vip_info_centers_and_lifts_the_complete_product_layer():
     source = _vip_info_test_source()
+    cutout = service._product_cutout(source)
     canvas = Image.new("RGB", (750, 665), "white")
     service._paste_info_product(canvas, source, None)
     left, top, right, bottom = service.INFO_PRODUCT_BOX
+    handle_lift = service._handle_visual_lift(cutout)
+    automatic_layout = service._info_product_auto_layout(
+        cutout.width,
+        cutout.height,
+        service._jd_product_body_bbox(cutout),
+        handle_lift,
+    )
     product = ImageChops.difference(canvas, Image.new("RGB", canvas.size, "white")).getbbox()
     expected_lift = (
         service.INFO_PRODUCT_HANDLE_LIFT_Y
-        * service._handle_visual_lift(source)
+        * handle_lift
         * (bottom - top)
     )
 
     assert product is not None
-    assert abs((product[0] + product[2]) / 2 - (left + right) / 2) <= 1
-    assert abs((product[1] + product[3]) / 2 - ((top + bottom) / 2 - expected_lift)) <= 1
+    expected_center_x = (left + right) / 2 + round(automatic_layout["shift_x"])
+    expected_center_y = (
+        (top + bottom) / 2
+        - expected_lift
+        + round(automatic_layout["drop_y"] * (bottom - top))
+    )
+    assert abs((product[0] + product[2]) / 2 - expected_center_x) <= 1
+    assert abs((product[1] + product[3]) / 2 - expected_center_y) <= 1
 
 
 def test_vip_info_template_box_is_fifty_percent_larger():
@@ -705,7 +719,13 @@ def test_vip_info_exact_renderer_uses_full_product_scale():
         )
 
     box_width = service.INFO_PRODUCT_BOX[2] - service.INFO_PRODUCT_BOX[0]
-    expected_width = box_width * service.INFO_PRODUCT_SCALE
+    automatic_layout = service._info_product_auto_layout(
+        source.width,
+        source.height,
+        (0, 0, source.width, source.height),
+        0,
+    )
+    expected_width = box_width * service.INFO_PRODUCT_SCALE * automatic_layout["scale"]
     assert abs((body[2] - body[0]) - expected_width) <= 1
 
 
@@ -811,6 +831,14 @@ def test_jd_phone_renderer_accepts_fractional_position():
     canvas = Image.new("RGB", (800, 800), "white")
     box = service._draw_jd_phone_reference(canvas, 600.4, 212.6, 163.2)
     assert all(isinstance(value, int) for value in box)
+
+
+def test_jd_phone_reference_keeps_the_phone_interior_opaque():
+    reference = service._jd_phone_reference_layer()
+    assert reference is not None
+    alpha = reference.getchannel("A")
+    assert alpha.getpixel((reference.width // 4, reference.height // 2)) == 255
+    assert alpha.getpixel((reference.width * 3 // 4, reference.height // 2)) == 255
 
 
 def test_jd_product_movement_does_not_move_the_phone():
@@ -1216,6 +1244,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_phone_renderer_rounds_coordinates(self):
         test_jd_phone_renderer_accepts_fractional_position()
+
+    def test_phone_reference_keeps_interior_opaque(self):
+        test_jd_phone_reference_keeps_the_phone_interior_opaque()
 
     def test_product_movement_keeps_phone_fixed(self):
         test_jd_product_movement_does_not_move_the_phone()
