@@ -4495,7 +4495,10 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 ).astype(np.int32)
                 below_material_envelope = (
                     (smoothed_material_bottoms[None, :] >= 0)
-                    & (yy >= smoothed_material_bottoms[None, :])
+                    # Keep the last trustworthy material row and its
+                    # antialiased neighbour.  Treat only pixels genuinely
+                    # below that contour as possible studio-floor residue.
+                    & (yy > smoothed_material_bottoms[None, :] + 1)
                 )
                 non_material_shadow = (
                     main_pixels
@@ -4520,9 +4523,12 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 )
                 alpha[non_material_shadow] = 0
 
-                # On a confidently terminated light/coloured base, remove
-                # only the very dark terminal flecks. Preserve a saturated
-                # brown/coloured piping core as well as verified hardware.
+                # On a confidently terminated light/coloured base, a faint
+                # studio shadow may continue below the contour at the sides.
+                # Side fittings, leather tabs and dark piping live in exactly
+                # the same zone, so only clear genuinely translucent pixels
+                # *below* the detected floor.  Opaque side pixels are product
+                # evidence and must survive even when their colour is neutral.
                 if (
                     has_confident_terminal_collapse
                     and median_material_saturation >= 28
@@ -4537,42 +4543,17 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     ).astype(bool)
                     side_neutral_shadow = (
                         main_pixels
-                        & (
-                            yy
-                            >= main_top + round(main_height * 0.90)
-                        )
+                        & (yy > floor_row + 1)
                         & (
                             (xx < central_left)
                             | (xx >= central_right)
                         )
+                        & (alpha < 160)
                         & (hsv[:, :, 1] <= 50)
                         & (hsv[:, :, 2] >= 70)
                         & ~tight_terminal_metal
                     )
                     alpha[side_neutral_shadow] = 0
-
-                    saturated_floor_core = (
-                        (hsv[:, :, 1] >= max(
-                            75.0,
-                            median_material_saturation * 0.85,
-                        ))
-                        & (hsv[:, :, 2] >= 45)
-                    )
-                    terminal_dark_shadow = (
-                        main_pixels
-                        & (
-                            yy
-                            >= floor_row - max(
-                                2,
-                                round(main_height * 0.01),
-                            )
-                        )
-                        & (yy <= floor_row)
-                        & (hsv[:, :, 2] < 55)
-                        & ~saturated_floor_core
-                        & ~verified_floor_metal
-                    )
-                    alpha[terminal_dark_shadow] = 0
                 changed = True
 
         # Dark products need a relative test: their white-studio shadow can be
@@ -4670,7 +4651,13 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
             ))
             low_chroma_floor_residue = (
                 main_pixels
+                # This is a second-pass floor inspection, not a general
+                # colour key.  Keep the useful historical central-bottom
+                # cleanup for pale shadows, but never extend it into the side
+                # zones where chain, tabs and fittings sit.
                 & (yy >= main_top + round(main_height * 0.90))
+                & (xx >= central_left)
+                & (xx < central_right)
                 & (alpha > 8)
                 & (
                     (
