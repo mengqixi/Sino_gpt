@@ -117,6 +117,7 @@ const ORGANIZER_PLATFORMS = [
 type OrganizerPlatform = "vip" | "jd";
 type PreviewFolder = "800" | "750";
 const JD_SINGLE_FOLDER_FILES = new Set(["0-无logo.jpg", "透明.png"]);
+const JD_MEASURE_COLOR = "#707070";
 
 const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   zoom: 1,
@@ -154,6 +155,12 @@ const VIP_INFO_PRODUCT_BOX = { left: 294, top: 238, right: 687, bottom: 511 } as
 const VIP_INFO_PRODUCT_SCALE = 1;
 const VIP_INFO_HANDLE_SCALE = 0.08;
 const VIP_INFO_HANDLE_LIFT_Y = 0.04;
+const VIP_INFO_NO_HANDLE_DROP_Y = 0.028;
+const VIP_INFO_WIDTH_EDGE_SAFE_RIGHT = 714;
+const VIP_INFO_WIDTH_RULER_ALLOWANCE = 84;
+const VIP_INFO_WIDTH_EDGE_RANGE = 36;
+const VIP_INFO_WIDTH_EDGE_MAX_SHRINK = 0.08;
+const VIP_INFO_WIDTH_EDGE_MAX_SHIFT_X = 16;
 const VIP_INFO_TEXT_X = 53;
 const VIP_INFO_HEIGHT_RULER_SHIFT_Y = 5;
 const VIP_INFO_RULER_COLOR = "#8a8a8a";
@@ -201,6 +208,33 @@ function vipInfoProductScale(handleLift = 0) {
 
 function vipInfoProductLiftY(handleLift = 0) {
   return VIP_INFO_HANDLE_LIFT_Y * Math.max(0, Math.min(1, handleLift));
+}
+
+function vipInfoAutoLayout(
+  layerWidth: number,
+  layerHeight: number,
+  body: PixelBounds,
+  handleLift = 0
+) {
+  const areaWidth = VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left;
+  const areaHeight = VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top;
+  const boundedHandleLift = Math.max(0, Math.min(1, handleLift));
+  const baseScale = Math.min(
+    areaWidth / Math.max(1, layerWidth),
+    areaHeight / Math.max(1, layerHeight)
+  ) * vipInfoProductScale(boundedHandleLift);
+  const baseX = VIP_INFO_PRODUCT_BOX.left + (areaWidth - layerWidth * baseScale) / 2;
+  const projectedWidthRulerRight = baseX + body.right * baseScale + VIP_INFO_WIDTH_RULER_ALLOWANCE;
+  const edgePressure = Math.max(0, Math.min(
+    1,
+    (projectedWidthRulerRight - VIP_INFO_WIDTH_EDGE_SAFE_RIGHT) / VIP_INFO_WIDTH_EDGE_RANGE
+  ));
+  const noHandleWeight = 1 - Math.min(1, boundedHandleLift / 0.35);
+  return {
+    scale: 1 - VIP_INFO_WIDTH_EDGE_MAX_SHRINK * edgePressure,
+    shiftX: -VIP_INFO_WIDTH_EDGE_MAX_SHIFT_X * edgePressure,
+    dropY: VIP_INFO_NO_HANDLE_DROP_Y * noHandleWeight
+  };
 }
 
 function targetScale(draft: ImageAdjustment, target: AdjustmentTarget) {
@@ -1215,12 +1249,14 @@ function positionedInfoProductBody(
   const areaWidth = VIP_INFO_PRODUCT_BOX.right - VIP_INFO_PRODUCT_BOX.left;
   const areaHeight = VIP_INFO_PRODUCT_BOX.bottom - VIP_INFO_PRODUCT_BOX.top;
   const fitScale = Math.min(areaWidth / layerWidth, areaHeight / layerHeight);
-  const scale = fitScale * draft.zoom * vipInfoProductScale(handleLift);
+  const automaticLayout = vipInfoAutoLayout(layerWidth, layerHeight, layerBounds, handleLift);
+  const scale = fitScale * draft.zoom * vipInfoProductScale(handleLift) * automaticLayout.scale;
   const drawWidth = layerWidth * scale;
   const drawHeight = layerHeight * scale;
-  let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth;
+  let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth + automaticLayout.shiftX;
   let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
-    - vipInfoProductLiftY(handleLift) * areaHeight;
+    - vipInfoProductLiftY(handleLift) * areaHeight
+    + automaticLayout.dropY * areaHeight;
   return {
     left: drawX + layerBounds.left * scale,
     top: drawY + layerBounds.top * scale,
@@ -1483,8 +1519,8 @@ function drawCanvasRuler(
 ) {
   const cap = Math.max(7, output.width * 0.011);
   context.save();
-  context.strokeStyle = "#707070";
-  context.fillStyle = "#707070";
+  context.strokeStyle = JD_MEASURE_COLOR;
+  context.fillStyle = JD_MEASURE_COLOR;
   context.lineWidth = Math.max(1, output.width * 0.002);
   context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
   context.textAlign = "center";
@@ -1607,8 +1643,8 @@ function drawJdComparisonPreview(
     true
   );
   context.save();
-  context.fillStyle = "#707070";
-  context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+  context.fillStyle = JD_MEASURE_COLOR;
+  context.font = `600 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
   context.textAlign = "center";
   context.fillText("iPhone 17 Pro Max", phone.left + phone.width / 2, phone.top + phone.height + 22);
   context.restore();
@@ -1789,15 +1825,20 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       const vipDetailOffset = detailRatio <= 0.78
         ? -0.105
         : detailRatio <= 1.05 ? -0.11 : detailRatio <= 1.45 ? -0.12 : -0.13;
+      const infoHandleLift = platform === "vip" && slot.file_name === "401.jpg"
+        ? layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
+        : 0;
+      const infoLayoutBody = platform === "vip" && slot.file_name === "401.jpg" && productLayer
+        ? organizerLayerBounds(layerInfo?.product_body_bbox) || liveInfoMeasurementBounds(productLayer)
+        : null;
+      const infoAutomaticLayout = infoLayoutBody
+        ? vipInfoAutoLayout(drawSourceWidth, drawSourceHeight, infoLayoutBody, infoHandleLift)
+        : { scale: 1, shiftX: 0, dropY: 0 };
       const infoProductScale = platform === "vip" && slot.file_name === "401.jpg"
-        ? vipInfoProductScale(
-          layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
-        )
+        ? vipInfoProductScale(infoHandleLift) * infoAutomaticLayout.scale
         : 1;
       const infoProductLiftY = platform === "vip" && slot.file_name === "401.jpg"
-        ? vipInfoProductLiftY(
-          layerInfo?.handle_lift ?? (productLayer ? liveHandleVisualLift(productLayer) : 0)
-        )
+        ? vipInfoProductLiftY(infoHandleLift)
         : 0;
       const autoHandleLayout = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
         || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
@@ -1820,7 +1861,9 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       const bodyCenterOffsetY = productBody && productLayer
         ? (productLayer.height / 2 - (productBody.top + productBody.bottom) / 2) * productScale
         : 0;
-      let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth + bodyCenterOffsetX;
+      let drawX = areaX + (areaWidth - drawWidth) / 2 + draft.offset_x * areaWidth
+        + bodyCenterOffsetX
+        + infoAutomaticLayout.shiftX;
       const multiAngleHandleLift = compositePrimary
         ? primaryLayerInfo?.handle_lift
           ?? liveHandleVisualLift(livePreviewProductCutout(compositePrimaryUrl || sourceUrl, compositePrimary))
@@ -1836,6 +1879,7 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
         + bodyCenterOffsetY
         + multiAngleRowShift
         - infoProductLiftY * areaHeight
+        + infoAutomaticLayout.dropY * areaHeight
         + (usesAutomaticDetailCutout && !automaticInteriorDetail ? (vipDetailOffset + 0.02) * areaHeight : 0)
         - (!hasManualCrop ? productAutoLift * areaHeight : 0)
         + (tallHandleDropAware && productLayer && !hasManualCrop

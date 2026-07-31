@@ -14,6 +14,8 @@ from backend.services.vip_organizer_service import (
     _detail_shape_offset_y,
     _api_analysis_prompt,
     _font,
+    _info_product_auto_layout,
+    _info_width_ruler_geometry,
     _jd_product_body_bbox,
     _jd_size_product_layout,
     _model_showcase_page,
@@ -21,6 +23,7 @@ from backend.services.vip_organizer_service import (
     _multi_angle_visual_row_shift,
     _normalized_product_page,
     _paste_layer,
+    _paste_info_product,
     _paste_product,
     _refine_product_classifications,
     _render_slot_image,
@@ -334,6 +337,56 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         assert foreground is not None
         self.assertLessEqual(foreground[3], INFO_PRODUCT_BOX[3])
         self.assertGreaterEqual(INFO_LENGTH_LINE_Y - foreground[3], 28)
+
+    def test_info_page_lowers_no_handle_bags_and_reduces_right_edge_pressure(self):
+        wide_layout = _info_product_auto_layout(
+            520,
+            240,
+            (0, 0, 520, 240),
+            0.0,
+        )
+        tall_handle_layout = _info_product_auto_layout(
+            220,
+            520,
+            (0, 180, 220, 520),
+            0.8,
+        )
+
+        self.assertEqual(wide_layout["scale"], 0.92)
+        self.assertEqual(wide_layout["shift_x"], -16)
+        self.assertAlmostEqual(wide_layout["drop_y"], 0.028)
+        self.assertEqual(tall_handle_layout["scale"], 1.0)
+        self.assertEqual(tall_handle_layout["shift_x"], 0.0)
+        self.assertEqual(tall_handle_layout["drop_y"], 0.0)
+
+        width_ruler = _info_width_ruler_geometry(
+            (330, 260, 640, 480),
+            product_center=(490.5, 374.5),
+        )
+        self.assertEqual(len(width_ruler["segments"]), 3)
+        self.assertGreater(width_ruler["segments"][0][1][0], width_ruler["segments"][0][0][0])
+
+    def test_info_page_manual_movement_stays_linear_from_automatic_baseline(self):
+        source = Image.new("RGBA", (520, 240), (74, 118, 158, 255))
+        base_canvas = Image.new("RGB", (750, 665), "white")
+        moved_canvas = Image.new("RGB", (750, 665), "white")
+        base = _paste_info_product(base_canvas, source, None)
+        moved = _paste_info_product(
+            moved_canvas,
+            source,
+            {"offset_x": 0.1, "offset_y": -0.1},
+        )
+
+        expected_x = round(0.1 * (INFO_PRODUCT_BOX[2] - INFO_PRODUCT_BOX[0]))
+        expected_y = round(-0.1 * (INFO_PRODUCT_BOX[3] - INFO_PRODUCT_BOX[1]))
+        for edge in (0, 2):
+            self.assertAlmostEqual(moved[edge] - base[edge], expected_x, delta=1)
+        for edge in (1, 3):
+            self.assertAlmostEqual(moved[edge] - base[edge], expected_y, delta=1)
+        self.assertGreater(
+            (base[1] + base[3]) / 2,
+            (INFO_PRODUCT_BOX[1] + INFO_PRODUCT_BOX[3]) / 2 + 5,
+        )
 
     def test_high_confidence_primary_roles(self):
         cases = [
