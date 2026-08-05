@@ -4768,6 +4768,10 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                         & (yy >= dark_contact_start)
                         & (xx >= dark_body_left)
                         & (xx < dark_body_right)
+                        & (
+                            hsv[:, :, 2]
+                            <= max(65.0, median_material_value * 0.72)
+                        )
                         & ~terminal_hardware
                     )
                     if np.any(dark_contact_tail):

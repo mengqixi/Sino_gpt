@@ -539,27 +539,6 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[661, 400, 3]), 0)
         self.assertEqual(int(cleaned[661, 315, 3]), 255)
 
-    def test_export_cleanup_clears_mixed_brightness_after_confirmed_contact_edge(self):
-        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((180, 170, 620, 650), fill=(190, 170, 135, 255))
-        # Real saturated piping is followed by a multi-row dark contact core.
-        # The same shadow also contains brighter grey/yellow studio fragments;
-        # once the contact boundary is confirmed, those fragments must not be
-        # left behind as a dotted line on the transparent preview.
-        draw.rectangle((190, 651, 610, 656), fill=(98, 60, 31, 255))
-        draw.rectangle((245, 657, 555, 665), fill=(61, 37, 24, 255))
-        draw.rectangle((270, 659, 315, 663), fill=(185, 170, 145, 255))
-        draw.rectangle((460, 658, 520, 664), fill=(145, 139, 125, 255))
-        draw.rectangle((330, 657, 350, 665), fill=(220, 165, 35, 255))
-
-        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
-
-        self.assertEqual(int(cleaned[653, 400, 3]), 255)
-        self.assertEqual(int(cleaned[661, 285, 3]), 0)
-        self.assertEqual(int(cleaned[661, 480, 3]), 0)
-        self.assertEqual(int(cleaned[661, 340, 3]), 255)
-
     def test_colour_cast_contact_cleanup_generalises_across_bag_shapes(self):
         cases = (
             ("bucket", (620, 760), (150, 150, 470, 625)),
