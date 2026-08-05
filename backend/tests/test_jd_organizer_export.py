@@ -834,7 +834,7 @@ def test_vip_info_long_handles_are_lifted_away_from_footer():
 
 
 def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
-    info = {"product_length": "195", "product_width": "55", "product_height": "140"}
+    info = {"product_length": "195", "product_height": "140", "product_thickness": "55"}
     source = _vip_info_test_source()
     adjustment = {"zoom": 1.1, "offset_x": 0.08, "offset_y": -0.04}
 
@@ -845,6 +845,11 @@ def test_vip_info_rulers_remain_visible_in_both_adjustment_modes():
 
     assert product_only.getpixel((adjusted_ruler["left"] + 5, adjusted_ruler["horizontal_y"])) != (255, 255, 255)
     assert np.array_equal(np.asarray(product_only), np.asarray(linked))
+
+
+def test_product_thickness_prefers_new_api_field_and_accepts_legacy_width():
+    assert service._product_thickness({"product_thickness": "55", "product_width": "99"}) == "55"
+    assert service._product_thickness({"product_width": "55"}) == "55"
 
 
 def test_jd_product_zoom_keeps_one_baseline_transform_for_every_shape():

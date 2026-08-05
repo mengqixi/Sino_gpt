@@ -123,9 +123,24 @@ type OrganizerPlatform = "vip" | "jd";
 type PreviewFolder = "800" | "750";
 const JD_SINGLE_FOLDER_FILES = new Set(["0-无logo.jpg", "透明.png"]);
 const JD_MEASURE_COLOR = "#707070";
+const JD_PHONE_SCALE_MAX = 4;
+const ORGANIZER_CANVAS_FONT = '"OrganizerNotoSans"';
+
+let organizerCanvasFontsReady: Promise<unknown> | null = null;
+
+function ensureOrganizerCanvasFonts() {
+  if (!organizerCanvasFontsReady) {
+    organizerCanvasFontsReady = Promise.all([
+      document.fonts.load(`400 19px ${ORGANIZER_CANVAS_FONT}`),
+      document.fonts.load(`500 12px ${ORGANIZER_CANVAS_FONT}`),
+      document.fonts.load(`700 32px ${ORGANIZER_CANVAS_FONT}`)
+    ]);
+  }
+  return organizerCanvasFontsReady;
+}
 
 function jdMeasureFont(output: { width: number; height: number }) {
-  return `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+  return `400 ${Math.max(14, Math.round(Math.min(output.width, output.height) * 0.022))}px ${ORGANIZER_CANVAS_FONT}`;
 }
 
 function jdPhoneLabelFont(
@@ -136,7 +151,10 @@ function jdPhoneLabelFont(
   const regularSize = Math.max(12, Math.round(Math.min(output.width, output.height) * 0.017));
   const adaptiveSize = Math.max(10, Math.min(regularSize, Math.round(phoneHeight * 0.085)));
   const scaledSize = Math.max(8, Math.round(adaptiveSize * labelScale));
-  return `500 ${scaledSize}px sans-serif`;
+  // Small text loses noticeably more coverage than the larger ruler labels
+  // after browser/image antialiasing. Medium keeps the same #707070 ink while
+  // matching their perceived darkness at the final rendered size.
+  return `500 ${scaledSize}px ${ORGANIZER_CANVAS_FONT}`;
 }
 
 function jdPhoneLabelGap(output: { width: number; height: number }, phoneHeight: number) {
@@ -231,6 +249,10 @@ function slotDisplayTitle(platform: OrganizerPlatform, fileName: string, fallbac
 
 function normalizeAdjustment(value?: Partial<ImageAdjustment>): ImageAdjustment {
   return { ...DEFAULT_ADJUSTMENT, ...(value || {}) };
+}
+
+function productThickness(productInfo: Record<string, string>) {
+  return productInfo.product_thickness || productInfo.product_width || "";
 }
 
 function vipInfoProductScale(handleLift = 0) {
@@ -1094,7 +1116,7 @@ function drawVipInfoStaticPreview(
 ) {
   context.save();
   context.fillStyle = "#101010";
-  context.font = "700 32px sans-serif";
+  context.font = `700 32px ${ORGANIZER_CANVAS_FONT}`;
   context.textAlign = "left";
   context.textBaseline = "top";
   context.fillText("\u4ea7\u54c1\u4fe1\u606f", 290, 40);
@@ -1107,10 +1129,10 @@ function drawVipInfoStaticPreview(
   rows.forEach(([label, value], index) => {
     const y = 216 + index * 96;
     context.fillStyle = "#111111";
-    context.font = "700 20px sans-serif";
+    context.font = `700 20px ${ORGANIZER_CANVAS_FONT}`;
     context.fillText(label, VIP_INFO_TEXT_X, y);
     context.fillStyle = "#555555";
-    context.font = "19px sans-serif";
+    context.font = `400 19px ${ORGANIZER_CANVAS_FONT}`;
     context.fillText(value.slice(0, 18), VIP_INFO_TEXT_X, y + 34);
   });
   context.restore();
@@ -1849,6 +1871,7 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    let disposed = false;
     const context = canvas.getContext("2d");
     if (!context) return;
     const output = slotCanvasSize(slot.size, platform, targetFolder);
@@ -2122,14 +2145,14 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
           output
         );
         const lengthValue = Number.parseFloat(productInfo.product_length || "");
-        const widthValue = Number.parseFloat(productInfo.product_width || "");
+        const thicknessValue = Number.parseFloat(productThickness(productInfo));
         const heightValue = Number.parseFloat(productInfo.product_height || "");
         const dimensionLabel = (value: number) => Number.isFinite(value) ? `${Math.round(value)}mm` : "--mm";
         context.save();
         context.strokeStyle = lineColor;
         context.fillStyle = "#555";
         context.lineWidth = 2 * Math.min(scaleX, scaleY);
-        context.font = `${Math.max(12, Math.round(19 * Math.min(scaleX, scaleY)))}px sans-serif`;
+        context.font = `400 ${Math.max(12, Math.round(19 * Math.min(scaleX, scaleY)))}px ${ORGANIZER_CANVAS_FONT}`;
         context.textAlign = "center";
         context.beginPath();
         context.moveTo(lengthRuler.start.x, lengthRuler.start.y);
@@ -2150,6 +2173,7 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
         });
         context.stroke();
         context.fillText(dimensionLabel(lengthValue), (lengthRuler.start.x + lengthRuler.end.x) / 2, lengthRuler.start.y + 36 * scaleY);
+        context.font = `400 ${Math.max(12, Math.round(18 * Math.min(scaleX, scaleY)))}px ${ORGANIZER_CANVAS_FONT}`;
         context.save();
         context.translate(heightRuler.start.x - 31 * scaleX, (heightRuler.start.y + heightRuler.end.y) / 2 - 7 * scaleY);
         context.rotate(-Math.PI / 2);
@@ -2159,7 +2183,7 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
         context.translate(widthRuler.text.x * scaleX, widthRuler.text.y * scaleY);
         context.rotate(-26 * Math.PI / 180);
         context.textBaseline = "middle";
-        context.fillText(dimensionLabel(widthValue), 0, 0);
+        context.fillText(dimensionLabel(thicknessValue), 0, 0);
         context.restore();
         context.restore();
       }
@@ -2177,7 +2201,11 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
     if (logoReference) logoReference.addEventListener("load", draw);
     if (preparedProduct) preparedProduct.addEventListener("load", draw);
     draw();
+    void ensureOrganizerCanvasFonts().then(() => {
+      if (!disposed) draw();
+    });
     return () => {
+      disposed = true;
       image.removeEventListener("load", draw);
       if (compositePrimary) compositePrimary.removeEventListener("load", draw);
       if (phoneReference) phoneReference.removeEventListener("load", draw);
@@ -2200,6 +2228,7 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
     templateUrl,
     logoColor,
     productInfo.product_length,
+    productInfo.product_thickness,
     productInfo.product_width,
     productInfo.product_height,
     productInfo.main_material,
@@ -2405,6 +2434,7 @@ function SlotAdjustmentEditor({
   const previewTimerRef = useRef<number | null>(null);
   const moveTargetRef = useRef<AdjustmentTarget>("product");
   const linkedProductRulersRef = useRef(false);
+  const defaultPhoneLinkAppliedRef = useRef(false);
 
   const activeMoveTarget: AdjustmentTarget = isInfoPage
     ? (infoMoveTarget === "product_rulers" ? "product" : infoMoveTarget)
@@ -2547,6 +2577,29 @@ function SlotAdjustmentEditor({
     };
   }
 
+  useEffect(() => {
+    if (!isPhoneObjectEditor || defaultPhoneLinkAppliedRef.current) return;
+    const productImage = livePreviewImage(sourceUrl);
+    const phoneReference = livePreviewImage("/organizer-assets/iphone_reference.png");
+    const applyDefaultPhoneLink = () => {
+      if (defaultPhoneLinkAppliedRef.current) return;
+      if (!productImage.complete || !productImage.naturalWidth) return;
+      if (!phoneReference.complete || !phoneReference.naturalWidth) return;
+      defaultPhoneLinkAppliedRef.current = true;
+      const current = draftRef.current;
+      let next = withPhoneRulerLinkPreservingPosition(current, true);
+      next = withPhoneLabelLinkPreservingPosition(next, true);
+      if (next !== current) applyDraft(next, false, false);
+    };
+    productImage.addEventListener("load", applyDefaultPhoneLink);
+    phoneReference.addEventListener("load", applyDefaultPhoneLink);
+    applyDefaultPhoneLink();
+    return () => {
+      productImage.removeEventListener("load", applyDefaultPhoneLink);
+      phoneReference.removeEventListener("load", applyDefaultPhoneLink);
+    };
+  }, [isPhoneObjectEditor, sourceUrl]);
+
   function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
     if (!isInfoPage && !isPhoneComparison) return null;
     if (isInfoPage) {
@@ -2573,6 +2626,21 @@ function SlotAdjustmentEditor({
       return geometry.body;
     }
     return null;
+  }
+
+  function withInfoRulerBaseline(current: ImageAdjustment): ImageAdjustment {
+    if (storedProductRulerBase(current)) return current;
+    const body = productRulerBodyForDraft(current);
+    return body ? {
+      ...current,
+      product_ruler_base_left: body.left,
+      product_ruler_base_top: body.top,
+      product_ruler_base_right: body.right,
+      product_ruler_base_bottom: body.bottom,
+      product_ruler_group_scale: current.product_ruler_group_scale || 1,
+      product_ruler_group_offset_x: current.product_ruler_group_offset_x || 0,
+      product_ruler_group_offset_y: current.product_ruler_group_offset_y || 0
+    } : current;
   }
 
   function withSyncedProductRulerBody(nextDraft: ImageAdjustment): ImageAdjustment {
@@ -2675,6 +2743,15 @@ function SlotAdjustmentEditor({
     }
   }
 
+  function setProductRulerLinkMode(linked: boolean) {
+    const previous = draftRef.current;
+    const current = withInfoRulerBaseline(previous);
+    if (current === previous && (current.product_show_ruler !== false) === linked) return;
+    const next = { ...current, product_show_ruler: linked };
+    draftRef.current = next;
+    setDraft(next);
+  }
+
   function changeLogoColor(nextColor: LogoColor) {
     if (logoColorRef.current === nextColor) return;
     cancelStalePreview();
@@ -2769,7 +2846,7 @@ function SlotAdjustmentEditor({
       const delta = event.deltaY < 0 ? 0.02 : -0.02;
       const current = draftRef.current;
       const target = moveTargetRef.current;
-      const maximum = target === "product" ? 4 : target === "phone" ? 1.8 : 2;
+      const maximum = target === "product" ? 4 : target === "phone" ? JD_PHONE_SCALE_MAX : 2;
       const nextScale = Math.max(0.5, Math.min(maximum, Math.round((targetScale(current, target) + delta) * 100) / 100));
       applyDraft(updateTargetScale(current, target, nextScale));
     };
@@ -2888,7 +2965,7 @@ function SlotAdjustmentEditor({
 
   function changeZoom(delta: number) {
     const current = draftRef.current;
-    const maximum = activeMoveTarget === "product" ? 4 : activeMoveTarget === "phone" ? 1.8 : 2;
+    const maximum = activeMoveTarget === "product" ? 4 : activeMoveTarget === "phone" ? JD_PHONE_SCALE_MAX : 2;
     const nextScale = Math.max(0.5, Math.min(maximum, Math.round((targetScale(current, activeMoveTarget) + delta) * 100) / 100));
     applyDraft(updateTargetScale(current, activeMoveTarget, nextScale));
   }
@@ -3039,7 +3116,7 @@ function SlotAdjustmentEditor({
         <header>
           <div>
             <strong>{slot.file_name} · {slot.title}</strong>
-            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? (draft.phone_show_ruler !== false ? "手机和高标线" : "手机") : moveTarget === "phone_label" ? "iPhone文字" : moveTarget === "phone_ruler" ? "高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
+            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? (draft.phone_show_ruler !== false ? "手机和高标线" : "手机") : moveTarget === "phone_label" ? "iPhone文字" : moveTarget === "phone_ruler" ? "高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "厚标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
           </div>
           <button type="button" className="icon-button" onClick={requestClose} title="关闭"><X size={21} /></button>
         </header>
@@ -3237,14 +3314,12 @@ function SlotAdjustmentEditor({
                 // Keep the independently positioned ruler baseline intact.
                 // Subsequent linked moves transform it by the same product
                 // delta instead of snapping it back onto the product body.
-                applyDraft({ ...draftRef.current, product_show_ruler: true }, false);
+                setProductRulerLinkMode(true);
               }}>全部</button>
               <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product");
                 linkedProductRulersRef.current = false;
-                if (draftRef.current.product_show_ruler !== false) {
-                  applyDraft({ ...draftRef.current, product_show_ruler: false }, false);
-                }
+                setProductRulerLinkMode(false);
               }}>商品图</button>
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("length_ruler");
@@ -3260,7 +3335,7 @@ function SlotAdjustmentEditor({
                 setInfoMoveTarget("width_ruler");
                 linkedProductRulersRef.current = false;
                 setCropMode(false);
-              }}>宽标线</button>
+              }}>厚标线</button>
             </> : <>
               <button type="button" className={moveTarget === "product" && draft.product_show_ruler !== false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("product");
@@ -3533,12 +3608,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   const [info, setInfo] = useState({
     product_name: "ELLE箱包",
     product_length: "",
-    product_width: "",
     product_height: "",
+    product_thickness: "",
     main_material: "",
     lining_material: "",
     wearing_method: "",
-    disclaimer: "包身长宽高测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
+    disclaimer: "包身长高厚测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
   });
 
   const allAssets = useMemo(() => [...(assets.product || []), ...(assets.model || []), ...(assets.tag || [])], [assets]);
@@ -3577,7 +3652,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   }, [slots]);
 
   function organizerProductInfo() {
-    const dimensions = [info.product_length, info.product_width, info.product_height]
+    const dimensions = [info.product_length, info.product_height, info.product_thickness]
       .map((value) => value.trim())
       .filter(Boolean)
       .join(" × ");
@@ -4654,8 +4729,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           <div className="organizer-info-grid">
             <label>商品名称<input value={info.product_name} onChange={(event) => setInfo({ ...info, product_name: event.target.value })} /></label>
             <label>长（mm）<input inputMode="decimal" placeholder="例如：200" value={info.product_length} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
-            <label>宽（mm）<input inputMode="decimal" placeholder="例如：80" value={info.product_width} onChange={(event) => setInfo({ ...info, product_width: event.target.value })} /></label>
             <label>高（mm）<input inputMode="decimal" placeholder="例如：140" value={info.product_height} onChange={(event) => setInfo({ ...info, product_height: event.target.value })} /></label>
+            <label>厚（mm）<input inputMode="decimal" placeholder="例如：80" value={info.product_thickness} onChange={(event) => setInfo({ ...info, product_thickness: event.target.value })} /></label>
             <label>主要材质<input value={info.main_material} onChange={(event) => setInfo({ ...info, main_material: event.target.value })} /></label>
             <label>里料材质<input value={info.lining_material} onChange={(event) => setInfo({ ...info, lining_material: event.target.value })} /></label>
             <label>包型背法<input placeholder="例如：单肩/斜挎" value={info.wearing_method} onChange={(event) => setInfo({ ...info, wearing_method: event.target.value })} /></label>

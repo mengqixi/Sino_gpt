@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "OrganizerNotoSans";
+  src: url("/organizer-assets/fonts/NotoSansSC-VF-GB2312.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
 :root {
   font-family: Inter, "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
   color: #202124;

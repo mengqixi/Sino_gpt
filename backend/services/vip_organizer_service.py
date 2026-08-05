@@ -5593,7 +5593,7 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "crop_y": crop_y,
         "crop_width": crop_width,
         "crop_height": crop_height,
-        "phone_scale": number("phone_scale", 1.0, 0.5, 1.8),
+        "phone_scale": number("phone_scale", 1.0, 0.5, 4.0),
         "phone_offset_x": number("phone_offset_x", 0.0, -1.5, 1.5),
         "phone_offset_y": number("phone_offset_y", 0.0, -1.5, 1.5),
         "phone_label_scale": number("phone_label_scale", 1.0, 0.5, 2.0),
@@ -6499,6 +6499,11 @@ def _dimension_mm(value: str) -> str:
     return f"{rendered}mm"
 
 
+def _product_thickness(product_info: dict[str, str]) -> str:
+    """Read the canonical thickness field while accepting legacy width payloads."""
+    return product_info.get("product_thickness") or product_info.get("product_width") or ""
+
+
 def _draw_rotated_text(
     canvas: Image.Image,
     text: str,
@@ -6661,13 +6666,13 @@ def _info_page(
     draw_ruler_segments(width_ruler["segments"])
     _draw_rotated_text_centered(
         image,
-        _dimension_mm(info.get("product_width") or ""),
+        _dimension_mm(_product_thickness(info)),
         width_ruler["text"],
         26,
         _font(18),
     )
 
-    disclaimer = info.get("disclaimer") or "包身长宽高测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
+    disclaimer = info.get("disclaimer") or "包身长高厚测量均为最长部分\n误差在1-2cm之间因手工测量均属正常"
     notes = [line.strip() for line in disclaimer.splitlines() if line.strip()]
     if len(notes) < 2:
         notes = textwrap.wrap(disclaimer.replace("\n", " "), width=31)[:2]
@@ -7126,6 +7131,18 @@ def _jd_measure_font(size: tuple[int, int]) -> ImageFont.ImageFont:
     return _font(max(14, round(min(size) * 0.022)))
 
 
+@lru_cache(maxsize=24)
+def _jd_phone_medium_font(size: int) -> ImageFont.ImageFont:
+    if BUNDLED_FONT_PATH.exists():
+        font = ImageFont.truetype(str(BUNDLED_FONT_PATH), size=size)
+        try:
+            font.set_variation_by_name("Medium")
+        except (AttributeError, OSError):
+            pass
+        return font
+    return _font(size)
+
+
 def _jd_phone_label_font(
     size: tuple[int, int],
     phone_height: int,
@@ -7133,7 +7150,7 @@ def _jd_phone_label_font(
 ) -> ImageFont.ImageFont:
     regular_size = max(12, round(min(size) * 0.017))
     adaptive_size = max(10, min(regular_size, round(phone_height * 0.085)))
-    return _font(max(8, round(adaptive_size * label_scale)))
+    return _jd_phone_medium_font(max(8, round(adaptive_size * label_scale)))
 
 
 def _jd_phone_label_gap(size: tuple[int, int], phone_height: int) -> int:
