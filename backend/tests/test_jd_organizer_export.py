@@ -1,5 +1,7 @@
 import zipfile
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
@@ -123,6 +125,79 @@ def test_jd_folder_adjustments_are_normalized_and_kept_separately():
     assert service._slot_adjustments_for_folder(slot, "800")[0]["offset_x"] == 0.12
     assert service._slot_adjustments_for_folder(slot, "750")[0]["zoom"] == 0.91
     assert service._slot_adjustments_for_folder(slot, "750")[0]["offset_y"] == -0.08
+
+
+def test_jd_logo_colors_are_kept_separately_per_folder():
+    slot_map = service._slot_map(
+        [
+            {
+                "file_name": "1.jpg",
+                "image_ids": [1],
+                "adjustments": [],
+                "logo_color": "black",
+                "folder_logo_colors": {
+                    "800": "white",
+                    "750": "black",
+                    "unknown": "white",
+                },
+            }
+        ],
+        "jd",
+    )
+
+    slot = slot_map["1.jpg"]
+    assert slot["folder_logo_colors"] == {"800": "white", "750": "black"}
+    assert service._slot_logo_color_for_folder(slot, "800") == "white"
+    assert service._slot_logo_color_for_folder(slot, "750") == "black"
+    assert service._slot_logo_color_for_folder(slot, "other") == "black"
+
+
+def test_jd_export_uses_the_logo_color_for_each_folder():
+    captured: dict[str, str] = {}
+
+    def render_slot(
+        file_name,
+        _image_ids,
+        _product_info,
+        _adjustments,
+        _platform,
+        target_folder,
+        logo_color,
+    ):
+        if file_name == "1.jpg":
+            captured[target_folder] = logo_color
+        return Image.new("RGB", (32, 32), "white")
+
+    slots = [
+        {
+            "file_name": file_name,
+            "image_ids": [1],
+            "adjustments": [],
+            **(
+                {
+                    "logo_color": "black",
+                    "folder_logo_colors": {"800": "white", "750": "black"},
+                }
+                if file_name == "1.jpg"
+                else {}
+            ),
+        }
+        for file_name, *_ in service.JD_SLOT_DEFINITIONS
+    ]
+    with (
+        TemporaryDirectory() as temporary_directory,
+        patch.object(service, "_session_result_dir", return_value=Path(temporary_directory)),
+        patch.object(service, "_validate_slot_map"),
+        patch.object(service, "_render_slot_image", side_effect=render_slot),
+    ):
+        service._export_package(
+            "a" * 32,
+            slots,
+            {"product_length": "200", "product_height": "140"},
+            "jd",
+        )
+
+    assert captured == {"800": "white", "750": "black"}
 
 
 def test_jd_export_uses_the_adjustments_for_each_target_folder(tmp_path, monkeypatch):
@@ -1015,11 +1090,37 @@ def test_jd_phone_first_zoom_step_keeps_the_automatic_anchor():
             })
 
         base, zoomed = phone_positions
+        assert zoomed[3] > base[3]
         assert abs((base[0] + base[2] / 2) - (zoomed[0] + zoomed[2] / 2)) <= 1
         if alignment == "bottom":
             assert abs((base[1] + base[3]) - (zoomed[1] + zoomed[3])) <= 1
         else:
             assert abs((base[1] + base[3] / 2) - (zoomed[1] + zoomed[3] / 2)) <= 1
+
+
+def test_jd_default_comparison_group_keeps_a_safe_gap_and_ruler_clearance():
+    source = Image.new("RGBA", (700, 250), (80, 90, 105, 255))
+    body_box = (0, 0, 700, 250)
+    info = {"product_length": "400", "product_height": "60"}
+
+    for width, height in ((800, 800), (750, 1000)):
+        layout = service._jd_size_product_layout(source, body_box, (width, height), info, None)
+        safe_right = layout["safe_box"][2]
+        object_gap = max(16, round(width * 0.025))
+        phone_ruler_gap = max(22, round(width * 0.035))
+        phone_label_clearance = max(40, round(width * 0.05))
+        phone_height = max(
+            round(height * 0.095),
+            min(
+                round(height * 0.46),
+                round(layout["base_body_height"] * service.JD_PHONE_HEIGHT_MM / layout["height_mm"]),
+            ),
+        )
+        phone_width = max(42, round(phone_height * service.JD_PHONE_ASPECT_RATIO))
+        phone_left = layout["body_box"][2] + object_gap
+
+        assert phone_left - layout["body_box"][2] == object_gap
+        assert phone_left + phone_width + phone_ruler_gap + phone_label_clearance <= safe_right + 2
 
 
 def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
@@ -1230,6 +1331,12 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_logo_uses_supplied_template(self):
         test_jd_logo_layers_use_the_supplied_templates_exactly()
 
+    def test_logo_colors_are_independent_per_folder(self):
+        test_jd_logo_colors_are_kept_separately_per_folder()
+
+    def test_export_uses_independent_folder_logo_colors(self):
+        test_jd_export_uses_the_logo_color_for_each_folder()
+
     def test_shape_profiles(self):
         test_jd_shape_profiles_cover_extreme_and_common_handbag_proportions()
 
@@ -1259,6 +1366,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_phone_first_zoom_step_keeps_anchor(self):
         test_jd_phone_first_zoom_step_keeps_the_automatic_anchor()
+
+    def test_default_comparison_group_keeps_safe_spacing(self):
+        test_jd_default_comparison_group_keeps_a_safe_gap_and_ruler_clearance()
 
     def test_jd_object_only_modes_keep_rulers_visible(self):
         test_jd_size_rulers_stay_visible_when_adjusting_objects_only()

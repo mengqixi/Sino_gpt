@@ -54,6 +54,7 @@ MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
 JD_MEASURE_COLOR = "#707070"
+JD_PHONE_ASPECT_RATIO = 553 / 710
 
 
 SLOT_DEFINITIONS = [
@@ -1715,6 +1716,102 @@ def _predict_product_matte(source: Image.Image) -> np.ndarray | None:
                 return np.asarray(matte_image.convert("L"), dtype=np.float32) / 255.0
         except (OSError, subprocess.SubprocessError, ValueError):
             return None
+
+
+def _model_dominant_pale_silver_alpha(
+    model_matte: np.ndarray,
+    *,
+    connected_background: np.ndarray,
+    lab_distance: np.ndarray,
+    saturation: np.ndarray,
+    value: np.ndarray,
+    current_alpha: np.ndarray,
+    strict_hardware: np.ndarray,
+) -> np.ndarray:
+    """Build a white-studio matte for pale bags with repeated silver chain.
+
+    The model is the more reliable body prior for this narrow case. Studio
+    white still wins where it is connected to the canvas and model confidence
+    is not decisive, which opens chain-link gaps without cutting white leather.
+    """
+    shape = model_matte.shape
+    if any(
+        array.shape != shape
+        for array in (
+            connected_background,
+            lab_distance,
+            saturation,
+            value,
+            current_alpha,
+            strict_hardware,
+        )
+    ):
+        return current_alpha
+    model = np.clip(model_matte.astype(np.float32), 0.0, 1.0)
+    confidence = np.clip((model - 0.55) / (0.98 - 0.55), 0.0, 1.0)
+    confidence = cv2.GaussianBlur(confidence, (0, 0), 0.45)
+    locked_studio_white = (
+        connected_background
+        & (lab_distance <= 14)
+        & (saturation <= 22)
+        & (value >= 225)
+        & (model < 0.94)
+    )
+    confidence[locked_studio_white] = 0.0
+    confidence[model >= 0.97] = 1.0
+    alpha = np.round(confidence * 255.0).astype(np.uint8)
+    alpha[strict_hardware] = np.maximum(
+        alpha[strict_hardware],
+        current_alpha[strict_hardware],
+    )
+    return _clear_shallow_model_body_fringe(alpha)
+
+
+def _clear_shallow_model_body_fringe(alpha: np.ndarray) -> np.ndarray:
+    """Clear short white feather shelves above a broad model-supported body."""
+    if alpha.ndim != 2 or min(alpha.shape) < 24:
+        return alpha
+    strong = alpha >= 220
+    row_widths = np.count_nonzero(strong, axis=1)
+    widest = int(np.max(row_widths))
+    if widest < max(24, round(alpha.shape[1] * 0.20)):
+        return alpha
+    broad_rows = np.flatnonzero(row_widths >= round(widest * 0.70))
+    if not broad_rows.size:
+        return alpha
+    body_top = int(broad_rows[0])
+    sample_bottom = min(alpha.shape[0], body_top + max(6, round(alpha.shape[0] * 0.03)))
+    sample_rows = np.arange(body_top, sample_bottom)
+    if not sample_rows.size:
+        return alpha
+    widest_sample_row = int(sample_rows[np.argmax(row_widths[sample_rows])])
+    body_columns = np.flatnonzero(strong[widest_sample_row])
+    if not body_columns.size:
+        return alpha
+    body_left = int(body_columns.min())
+    body_right = int(body_columns.max())
+    clearance = max(5, round(alpha.shape[0] * 0.010))
+    row_grid = np.arange(alpha.shape[0])[:, None]
+    column_grid = np.arange(alpha.shape[1])[None, :]
+    remote_upper_structure = (
+        (alpha >= 24)
+        & (row_grid <= body_top - clearance)
+    )
+    upper_keep = cv2.dilate(
+        remote_upper_structure.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=clearance + 1,
+    ).astype(bool)
+    shallow_fringe = (
+        (alpha > 0)
+        & (row_grid < body_top)
+        & (column_grid >= body_left)
+        & (column_grid <= body_right)
+        & ~upper_keep
+    )
+    cleaned = alpha.copy()
+    cleaned[shallow_fringe] = 0
+    return cleaned
 
 
 def _decontaminate_pale_studio_edge(
@@ -4113,6 +4210,20 @@ def _prepared_product_cutout(
                     strict_seed=cropped_strict_silver_hardware,
                 )
 
+        if model_matte is not None and pale_product and restore_source_silver:
+            alpha = _model_dominant_pale_silver_alpha(
+                cropped_model_matte,
+                connected_background=connected_background[
+                    top:bottom,
+                    left:right,
+                ],
+                lab_distance=cropped_lab_distance,
+                saturation=cropped_saturation,
+                value=cropped_value,
+                current_alpha=alpha,
+                strict_hardware=cropped_strict_silver_hardware,
+            )
+
     result = Image.fromarray(np.clip(cropped_rgb, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
     result.putalpha(Image.fromarray(alpha, "L"))
     return result
@@ -4344,14 +4455,11 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
             & (hsv[:, :, 2] >= 35)
             & (hsv[:, :, 2] <= 245)
             & (alpha > 8)
-            # Warm/neutral cast shadows can have the same local gradient as
-            # silver edges. Real silver in these white-studio photos keeps a
-            # cool-channel lead; require it before shielding a floor pixel.
-            & (blue >= red - 2)
-            & (
-                (gradient >= 22)
-                | (local_value_range >= 17)
-            )
+            # Silver can become warm-neutral under studio lighting. Require
+            # both a hard edge and alternating local values, then let the
+            # compact-component filter below reject broad shadow boundaries.
+            & (gradient >= 22)
+            & (local_value_range >= 17)
         )
         terminal_silver_core = cv2.morphologyEx(
             terminal_silver_core.astype(np.uint8),
@@ -4465,6 +4573,207 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 alpha[historical_tail_candidate] = 0
                 changed = True
 
+            # A white bag on a white sweep often leaves a fully opaque pale
+            # shelf plus darker contact-shadow pixels after the confidence
+            # collapse. Colour thresholds cannot remove both: the shelf looks
+            # like leather and the contact shadow is no longer bright. In this
+            # narrow white-studio case the sharp late alpha collapse is the
+            # reliable product boundary. Clear everything from that boundary
+            # down, while protecting compact gold/silver fittings and chains.
+            collapse_width = int(np.count_nonzero(
+                main_pixels[confidence_collapse_row]
+                & (alpha[confidence_collapse_row] > 8)
+            ))
+            pale_flat_terminal = (
+                median_material_value >= 165
+                and median_material_saturation <= 28
+                and collapse_width >= max(20, round(main_width * 0.40))
+            )
+            if pale_flat_terminal:
+                tail_start = confidence_collapse_row
+                if (
+                    confidence_collapse_row > main_top
+                    and row_alpha_medians[confidence_collapse_row - 1] < 245
+                ):
+                    tail_start -= 1
+                body_anchor_row = max(main_top, tail_start - 5)
+                body_anchor_columns = np.flatnonzero(
+                    main_pixels[body_anchor_row]
+                    & (alpha[body_anchor_row] >= 128)
+                )
+                terminal_body_left = central_left
+                terminal_body_right = central_right
+                if body_anchor_columns.size >= max(
+                    20,
+                    round(main_width * 0.40),
+                ):
+                    terminal_body_left = int(body_anchor_columns.min())
+                    terminal_body_right = int(body_anchor_columns.max()) + 1
+                central_tail = (
+                    main_pixels
+                    & (yy >= tail_start)
+                    & (xx >= terminal_body_left)
+                    & (xx < terminal_body_right)
+                )
+                side_tail = (
+                    main_pixels
+                    & (yy >= tail_start)
+                    & (
+                        (xx < terminal_body_left)
+                        | (xx >= terminal_body_right)
+                    )
+                    & ~terminal_hardware
+                )
+                pale_flat_tail = (
+                    central_tail
+                    | side_tail
+                )
+                if np.any(pale_flat_tail):
+                    alpha[pale_flat_tail] = 0
+                    changed = True
+
+        # Coloured and woven bags can carry a fully opaque, colour-cast
+        # contact shadow. Alpha-only and low-chroma rules miss it because it
+        # looks like a dark continuation of the material. Detect a late,
+        # broad drop in value relative to the bag itself, keep the last real
+        # piping rows above it, and clear the tail only inside the body span.
+        # Gold/silver chains crossing that span remain protected.
+        if (
+            median_material_value > 105
+            and median_material_saturation >= 50
+        ):
+            dark_contact_start: int | None = None
+            dark_contact_value_limit = max(
+                45.0,
+                median_material_value * 0.56,
+            )
+            minimum_dark_contact_width = max(
+                20,
+                round(main_width * 0.28),
+            )
+            dark_contact_scan_start = main_top + round(main_height * 0.90)
+            dark_row_measurements: list[tuple[int, float]] = []
+            for row in range(
+                max(main_top, dark_contact_scan_start),
+                main_top + main_height,
+            ):
+                row_pixels = (
+                    main_pixels[row, central_left:central_right]
+                    & (alpha[row, central_left:central_right] > 8)
+                )
+                row_count = int(np.count_nonzero(row_pixels))
+                if row_count < minimum_dark_contact_width:
+                    continue
+                row_value = float(np.median(
+                    hsv[row, central_left:central_right, 2][row_pixels]
+                ))
+                dark_row_measurements.append((row, row_value))
+
+            for index, (row, row_value) in enumerate(dark_row_measurements):
+                if row_value > dark_contact_value_limit:
+                    continue
+                previous_values = [
+                    value
+                    for _, value in dark_row_measurements[
+                        max(0, index - 8):index
+                    ]
+                ]
+                previous_material_value = (
+                    float(np.median(previous_values))
+                    if previous_values
+                    else median_material_value
+                )
+                if previous_material_value < median_material_value * 0.66:
+                    continue
+
+                # A real leather/straw piping band can itself be dark. It is
+                # usually several stable rows followed by a second, much
+                # darker drop into the cast shadow. Preserve that plateau and
+                # start at the second drop; a one-row drop is shadow already.
+                plateau_end = index
+                while plateau_end + 1 < len(dark_row_measurements):
+                    next_row, next_value = dark_row_measurements[plateau_end + 1]
+                    previous_row = dark_row_measurements[plateau_end][0]
+                    if (
+                        next_row != previous_row + 1
+                        or next_value < row_value * 0.85
+                        or next_value > row_value * 1.15
+                    ):
+                        break
+                    plateau_end += 1
+                plateau_length = plateau_end - index + 1
+                following_index = plateau_end + 1
+                if (
+                    plateau_length >= 3
+                    and following_index < len(dark_row_measurements)
+                    and dark_row_measurements[following_index][0]
+                    == dark_row_measurements[plateau_end][0] + 1
+                    and dark_row_measurements[following_index][1]
+                    <= row_value * 0.82
+                ):
+                    dark_contact_start = dark_row_measurements[
+                        following_index
+                    ][0]
+                else:
+                    dark_contact_start = row
+                break
+
+            if dark_contact_start is not None:
+                # Do not erase a genuine one- or two-row piping edge.  An
+                # opaque cast shadow has a measurable vertical footprint;
+                # isolated terminal lines are deliberately left intact when
+                # there is no second, deeper value transition.
+                dark_contact_rows = 0
+                for row in range(
+                    dark_contact_start,
+                    main_top + main_height,
+                ):
+                    row_pixels = (
+                        main_pixels[row, central_left:central_right]
+                        & (alpha[row, central_left:central_right] > 8)
+                    )
+                    if (
+                        int(np.count_nonzero(row_pixels))
+                        < minimum_dark_contact_width
+                    ):
+                        continue
+                    row_value = float(np.median(
+                        hsv[row, central_left:central_right, 2][row_pixels]
+                    ))
+                    if row_value <= max(
+                        65.0,
+                        median_material_value * 0.72,
+                    ):
+                        dark_contact_rows += 1
+                minimum_contact_rows = max(
+                    3,
+                    round(main_height * 0.004),
+                )
+                if dark_contact_rows < minimum_contact_rows:
+                    dark_contact_start = None
+
+            if dark_contact_start is not None:
+                body_anchor_row = max(main_top, dark_contact_start - 10)
+                body_anchor_columns = np.flatnonzero(
+                    main_pixels[body_anchor_row]
+                    & (alpha[body_anchor_row] >= 128)
+                    & (xx[body_anchor_row] >= central_left)
+                    & (xx[body_anchor_row] < central_right)
+                )
+                if body_anchor_columns.size >= minimum_dark_contact_width:
+                    dark_body_left = int(body_anchor_columns.min())
+                    dark_body_right = int(body_anchor_columns.max()) + 1
+                    dark_contact_tail = (
+                        main_pixels
+                        & (yy >= dark_contact_start)
+                        & (xx >= dark_body_left)
+                        & (xx < dark_body_right)
+                        & ~terminal_hardware
+                    )
+                    if np.any(dark_contact_tail):
+                        alpha[dark_contact_tail] = 0
+                        changed = True
+
         if floor_row is not None and median_material_value > 105:
             gold_core = (
                 (hsv[:, :, 0] >= 7)
@@ -4542,10 +4851,7 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 body_core_envelope = np.zeros_like(main_pixels)
                 lateral_shadow_runs = np.zeros_like(main_pixels)
                 product_center_x = main_left + main_width / 2
-                verified_floor_metal = gold_core | (
-                    silver_core
-                    & (blue >= red - 2)
-                )
+                verified_floor_metal = gold_core | silver_core
                 for row in range(taper_start, floor_row + 1):
                     row_columns = np.flatnonzero(
                         (alpha[row] >= 128)
@@ -4968,6 +5274,16 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     and mean_alpha < 190
                 ):
                     alpha[component_pixels] = 0
+
+    # Lanczos resizing and alpha feathering can leave sub-visible (1..8)
+    # colour specks after an attached shadow has been removed. They become a
+    # dirty dotted line on a grey marketplace preview even though they carry
+    # less than 3.2% opacity. Normalise this numerical tail globally; alpha 9
+    # and above remains untouched so real antialiased product edges survive.
+    numerical_alpha_tail = (alpha > 0) & (alpha <= 8)
+    if np.any(numerical_alpha_tail):
+        alpha[numerical_alpha_tail] = 0
+        changed = True
 
     if changed:
         result.putalpha(Image.fromarray(alpha, "L"))
@@ -6398,6 +6714,19 @@ def _jd_size_product_layout(
         physical_ratio,
     )
 
+    safe_left = round(width * 0.04)
+    safe_top = round(height * 0.04)
+    safe_right = round(width * 0.96)
+    safe_bottom = round(height * 0.96)
+    object_gap = max(16, round(width * 0.025))
+    product_ruler_gap = max(28, round(width * 0.045))
+    product_left_allowance = product_ruler_gap + max(24, round(width * 0.03))
+    phone_ruler_gap = max(22, round(width * 0.035))
+    phone_label_clearance = max(40, round(width * 0.05))
+    group_left_bound = safe_left + product_left_allowance
+    group_right_bound = safe_right - phone_ruler_gap - phone_label_clearance
+    group_available_width = max(1, group_right_bound - group_left_bound)
+
     preferred_body_width = width * preferred_width_ratio * max(0.82, min(1.08, length_mm / 205.0))
     base_scale = min(
         width * max_width_ratio / body_width,
@@ -6406,6 +6735,13 @@ def _jd_size_product_layout(
         height * 0.60 / max(1, cutout.height),
         preferred_body_width / body_width,
     )
+    for _ in range(2):
+        fitted_phone_height = max(
+            height * 0.095,
+            min(height * 0.46, body_height * base_scale * JD_PHONE_HEIGHT_MM / height_mm),
+        )
+        group_width = body_width * base_scale + object_gap + fitted_phone_height * JD_PHONE_ASPECT_RATIO
+        base_scale *= min(1.0, group_available_width / max(1.0, group_width))
     scale = base_scale * normalized["zoom"]
     rendered_width = max(1, round(cutout.width * scale))
     rendered_height = max(1, round(cutout.height * scale))
@@ -6416,14 +6752,20 @@ def _jd_size_product_layout(
         round(body_bottom * scale),
     )
 
-    desired_body_center_x = width * 0.34 + normalized["offset_x"] * width * 0.18
+    base_phone_height = max(
+        height * 0.095,
+        min(height * 0.46, body_height * base_scale * JD_PHONE_HEIGHT_MM / height_mm),
+    )
+    base_group_width = body_width * base_scale + object_gap + base_phone_height * JD_PHONE_ASPECT_RATIO
+    base_group_left = group_left_bound + max(0.0, group_available_width - base_group_width) / 2
+    desired_body_center_x = (
+        base_group_left
+        + body_width * base_scale / 2
+        + normalized["offset_x"] * width * 0.18
+    )
     desired_body_bottom = height * (0.70 if height > width else 0.73) + normalized["offset_y"] * height * 0.18
     paste_x = round(desired_body_center_x - (scaled_body[0] + scaled_body[2]) / 2)
     paste_y = round(desired_body_bottom - scaled_body[3])
-    safe_left = round(width * 0.04)
-    safe_top = round(height * 0.04)
-    safe_right = round(width * 0.96)
-    safe_bottom = round(height * 0.96)
 
     def clamp_origin(position: int, layer_size: int, minimum: int, maximum: int) -> int:
         if layer_size <= maximum - minimum:
@@ -6469,6 +6811,7 @@ def _jd_size_product_layout(
         "rendered_height": rendered_height,
         "body_box": rendered_body,
         "height_mm": height_mm,
+        "automatic_body_center_x": base_group_left + body_width * base_scale / 2,
         "safe_box": (safe_left, safe_top, safe_right, safe_bottom),
     }
 
@@ -6663,7 +7006,9 @@ def _jd_comparison_product_layout(
     )
     width, height = size
     base_body = base_layout["body_box"]
-    baseline_shift_x = round((base_body[0] + base_body[2]) / 2 - width * 0.34)
+    baseline_shift_x = round(
+        (base_body[0] + base_body[2]) / 2 - base_layout["automatic_body_center_x"]
+    )
     baseline_shift_y = round(base_body[3] - height * (0.70 if height > width else 0.73))
     shifted_body = tuple(
         value + (baseline_shift_x if index % 2 == 0 else baseline_shift_y)
@@ -6709,8 +7054,7 @@ def _jd_size_comparison_page(
     rendered_pixels_per_mm = layout["base_body_height"] / max(1.0, layout["height_mm"])
     base_phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm)
     base_phone_height = max(round(height * 0.095), min(round(height * 0.46), base_phone_height))
-    phone_height = round(JD_PHONE_HEIGHT_MM * rendered_pixels_per_mm * normalized["phone_scale"])
-    phone_height = max(round(height * 0.095), min(round(height * 0.46), phone_height))
+    phone_height = max(1, round(base_phone_height * normalized["phone_scale"]))
     reference = _jd_phone_reference_layer()
     reference_ratio = reference.width / reference.height if reference is not None else 0.83
     base_phone_width = max(42, round(base_phone_height * reference_ratio))
@@ -6719,7 +7063,8 @@ def _jd_size_comparison_page(
     phone_label_clearance = max(40, round(width * 0.05))
     phone_right_allowance = phone_ruler_gap + phone_label_clearance
     phone_bottom_allowance = max(28, round(height * 0.055))
-    base_phone_left = round(width * 0.75 - base_phone_width / 2)
+    object_gap = max(16, round(width * 0.025))
+    base_phone_left = base_layout["body_box"][2] + object_gap
     base_phone_top = _jd_aligned_phone_top(
         base_layout["body_box"],
         base_phone_height,
@@ -6841,7 +7186,7 @@ def _jd_size_comparison_page(
         vertical=True,
         vertical_label_side="right",
     )
-    label_font = _font(max(13, round(min(size) * 0.02)), bold=True)
+    label_font = _font(max(14, round(min(size) * 0.022)))
     phone_label = JD_PHONE_LABEL
     label_box = draw.textbbox((0, 0), phone_label, font=label_font)
     draw.text(
@@ -6923,6 +7268,15 @@ def _slot_map(slots: list[dict[str, Any]], platform: str = "vip") -> dict[str, d
                 )
                 if folder in {"800", "750"} and isinstance(values, list)
             },
+            "folder_logo_colors": {
+                str(folder): color
+                for folder, color in (
+                    item.get("folder_logo_colors", {}).items()
+                    if isinstance(item.get("folder_logo_colors"), dict)
+                    else []
+                )
+                if folder in {"800", "750"} and color in {"black", "white"}
+            },
             "logo_color": "white" if item.get("logo_color") == "white" else "black",
         }
         for item in slots
@@ -6942,6 +7296,15 @@ def _slot_adjustments_for_folder(slot: dict[str, Any], target_folder: str) -> li
     if not isinstance(folder_adjustments, dict):
         return slot.get("adjustments", [])
     return folder_adjustments.get(target_folder, slot.get("adjustments", []))
+
+
+def _slot_logo_color_for_folder(slot: dict[str, Any], target_folder: str) -> str:
+    folder_logo_colors = slot.get("folder_logo_colors")
+    if isinstance(folder_logo_colors, dict):
+        color = folder_logo_colors.get(target_folder)
+        if color in {"black", "white"}:
+            return color
+    return "white" if slot.get("logo_color") == "white" else "black"
 
 
 def _validate_slot_map(session_id: str, slot_map: dict[str, dict[str, Any]], platform: str = "vip") -> None:
@@ -7286,6 +7649,7 @@ def _render_slot_preview(
     slot = {
         **slot,
         "adjustments": _slot_adjustments_for_folder(slot, target_folder),
+        "logo_color": _slot_logo_color_for_folder(slot, target_folder),
     }
     if platform == "jd" and target_folder not in {"800", "750"}:
         raise ValueError("京东预览目录必须是 800 或 750")
@@ -7330,6 +7694,7 @@ def _render_previews(
         slot = {
             **slot,
             "adjustments": _slot_adjustments_for_folder(slot, target_folder),
+            "logo_color": _slot_logo_color_for_folder(slot, target_folder),
         }
         preview_url = _render_cached_slot_preview(
             session_id,
@@ -7400,7 +7765,7 @@ def _export_package(
                     target_adjustments,
                     platform,
                     target,
-                    slot["logo_color"],
+                    _slot_logo_color_for_folder(slot, target),
                 )
                 if image is None:
                     missing.append(f"{target}/{file_name}")

@@ -24,6 +24,7 @@ type Slot = {
   reason: string;
   adjustments?: ImageAdjustment[];
   folder_adjustments?: Partial<Record<PreviewFolder, ImageAdjustment[]>>;
+  folder_logo_colors?: Partial<Record<PreviewFolder, LogoColor>>;
   logo_color?: LogoColor;
 };
 
@@ -152,6 +153,7 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
 };
 
 const VIP_INFO_PRODUCT_BOX = { left: 294, top: 238, right: 687, bottom: 511 } as const;
+const JD_PHONE_ASPECT_RATIO = 553 / 710;
 const VIP_INFO_PRODUCT_SCALE = 1;
 const VIP_INFO_HANDLE_SCALE = 0.08;
 const VIP_INFO_HANDLE_LIFT_Y = 0.04;
@@ -333,6 +335,7 @@ function mergeAnalyzedSlots(current: Slot[], incoming: Slot[]) {
       image_ids: imageIds,
       adjustments,
       folder_adjustments: previous.folder_adjustments,
+      folder_logo_colors: previous.folder_logo_colors,
       logo_color: previous.logo_color || nextSlot.logo_color,
       confidence: preserveManualSources ? previous.confidence : nextSlot.confidence,
       reason: preserveManualSources ? previous.reason : nextSlot.reason
@@ -351,10 +354,15 @@ function slotForPreviewFolder(
   targetFolder: PreviewFolder
 ): Slot {
   if (platform !== "jd") return slot;
-  const { folder_adjustments: folderAdjustments, ...baseSlot } = slot;
+  const {
+    folder_adjustments: folderAdjustments,
+    folder_logo_colors: folderLogoColors,
+    ...baseSlot
+  } = slot;
   return {
     ...baseSlot,
-    adjustments: folderAdjustments?.[targetFolder] || slot.adjustments
+    adjustments: folderAdjustments?.[targetFolder] || slot.adjustments,
+    logo_color: folderLogoColors?.[targetFolder] || slot.logo_color
   };
 }
 
@@ -1328,13 +1336,30 @@ function jdProductGeometry(
     : Math.max(60, lengthMm * bodyHeight / bodyWidth);
   const profile = jdProductShapeProfile(bodyWidth, bodyHeight, lengthMm / Math.max(1, heightMm));
   const preferredBodyWidth = output.width * profile.preferredWidth * Math.max(0.82, Math.min(1.08, lengthMm / 205));
-  const baseScale = Math.min(
+  const safe = { left: output.width * 0.04, top: output.height * 0.04, right: output.width * 0.96, bottom: output.height * 0.96 };
+  const objectGap = Math.max(16, output.width * 0.025);
+  const productRulerGap = Math.max(28, output.width * 0.045);
+  const productLeftAllowance = productRulerGap + Math.max(24, output.width * 0.03);
+  const phoneRulerGap = Math.max(22, output.width * 0.035);
+  const phoneLabelClearance = Math.max(40, output.width * 0.05);
+  const groupLeftBound = safe.left + productLeftAllowance;
+  const groupRightBound = safe.right - phoneRulerGap - phoneLabelClearance;
+  const groupAvailableWidth = Math.max(1, groupRightBound - groupLeftBound);
+  let baseScale = Math.min(
     output.width * profile.maxWidth / bodyWidth,
     output.height * profile.maxHeight / bodyHeight,
     output.width * 0.46 / layer.canvas.width,
     output.height * 0.60 / layer.canvas.height,
     preferredBodyWidth / bodyWidth
   );
+  for (let pass = 0; pass < 2; pass += 1) {
+    const fittedPhoneHeight = Math.max(
+      output.height * 0.095,
+      Math.min(output.height * 0.46, bodyHeight * baseScale * (163 / heightMm))
+    );
+    const groupWidth = bodyWidth * baseScale + objectGap + fittedPhoneHeight * JD_PHONE_ASPECT_RATIO;
+    baseScale *= Math.min(1, groupAvailableWidth / Math.max(1, groupWidth));
+  }
   const scale = baseScale * draft.zoom;
   const width = layer.canvas.width * scale;
   const height = layer.canvas.height * scale;
@@ -1344,9 +1369,15 @@ function jdProductGeometry(
     right: layer.body.right * scale,
     bottom: layer.body.bottom * scale
   };
-  let x = output.width * 0.34 + draft.offset_x * output.width * 0.18 - (scaledBody.left + scaledBody.right) / 2;
+  const basePhoneHeight = Math.max(
+    output.height * 0.095,
+    Math.min(output.height * 0.46, bodyHeight * baseScale * (163 / heightMm))
+  );
+  const baseGroupWidth = bodyWidth * baseScale + objectGap + basePhoneHeight * JD_PHONE_ASPECT_RATIO;
+  const baseGroupLeft = groupLeftBound + Math.max(0, groupAvailableWidth - baseGroupWidth) / 2;
+  const desiredBodyCenterX = baseGroupLeft + bodyWidth * baseScale / 2 + draft.offset_x * output.width * 0.18;
+  let x = desiredBodyCenterX - (scaledBody.left + scaledBody.right) / 2;
   let y = output.height * (output.height > output.width ? 0.70 : 0.73) + draft.offset_y * output.height * 0.18 - scaledBody.bottom;
-  const safe = { left: output.width * 0.04, top: output.height * 0.04, right: output.width * 0.96, bottom: output.height * 0.96 };
   const clampOrigin = (position: number, layerSize: number, minimum: number, maximum: number) => layerSize <= maximum - minimum
     ? Math.max(minimum, Math.min(position, maximum - layerSize))
     : Math.max(maximum - layerSize, Math.min(position, minimum));
@@ -1382,6 +1413,7 @@ function jdProductGeometry(
     },
     heightMm,
     baseBodyHeight: bodyHeight * baseScale,
+    automaticBodyCenterX: baseGroupLeft + bodyWidth * baseScale / 2,
     safe
   };
 }
@@ -1408,7 +1440,7 @@ function jdComparisonProductGeometry(
   if (!hasManualLayout) return { geometry: baseGeometry, baseGeometry };
 
   const rawGeometry = jdProductGeometry(output, layer, draft, productInfo, false, false);
-  const baselineShiftX = (baseGeometry.body.left + baseGeometry.body.right) / 2 - output.width * 0.34;
+  const baselineShiftX = (baseGeometry.body.left + baseGeometry.body.right) / 2 - baseGeometry.automaticBodyCenterX;
   const baselineShiftY = baseGeometry.body.bottom
     - output.height * (output.height > output.width ? 0.70 : 0.73);
   return {
@@ -1442,16 +1474,17 @@ function jdComparisonPhoneLayout(
   const phoneLabelClearance = Math.max(40, output.width * 0.05);
   const phoneRightAllowance = phoneRulerGap + phoneLabelClearance;
   const phoneBottomAllowance = Math.max(28, output.height * 0.055);
-  const phoneHeightForScale = (scale: number) => Math.max(
+  const basePhoneHeight = Math.max(
     output.height * 0.095,
-    Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm) * scale)
+    Math.min(output.height * 0.46, geometry.baseBodyHeight * (163 / geometry.heightMm))
   );
+  const phoneHeightForScale = (scale: number) => basePhoneHeight * scale;
   const phoneWidthForHeight = (height: number) => phoneReference?.naturalWidth && phoneReference.naturalHeight
     ? height * phoneReference.naturalWidth / phoneReference.naturalHeight
     : height * 0.78;
-  const basePhoneHeight = phoneHeightForScale(1);
   const basePhoneWidth = phoneWidthForHeight(basePhoneHeight);
-  let basePhoneLeft = output.width * 0.75 - basePhoneWidth / 2;
+  const objectGap = Math.max(16, output.width * 0.025);
+  let basePhoneLeft = baseGeometry.body.right + objectGap;
   let basePhoneTop = (draft.phone_alignment || "bottom") === "bottom"
     ? baseGeometry.body.bottom - basePhoneHeight
     : (baseGeometry.body.top + baseGeometry.body.bottom - basePhoneHeight) / 2;
@@ -1644,7 +1677,7 @@ function drawJdComparisonPreview(
   );
   context.save();
   context.fillStyle = JD_MEASURE_COLOR;
-  context.font = `600 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+  context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
   context.textAlign = "center";
   context.fillText("iPhone 17 Pro Max", phone.left + phone.width / 2, phone.top + phone.height + 22);
   context.restore();
@@ -2393,20 +2426,6 @@ function SlotAdjustmentEditor({
 
   function withSyncedProductRulerBody(nextDraft: ImageAdjustment): ImageAdjustment {
     if (isPhoneObjectEditor) return nextDraft;
-    if (isInfoPage) {
-      const body = productRulerBodyForDraft(nextDraft);
-      return {
-        ...nextDraft,
-        product_ruler_base_left: body?.left,
-        product_ruler_base_top: body?.top,
-        product_ruler_base_right: body?.right,
-        product_ruler_base_bottom: body?.bottom,
-        product_ruler_gap_scale: nextDraft.zoom,
-        product_ruler_group_scale: 1,
-        product_ruler_group_offset_x: 0,
-        product_ruler_group_offset_y: 0
-      };
-    }
     const current = draftRef.current;
     const currentBody = storedProductRulerBase(current);
     const cropUnchanged = current.crop_x === nextDraft.crop_x
@@ -2435,6 +2454,10 @@ function SlotAdjustmentEditor({
           product_ruler_base_top: transformY(currentBody.top),
           product_ruler_base_right: transformX(currentBody.right),
           product_ruler_base_bottom: transformY(currentBody.bottom),
+          ...(isInfoPage ? {
+            product_ruler_gap_scale: (current.product_ruler_gap_scale || 1)
+              * nextDraft.zoom / Math.max(0.0001, current.zoom)
+          } : {}),
           product_ruler_group_scale: 1,
           product_ruler_group_offset_x: 0,
           product_ruler_group_offset_y: 0
@@ -2448,6 +2471,7 @@ function SlotAdjustmentEditor({
       product_ruler_base_top: body.top,
       product_ruler_base_right: body.right,
       product_ruler_base_bottom: body.bottom,
+      ...(isInfoPage ? { product_ruler_gap_scale: nextDraft.zoom } : {}),
       product_ruler_group_scale: 1,
       product_ruler_group_offset_x: 0,
       product_ruler_group_offset_y: 0
@@ -3039,7 +3063,10 @@ function SlotAdjustmentEditor({
               <button type="button" className={infoMoveTarget === "product_rulers" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product_rulers");
                 linkedProductRulersRef.current = true;
-                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
+                // Keep the independently positioned ruler baseline intact.
+                // Subsequent linked moves transform it by the same product
+                // delta instead of snapping it back onto the product body.
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, false);
               }}>全部</button>
               <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product");
@@ -4154,15 +4181,19 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     const baseAdjustments = (currentSlot.adjustments || [])
       .map((item) => normalizeAdjustment(item));
     const folderAdjustments = { ...(currentSlot.folder_adjustments || {}) };
+    const baseLogoColor: LogoColor = currentSlot.logo_color === "white" ? "white" : "black";
+    const folderLogoColors = { ...(currentSlot.folder_logo_colors || {}) };
     if (platform === "jd") {
       previewFoldersForSlot(currentSlot, platform).forEach((folder) => {
         if (!folderAdjustments[folder]) {
           folderAdjustments[folder] = baseAdjustments.map((item) => ({ ...item }));
         }
+        if (!folderLogoColors[folder]) folderLogoColors[folder] = baseLogoColor;
       });
     }
     foldersToUpdate.forEach((folder) => {
       folderAdjustments[folder] = normalizedAdjustments.map((item) => ({ ...item }));
+      folderLogoColors[folder] = logoColor;
     });
     const updatedSlot: Slot = {
       ...currentSlot,
@@ -4170,7 +4201,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         ? normalizedAdjustments
         : currentSlot.adjustments,
       folder_adjustments: platform === "jd" ? folderAdjustments : currentSlot.folder_adjustments,
-      logo_color: logoColor
+      folder_logo_colors: platform === "jd" ? folderLogoColors : currentSlot.folder_logo_colors,
+      logo_color: platform !== "jd" || targetFolder === "800" || syncJdFolders
+        ? logoColor
+        : currentSlot.logo_color
     };
     setSlots((current) => {
       const nextSlots = current.map((slot) => slot.file_name === fileName ? updatedSlot : slot);
