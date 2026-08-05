@@ -5599,6 +5599,7 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "phone_label_scale": number("phone_label_scale", 1.0, 0.5, 2.0),
         "phone_label_offset_x": number("phone_label_offset_x", 0.0, -1.5, 1.5),
         "phone_label_offset_y": number("phone_label_offset_y", 0.0, -1.5, 1.5),
+        "phone_label_linked": value.get("phone_label_linked") is not False,
         "phone_alignment": "center" if value.get("phone_alignment") == "center" else "bottom",
         "product_show_ruler": value.get("product_show_ruler") is not False,
         "phone_show_ruler": value.get("phone_show_ruler") is not False,
@@ -7132,10 +7133,7 @@ def _jd_phone_label_font(
 ) -> ImageFont.ImageFont:
     regular_size = max(12, round(min(size) * 0.017))
     adaptive_size = max(10, min(regular_size, round(phone_height * 0.085)))
-    return _font(
-        max(8, round(adaptive_size * label_scale)),
-        bold=adaptive_size < regular_size,
-    )
+    return _font(max(8, round(adaptive_size * label_scale)))
 
 
 def _jd_phone_label_gap(size: tuple[int, int], phone_height: int) -> int:
@@ -7530,9 +7528,15 @@ def _jd_size_comparison_page(
         vertical=True,
         vertical_label_side="right",
     )
+    phone_label_box = phone_box if normalized["phone_label_linked"] else (
+        base_phone_left,
+        base_phone_top,
+        base_phone_left + base_phone_width,
+        base_phone_top + base_phone_height,
+    )
     label_font = _jd_phone_label_font(
         size,
-        phone_box[3] - phone_box[1],
+        phone_label_box[3] - phone_label_box[1],
         normalized["phone_label_scale"],
     )
     phone_label = JD_PHONE_LABEL
@@ -7540,12 +7544,12 @@ def _jd_size_comparison_page(
     draw.text(
         (
             round(
-                (phone_box[0] + phone_box[2] - (label_box[2] - label_box[0])) / 2
+                (phone_label_box[0] + phone_label_box[2] - (label_box[2] - label_box[0])) / 2
                 + normalized["phone_label_offset_x"] * width * 0.18
             ),
             round(
-                phone_box[3]
-                + _jd_phone_label_gap(size, phone_box[3] - phone_box[1])
+                phone_label_box[3]
+                + _jd_phone_label_gap(size, phone_label_box[3] - phone_label_box[1])
                 + normalized["phone_label_offset_y"] * height * 0.18
             ),
         ),

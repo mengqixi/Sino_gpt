@@ -1156,11 +1156,14 @@ def test_jd_phone_label_adjustment_is_normalized_independently():
         "phone_label_scale": 1.35,
         "phone_label_offset_x": 0.2,
         "phone_label_offset_y": -0.15,
+        "phone_label_linked": False,
     })
 
     assert normalized["phone_label_scale"] == 1.35
     assert normalized["phone_label_offset_x"] == 0.2
     assert normalized["phone_label_offset_y"] == -0.15
+    assert normalized["phone_label_linked"] is False
+    assert service._normalize_adjustment({})["phone_label_linked"] is True
 
 
 def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():

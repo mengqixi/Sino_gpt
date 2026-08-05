@@ -42,6 +42,7 @@ type ImageAdjustment = {
   phone_label_scale?: number;
   phone_label_offset_x?: number;
   phone_label_offset_y?: number;
+  phone_label_linked?: boolean;
   phone_alignment?: "center" | "bottom";
   product_show_ruler?: boolean;
   phone_show_ruler?: boolean;
@@ -135,8 +136,7 @@ function jdPhoneLabelFont(
   const regularSize = Math.max(12, Math.round(Math.min(output.width, output.height) * 0.017));
   const adaptiveSize = Math.max(10, Math.min(regularSize, Math.round(phoneHeight * 0.085)));
   const scaledSize = Math.max(8, Math.round(adaptiveSize * labelScale));
-  const opticalWeight = adaptiveSize < regularSize ? 600 : 500;
-  return `${opticalWeight} ${scaledSize}px sans-serif`;
+  return `500 ${scaledSize}px sans-serif`;
 }
 
 function jdPhoneLabelGap(output: { width: number; height: number }, phoneHeight: number) {
@@ -159,6 +159,7 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_label_scale: 1,
   phone_label_offset_x: 0,
   phone_label_offset_y: 0,
+  phone_label_linked: true,
   phone_alignment: "bottom",
   product_show_ruler: true,
   phone_show_ruler: true,
@@ -1766,15 +1767,16 @@ function drawJdComparisonPreview(
     true,
     true
   );
+  const phoneLabelBox = draft.phone_label_linked === false ? phoneLayout.basePhone : phone;
   context.save();
   context.fillStyle = JD_MEASURE_COLOR;
-  context.font = jdPhoneLabelFont(output, phone.height, draft.phone_label_scale || 1);
+  context.font = jdPhoneLabelFont(output, phoneLabelBox.height, draft.phone_label_scale || 1);
   context.textAlign = "center";
   context.textBaseline = "top";
   context.fillText(
     "iPhone 17 Pro Max",
-    phone.left + phone.width / 2 + (draft.phone_label_offset_x || 0) * output.width * 0.18,
-    phone.top + phone.height + jdPhoneLabelGap(output, phone.height)
+    phoneLabelBox.left + phoneLabelBox.width / 2 + (draft.phone_label_offset_x || 0) * output.width * 0.18,
+    phoneLabelBox.top + phoneLabelBox.height + jdPhoneLabelGap(output, phoneLabelBox.height)
       + (draft.phone_label_offset_y || 0) * output.height * 0.18
   );
   context.restore();
@@ -2498,6 +2500,53 @@ function SlotAdjustmentEditor({
     };
   }
 
+  function withPhoneLabelLinkPreservingPosition(
+    current: ImageAdjustment,
+    linked: boolean
+  ): ImageAdjustment {
+    const currentlyLinked = current.phone_label_linked !== false;
+    if (currentlyLinked === linked) return current;
+    const productImage = livePreviewImage(sourceUrl);
+    const phoneReference = livePreviewImage("/organizer-assets/iphone_reference.png");
+    if (!productImage.complete || !productImage.naturalWidth) {
+      return { ...current, phone_label_linked: linked };
+    }
+
+    const output = slotCanvasSize(slot.size, platform, targetFolder);
+    const layer = liveJdProductLayer(sourceUrl, productImage, current);
+    const { geometry, baseGeometry } = jdComparisonProductGeometry(
+      output,
+      layer,
+      current,
+      productInfo
+    );
+    const phoneLayout = jdComparisonPhoneLayout(
+      output,
+      geometry,
+      baseGeometry,
+      current,
+      phoneReference
+    );
+    const anchor = (useLinkedPhone: boolean) => useLinkedPhone
+      ? phoneLayout.phone
+      : phoneLayout.basePhone;
+    const previousBox = anchor(currentlyLinked);
+    const nextBox = anchor(linked);
+    const desiredX = previousBox.left + previousBox.width / 2
+      + (current.phone_label_offset_x || 0) * output.width * 0.18;
+    const desiredY = previousBox.top + previousBox.height
+      + jdPhoneLabelGap(output, previousBox.height)
+      + (current.phone_label_offset_y || 0) * output.height * 0.18;
+    const nextBaseX = nextBox.left + nextBox.width / 2;
+    const nextBaseY = nextBox.top + nextBox.height + jdPhoneLabelGap(output, nextBox.height);
+    return {
+      ...current,
+      phone_label_linked: linked,
+      phone_label_offset_x: (desiredX - nextBaseX) / (output.width * 0.18),
+      phone_label_offset_y: (desiredY - nextBaseY) / (output.height * 0.18)
+    };
+  }
+
   function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
     if (!isInfoPage && !isPhoneComparison) return null;
     if (isInfoPage) {
@@ -2906,6 +2955,7 @@ function SlotAdjustmentEditor({
         if (linkedProductRulersRef.current) next = resetProductRulers(next);
       } else if (activeMoveTarget === "phone") {
         const phoneRulerLinked = next.phone_show_ruler !== false;
+        const phoneLabelLinked = next.phone_label_linked !== false;
         next = {
           ...next,
           phone_scale: DEFAULT_ADJUSTMENT.phone_scale,
@@ -2915,7 +2965,9 @@ function SlotAdjustmentEditor({
           ...(phoneRulerLinked ? {
             phone_ruler_scale: DEFAULT_ADJUSTMENT.phone_ruler_scale,
             phone_ruler_offset_x: DEFAULT_ADJUSTMENT.phone_ruler_offset_x,
-            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y,
+            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y
+          } : {}),
+          ...(phoneLabelLinked ? {
             phone_label_scale: DEFAULT_ADJUSTMENT.phone_label_scale,
             phone_label_offset_x: DEFAULT_ADJUSTMENT.phone_label_offset_x,
             phone_label_offset_y: DEFAULT_ADJUSTMENT.phone_label_offset_y
@@ -3143,23 +3195,30 @@ function SlotAdjustmentEditor({
           {(isPhoneComparison || isInfoPage) && <div className="slot-phone-controls" role="group" aria-label={isInfoPage ? "产品信息图调整" : "手机对比调整"}>
             <span>调整对象</span>
             {isPhoneObjectEditor ? <>
-              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler !== false ? "active-tool" : ""} onClick={() => {
+              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler !== false && draft.phone_label_linked !== false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone");
                 setCropMode(false);
-                if (draftRef.current.phone_show_ruler === false) {
-                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, true));
+                if (draftRef.current.phone_show_ruler === false || draftRef.current.phone_label_linked === false) {
+                  let next = withPhoneRulerLinkPreservingPosition(draftRef.current, true);
+                  next = withPhoneLabelLinkPreservingPosition(next, true);
+                  applyDraft(next);
                 }
               }}>全部</button>
-              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler === false ? "active-tool" : ""} onClick={() => {
+              <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler === false && draft.phone_label_linked === false ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone");
                 setCropMode(false);
-                if (draftRef.current.phone_show_ruler !== false) {
-                  applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, false));
+                if (draftRef.current.phone_show_ruler !== false || draftRef.current.phone_label_linked !== false) {
+                  let next = withPhoneRulerLinkPreservingPosition(draftRef.current, false);
+                  next = withPhoneLabelLinkPreservingPosition(next, false);
+                  applyDraft(next);
                 }
               }}>手机</button>
               <button type="button" className={moveTarget === "phone_label" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone_label");
                 setCropMode(false);
+                if (draftRef.current.phone_label_linked !== false) {
+                  applyDraft(withPhoneLabelLinkPreservingPosition(draftRef.current, false));
+                }
               }}>iPhone文字</button>
               <button type="button" className={moveTarget === "phone_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone_ruler");
@@ -3178,13 +3237,13 @@ function SlotAdjustmentEditor({
                 // Keep the independently positioned ruler baseline intact.
                 // Subsequent linked moves transform it by the same product
                 // delta instead of snapping it back onto the product body.
-                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, false);
               }}>全部</button>
               <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product");
                 linkedProductRulersRef.current = false;
                 if (draftRef.current.product_show_ruler !== false) {
-                  applyDraft({ ...draftRef.current, product_show_ruler: false }, true);
+                  applyDraft({ ...draftRef.current, product_show_ruler: false }, false);
                 }
               }}>商品图</button>
               <button type="button" className={infoMoveTarget === "length_ruler" ? "active-tool" : ""} onClick={() => {
