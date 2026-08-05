@@ -1139,6 +1139,30 @@ def test_jd_vertical_dimension_text_uses_the_shared_measure_color():
     assert not np.any(np.all(pixels == (85, 85, 85), axis=2))
 
 
+def test_jd_phone_label_font_shrinks_with_a_small_phone():
+    regular = service._jd_phone_label_font((800, 800), 220)
+    small = service._jd_phone_label_font((800, 800), 120)
+    tiny = service._jd_phone_label_font((800, 800), 40)
+    enlarged = service._jd_phone_label_font((800, 800), 120, 1.5)
+
+    assert getattr(small, "size", 0) < getattr(regular, "size", 0)
+    assert getattr(tiny, "size", 0) == 10
+    assert getattr(enlarged, "size", 0) > getattr(small, "size", 0)
+    assert service._jd_phone_label_gap((800, 800), 120) < service._jd_phone_label_gap((800, 800), 220)
+
+
+def test_jd_phone_label_adjustment_is_normalized_independently():
+    normalized = service._normalize_adjustment({
+        "phone_label_scale": 1.35,
+        "phone_label_offset_x": 0.2,
+        "phone_label_offset_y": -0.15,
+    })
+
+    assert normalized["phone_label_scale"] == 1.35
+    assert normalized["phone_label_offset_x"] == 0.2
+    assert normalized["phone_label_offset_y"] == -0.15
+
+
 def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
     source = Image.new("RGBA", (420, 320), (0, 0, 0, 0))
     draw = ImageDraw.Draw(source)

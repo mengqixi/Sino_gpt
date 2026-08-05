@@ -39,6 +39,9 @@ type ImageAdjustment = {
   phone_scale?: number;
   phone_offset_x?: number;
   phone_offset_y?: number;
+  phone_label_scale?: number;
+  phone_label_offset_x?: number;
+  phone_label_offset_y?: number;
   phone_alignment?: "center" | "bottom";
   product_show_ruler?: boolean;
   phone_show_ruler?: boolean;
@@ -73,7 +76,7 @@ type OrganizerLayerInfo = {
   product_body_bbox: [number, number, number, number];
   handle_lift: number;
 };
-type AdjustmentTarget = "product" | "phone" | "length_ruler" | "height_ruler" | "width_ruler" | "phone_ruler";
+type AdjustmentTarget = "product" | "phone" | "phone_label" | "length_ruler" | "height_ruler" | "width_ruler" | "phone_ruler";
 type InfoMoveTarget = "product" | "product_rulers" | "length_ruler" | "height_ruler" | "width_ruler";
 
 type ApiRoleNote = {
@@ -124,6 +127,24 @@ function jdMeasureFont(output: { width: number; height: number }) {
   return `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
 }
 
+function jdPhoneLabelFont(
+  output: { width: number; height: number },
+  phoneHeight: number,
+  labelScale = 1
+) {
+  const regularSize = Math.max(12, Math.round(Math.min(output.width, output.height) * 0.017));
+  const adaptiveSize = Math.max(10, Math.min(regularSize, Math.round(phoneHeight * 0.085)));
+  const scaledSize = Math.max(8, Math.round(adaptiveSize * labelScale));
+  const opticalWeight = adaptiveSize < regularSize ? 600 : 500;
+  return `${opticalWeight} ${scaledSize}px sans-serif`;
+}
+
+function jdPhoneLabelGap(output: { width: number; height: number }, phoneHeight: number) {
+  const referenceHeight = Math.min(output.width, output.height) * 0.22;
+  const phoneScale = Math.max(0.65, Math.min(1.5, phoneHeight / referenceHeight));
+  return Math.max(6, Math.round(Math.min(output.width, output.height) * 0.015 * phoneScale));
+}
+
 const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   zoom: 1,
   offset_x: 0,
@@ -135,6 +156,9 @@ const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   phone_scale: 1,
   phone_offset_x: 0,
   phone_offset_y: 0,
+  phone_label_scale: 1,
+  phone_label_offset_x: 0,
+  phone_label_offset_y: 0,
   phone_alignment: "bottom",
   product_show_ruler: true,
   phone_show_ruler: true,
@@ -245,6 +269,7 @@ function vipInfoAutoLayout(
 
 function targetScale(draft: ImageAdjustment, target: AdjustmentTarget) {
   if (target === "phone") return draft.phone_scale || 1;
+  if (target === "phone_label") return draft.phone_label_scale || 1;
   if (target === "length_ruler") return draft.length_ruler_scale || 1;
   if (target === "height_ruler") return draft.height_ruler_scale || 1;
   if (target === "width_ruler") return draft.width_ruler_scale || 1;
@@ -254,6 +279,7 @@ function targetScale(draft: ImageAdjustment, target: AdjustmentTarget) {
 
 function targetOffset(draft: ImageAdjustment, target: AdjustmentTarget) {
   if (target === "phone") return { x: draft.phone_offset_x || 0, y: draft.phone_offset_y || 0 };
+  if (target === "phone_label") return { x: draft.phone_label_offset_x || 0, y: draft.phone_label_offset_y || 0 };
   if (target === "length_ruler") return { x: draft.length_ruler_offset_x || 0, y: draft.length_ruler_offset_y || 0 };
   if (target === "height_ruler") return { x: draft.height_ruler_offset_x || 0, y: draft.height_ruler_offset_y || 0 };
   if (target === "width_ruler") return { x: draft.width_ruler_offset_x || 0, y: draft.width_ruler_offset_y || 0 };
@@ -263,6 +289,7 @@ function targetOffset(draft: ImageAdjustment, target: AdjustmentTarget) {
 
 function withTargetScale(draft: ImageAdjustment, target: AdjustmentTarget, scale: number): ImageAdjustment {
   if (target === "phone") return { ...draft, phone_scale: scale };
+  if (target === "phone_label") return { ...draft, phone_label_scale: scale };
   if (target === "length_ruler") return { ...draft, length_ruler_scale: scale };
   if (target === "height_ruler") return { ...draft, height_ruler_scale: scale };
   if (target === "width_ruler") return { ...draft, width_ruler_scale: scale };
@@ -272,6 +299,7 @@ function withTargetScale(draft: ImageAdjustment, target: AdjustmentTarget, scale
 
 function withTargetOffset(draft: ImageAdjustment, target: AdjustmentTarget, x: number, y: number): ImageAdjustment {
   if (target === "phone") return { ...draft, phone_offset_x: x, phone_offset_y: y };
+  if (target === "phone_label") return { ...draft, phone_label_offset_x: x, phone_label_offset_y: y };
   if (target === "length_ruler") return { ...draft, length_ruler_offset_x: x, length_ruler_offset_y: y };
   if (target === "height_ruler") return { ...draft, height_ruler_offset_x: x, height_ruler_offset_y: y };
   if (target === "width_ruler") return { ...draft, width_ruler_offset_x: x, width_ruler_offset_y: y };
@@ -1740,9 +1768,15 @@ function drawJdComparisonPreview(
   );
   context.save();
   context.fillStyle = JD_MEASURE_COLOR;
-  context.font = jdMeasureFont(output);
+  context.font = jdPhoneLabelFont(output, phone.height, draft.phone_label_scale || 1);
   context.textAlign = "center";
-  context.fillText("iPhone 17 Pro Max", phone.left + phone.width / 2, phone.top + phone.height + 22);
+  context.textBaseline = "top";
+  context.fillText(
+    "iPhone 17 Pro Max",
+    phone.left + phone.width / 2 + (draft.phone_label_offset_x || 0) * output.width * 0.18,
+    phone.top + phone.height + jdPhoneLabelGap(output, phone.height)
+      + (draft.phone_label_offset_y || 0) * output.height * 0.18
+  );
   context.restore();
 }
 
@@ -2881,7 +2915,10 @@ function SlotAdjustmentEditor({
           ...(phoneRulerLinked ? {
             phone_ruler_scale: DEFAULT_ADJUSTMENT.phone_ruler_scale,
             phone_ruler_offset_x: DEFAULT_ADJUSTMENT.phone_ruler_offset_x,
-            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y
+            phone_ruler_offset_y: DEFAULT_ADJUSTMENT.phone_ruler_offset_y,
+            phone_label_scale: DEFAULT_ADJUSTMENT.phone_label_scale,
+            phone_label_offset_x: DEFAULT_ADJUSTMENT.phone_label_offset_x,
+            phone_label_offset_y: DEFAULT_ADJUSTMENT.phone_label_offset_y
           } : {})
         };
       } else {
@@ -2950,7 +2987,7 @@ function SlotAdjustmentEditor({
         <header>
           <div>
             <strong>{slot.file_name} · {slot.title}</strong>
-            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? (draft.phone_show_ruler !== false ? "手机和高标线" : "手机") : moveTarget === "phone_ruler" ? "高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
+            <span>{slot.file_name === "606.jpg" ? `正在调整来源 ${sourceIndex + 1}` : isPhoneComparison ? `正在调整${moveTarget === "phone" ? (draft.phone_show_ruler !== false ? "手机和高标线" : "手机") : moveTarget === "phone_label" ? "iPhone文字" : moveTarget === "phone_ruler" ? "高标线" : moveTarget === "length_ruler" ? "商品长标线" : moveTarget === "height_ruler" ? "商品高标线" : "商品图"}` : isInfoPage ? `正在调整${infoMoveTarget === "width_ruler" ? "宽标线" : infoMoveTarget === "length_ruler" ? "长标线" : infoMoveTarget === "height_ruler" ? "高标线" : infoMoveTarget === "product" ? "商品图" : "全部"}` : "当前输出位置独立调整"}</span>
           </div>
           <button type="button" className="icon-button" onClick={requestClose} title="关闭"><X size={21} /></button>
         </header>
@@ -2975,7 +3012,7 @@ function SlotAdjustmentEditor({
           <div className="slot-adjustment-source">
             <div className="slot-adjustment-heading">
               <strong>{isPhoneObjectEditor ? "手机参照图" : "原始图片"}</strong>
-              <span>{isPhoneObjectEditor ? "在右侧预览中调整手机或高标线" : cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
+              <span>{isPhoneObjectEditor ? "在右侧预览中调整手机、iPhone文字或高标线" : cropMode ? "拖动框选保留区域" : "点击“裁剪”后框选区域"}</span>
             </div>
             <div
               ref={sourceStageRef}
@@ -3120,6 +3157,10 @@ function SlotAdjustmentEditor({
                   applyDraft(withPhoneRulerLinkPreservingPosition(draftRef.current, false));
                 }
               }}>手机</button>
+              <button type="button" className={moveTarget === "phone_label" ? "active-tool" : ""} onClick={() => {
+                setMoveTarget("phone_label");
+                setCropMode(false);
+              }}>iPhone文字</button>
               <button type="button" className={moveTarget === "phone_ruler" ? "active-tool" : ""} onClick={() => {
                 setMoveTarget("phone_ruler");
                 setCropMode(false);

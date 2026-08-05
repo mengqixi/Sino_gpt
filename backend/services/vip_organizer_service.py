@@ -49,7 +49,7 @@ CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 _FAST_SLOT_PREVIEW_LOCK = Lock()
-PREVIEW_RENDER_VERSION = 30
+PREVIEW_RENDER_VERSION = 31
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -5596,6 +5596,9 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "phone_scale": number("phone_scale", 1.0, 0.5, 1.8),
         "phone_offset_x": number("phone_offset_x", 0.0, -1.5, 1.5),
         "phone_offset_y": number("phone_offset_y", 0.0, -1.5, 1.5),
+        "phone_label_scale": number("phone_label_scale", 1.0, 0.5, 2.0),
+        "phone_label_offset_x": number("phone_label_offset_x", 0.0, -1.5, 1.5),
+        "phone_label_offset_y": number("phone_label_offset_y", 0.0, -1.5, 1.5),
         "phone_alignment": "center" if value.get("phone_alignment") == "center" else "bottom",
         "product_show_ruler": value.get("product_show_ruler") is not False,
         "phone_show_ruler": value.get("phone_show_ruler") is not False,
@@ -6507,7 +6510,15 @@ def _draw_rotated_text(
     box = font.getbbox(text)
     layer = Image.new("RGBA", (max(1, box[2] - box[0] + 12), max(1, box[3] - box[1] + 12)), (255, 255, 255, 0))
     ImageDraw.Draw(layer).text((6 - box[0], 6 - box[1]), text, font=font, fill=fill)
-    rotated = layer.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+    normalized_angle = angle % 360
+    if normalized_angle == 90:
+        rotated = layer.transpose(Image.Transpose.ROTATE_90)
+    elif normalized_angle == 270:
+        rotated = layer.transpose(Image.Transpose.ROTATE_270)
+    elif normalized_angle == 180:
+        rotated = layer.transpose(Image.Transpose.ROTATE_180)
+    else:
+        rotated = layer.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
     canvas.paste(rotated, xy, rotated)
 
 
@@ -7114,6 +7125,25 @@ def _jd_measure_font(size: tuple[int, int]) -> ImageFont.ImageFont:
     return _font(max(14, round(min(size) * 0.022)))
 
 
+def _jd_phone_label_font(
+    size: tuple[int, int],
+    phone_height: int,
+    label_scale: float = 1.0,
+) -> ImageFont.ImageFont:
+    regular_size = max(12, round(min(size) * 0.017))
+    adaptive_size = max(10, min(regular_size, round(phone_height * 0.085)))
+    return _font(
+        max(8, round(adaptive_size * label_scale)),
+        bold=adaptive_size < regular_size,
+    )
+
+
+def _jd_phone_label_gap(size: tuple[int, int], phone_height: int) -> int:
+    reference_height = min(size) * 0.22
+    phone_scale = max(0.65, min(1.5, phone_height / reference_height))
+    return max(6, round(min(size) * 0.015 * phone_scale))
+
+
 def _draw_jd_dimension_bar(
     canvas: Image.Image,
     start: tuple[int, int],
@@ -7500,11 +7530,25 @@ def _jd_size_comparison_page(
         vertical=True,
         vertical_label_side="right",
     )
-    label_font = _jd_measure_font(size)
+    label_font = _jd_phone_label_font(
+        size,
+        phone_box[3] - phone_box[1],
+        normalized["phone_label_scale"],
+    )
     phone_label = JD_PHONE_LABEL
     label_box = draw.textbbox((0, 0), phone_label, font=label_font)
     draw.text(
-        (round((phone_box[0] + phone_box[2] - (label_box[2] - label_box[0])) / 2), phone_box[3] + 12),
+        (
+            round(
+                (phone_box[0] + phone_box[2] - (label_box[2] - label_box[0])) / 2
+                + normalized["phone_label_offset_x"] * width * 0.18
+            ),
+            round(
+                phone_box[3]
+                + _jd_phone_label_gap(size, phone_box[3] - phone_box[1])
+                + normalized["phone_label_offset_y"] * height * 0.18
+            ),
+        ),
         phone_label,
         font=label_font,
         fill=JD_MEASURE_COLOR,
