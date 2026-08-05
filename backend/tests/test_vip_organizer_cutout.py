@@ -10,6 +10,69 @@ from backend.services import vip_organizer_service as service
 
 
 class PreparedProductCutoutTests(unittest.TestCase):
+    def test_export_cleanup_clears_opaque_pale_tail_after_alpha_collapse(self):
+        rgba = np.zeros((180, 180, 4), dtype=np.uint8)
+        rgba[35:138, 30:150, :3] = (205, 201, 194)
+        rgba[35:132, 30:150, 3] = 255
+        rgba[132, 30:150, 3] = 205
+        rgba[133, 34:146, 3] = 145
+        rgba[134, 42:138, 3] = 80
+        rgba[135, 55:125, 3] = 35
+        for column in range(18, 30):
+            rgba[132:140, column, :3] = (220, 165, 35)
+            rgba[132:140, column, 3] = 255
+        rgba[130:133, 28:32, :3] = (220, 165, 35)
+        rgba[130:133, 28:32, 3] = 255
+
+        cleaned = service._remove_detached_floor_fragments(
+            Image.fromarray(rgba, "RGBA")
+        )
+        alpha = np.asarray(cleaned.getchannel("A"))
+
+        self.assertEqual(int(alpha[131, 90]), 255)
+        self.assertEqual(int(alpha[132, 90]), 0)
+        self.assertEqual(int(alpha[134, 90]), 0)
+        self.assertEqual(int(alpha[136, 22]), 255)
+
+    def test_model_dominant_pale_silver_keeps_body_and_opens_hardware_gap(self):
+        shape = (120, 120)
+        model_matte = np.zeros(shape, dtype=np.float32)
+        model_matte[45:105, 20:100] = 0.99
+        cv2.circle(model_matte, (82, 28), 13, 0.86, -1)
+        strict_hardware = np.zeros(shape, dtype=np.uint8)
+        cv2.circle(strict_hardware, (82, 28), 13, 1, 3)
+        strict_hardware = strict_hardware.astype(bool)
+        current_alpha = np.zeros(shape, dtype=np.uint8)
+        current_alpha[strict_hardware] = 255
+
+        alpha = service._model_dominant_pale_silver_alpha(
+            model_matte,
+            connected_background=np.ones(shape, dtype=bool),
+            lab_distance=np.zeros(shape, dtype=np.float32),
+            saturation=np.zeros(shape, dtype=np.uint8),
+            value=np.full(shape, 255, dtype=np.uint8),
+            current_alpha=current_alpha,
+            strict_hardware=strict_hardware,
+        )
+
+        self.assertEqual(int(alpha[70, 60]), 255)
+        self.assertEqual(int(alpha[28, 82]), 0)
+        self.assertEqual(int(alpha[28, 69]), 255)
+        self.assertEqual(int(alpha[5, 5]), 0)
+
+    def test_model_body_fringe_cleanup_keeps_upper_structure_only(self):
+        alpha = np.zeros((120, 120), dtype=np.uint8)
+        alpha[52:110, 18:102] = 255
+        alpha[48:52, 18:38] = 230
+        alpha[48:52, 60:90] = 230
+        cv2.line(alpha, (82, 8), (82, 52), 255, 5)
+
+        cleaned = service._clear_shallow_model_body_fringe(alpha)
+
+        self.assertEqual(int(cleaned[49, 30]), 0)
+        self.assertEqual(int(cleaned[49, 82]), 255)
+        self.assertEqual(int(cleaned[52, 30]), 255)
+
     def test_white_background_and_soft_floor_shadow_are_removed(self):
         source = Image.new("RGB", (520, 420), "white")
         pixels = np.asarray(source).copy()
@@ -461,6 +524,149 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[660, 400, 3]), 0)
         self.assertEqual(int(cleaned[630, 660, 3]), 255)
         self.assertEqual(int(cleaned[655, 660, 3]), 0)
+
+    def test_export_cleanup_removes_opaque_colour_cast_contact_tail(self):
+        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((180, 170, 620, 650), fill=(190, 170, 135, 255))
+        draw.rectangle((190, 651, 610, 656), fill=(92, 55, 35, 255))
+        draw.rectangle((245, 657, 555, 665), fill=(70, 38, 24, 255))
+        draw.rectangle((300, 657, 330, 665), fill=(220, 165, 35, 255))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[653, 400, 3]), 255)
+        self.assertEqual(int(cleaned[661, 400, 3]), 0)
+        self.assertEqual(int(cleaned[661, 315, 3]), 255)
+
+    def test_export_cleanup_clears_mixed_brightness_after_confirmed_contact_edge(self):
+        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((180, 170, 620, 650), fill=(190, 170, 135, 255))
+        # Real saturated piping is followed by a multi-row dark contact core.
+        # The same shadow also contains brighter grey/yellow studio fragments;
+        # once the contact boundary is confirmed, those fragments must not be
+        # left behind as a dotted line on the transparent preview.
+        draw.rectangle((190, 651, 610, 656), fill=(98, 60, 31, 255))
+        draw.rectangle((245, 657, 555, 665), fill=(61, 37, 24, 255))
+        draw.rectangle((270, 659, 315, 663), fill=(185, 170, 145, 255))
+        draw.rectangle((460, 658, 520, 664), fill=(145, 139, 125, 255))
+        draw.rectangle((330, 657, 350, 665), fill=(220, 165, 35, 255))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[653, 400, 3]), 255)
+        self.assertEqual(int(cleaned[661, 285, 3]), 0)
+        self.assertEqual(int(cleaned[661, 480, 3]), 0)
+        self.assertEqual(int(cleaned[661, 340, 3]), 255)
+
+    def test_colour_cast_contact_cleanup_generalises_across_bag_shapes(self):
+        cases = (
+            ("bucket", (620, 760), (150, 150, 470, 625)),
+            ("wide_tote", (960, 720), (150, 150, 810, 585)),
+            ("box_case", (720, 720), (145, 145, 575, 585)),
+            ("small_crossbody", (520, 640), (105, 135, 415, 515)),
+        )
+        for name, size, bounds in cases:
+            with self.subTest(name=name):
+                width, height = size
+                left, top, right, bottom = bounds
+                image = Image.new(
+                    "RGBA",
+                    size,
+                    (255, 255, 255, 0),
+                )
+                draw = ImageDraw.Draw(image)
+                body_colour = (188, 156, 105, 255)
+                if name == "wide_tote":
+                    draw.polygon(
+                        (
+                            (left + 35, top),
+                            (right - 35, top),
+                            (right, bottom),
+                            (left, bottom),
+                        ),
+                        fill=body_colour,
+                    )
+                elif name == "bucket":
+                    draw.rounded_rectangle(
+                        bounds,
+                        radius=round((right - left) * 0.12),
+                        fill=body_colour,
+                    )
+                else:
+                    draw.rounded_rectangle(
+                        bounds,
+                        radius=max(10, round((right - left) * 0.05)),
+                        fill=body_colour,
+                    )
+
+                # Real leather piping is followed by a deeper cast shadow.
+                pipe_top = bottom + 1
+                shadow_top = pipe_top + 5
+                draw.rectangle(
+                    (left + 10, pipe_top, right - 10, shadow_top - 1),
+                    fill=(98, 60, 31, 255),
+                )
+                draw.rectangle(
+                    (
+                        left + round((right - left) * 0.18),
+                        shadow_top,
+                        right - round((right - left) * 0.18),
+                        shadow_top + 7,
+                    ),
+                    fill=(61, 37, 24, 255),
+                )
+                hardware_x = left + round((right - left) * 0.30)
+                draw.rectangle(
+                    (hardware_x, shadow_top, hardware_x + 16, shadow_top + 7),
+                    fill=(220, 165, 35, 255),
+                )
+
+                cleaned = np.asarray(
+                    service._remove_detached_floor_fragments(image)
+                )
+                center_x = (left + right) // 2
+
+                self.assertEqual(
+                    int(cleaned[pipe_top + 2, center_x, 3]),
+                    255,
+                )
+                self.assertEqual(
+                    int(cleaned[shadow_top + 4, center_x, 3]),
+                    0,
+                )
+                self.assertEqual(
+                    int(cleaned[shadow_top + 4, hardware_x + 8, 3]),
+                    255,
+                )
+
+    def test_colour_cast_cleanup_keeps_real_terminal_piping_without_shadow(self):
+        image = Image.new("RGBA", (640, 640), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle(
+            (120, 120, 520, 525),
+            radius=35,
+            fill=(116, 166, 142, 255),
+        )
+        draw.rectangle((135, 526, 505, 527), fill=(42, 78, 62, 255))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[526, 320, 3]), 255)
+        self.assertEqual(int(cleaned[527, 320, 3]), 255)
+
+    def test_export_cleanup_normalises_only_subvisible_alpha_noise(self):
+        image = Image.new("RGBA", (240, 240), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((45, 45, 195, 195), fill=(130, 100, 75, 255))
+        draw.point((43, 120), fill=(70, 50, 35, 8))
+        draw.point((44, 120), fill=(70, 50, 35, 9))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[120, 43, 3]), 0)
+        self.assertEqual(int(cleaned[120, 44, 3]), 9)
 
     def test_export_cleanup_uses_terminal_alpha_collapse_on_patterned_bag(self):
         image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
