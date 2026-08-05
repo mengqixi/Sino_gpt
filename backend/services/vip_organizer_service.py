@@ -49,7 +49,7 @@ CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 _FAST_SLOT_PREVIEW_LOCK = Lock()
-PREVIEW_RENDER_VERSION = 29
+PREVIEW_RENDER_VERSION = 30
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -4263,11 +4263,226 @@ def _retain_compact_terminal_hardware(
     return retained
 
 
+def _restore_overcut_bottom_material(
+    rgba: np.ndarray,
+    original_alpha: np.ndarray,
+    cleaned_alpha: np.ndarray,
+) -> bool:
+    """Restore a short, colour-continuous product edge removed as floor.
+
+    This is deliberately a validation pass, not a new foreground detector. It
+    can only restore pixels which were present before floor cleanup, touch the
+    retained central product base, and match the local material immediately
+    above them. Once colour or opacity stops matching, the column is closed so
+    the recovery cannot continue into the studio shadow.
+    """
+    # Genuine product material which was cut too high normally kept an opaque
+    # model prediction. A confidence-collapse tail is precisely the opposite;
+    # never use this pass to undo that lower-confidence evidence.
+    removed = (original_alpha >= 230) & (cleaned_alpha <= 8)
+    if not np.any(removed):
+        return False
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (cleaned_alpha > 8).astype(np.uint8),
+        8,
+    )
+    if component_count <= 1:
+        return False
+    largest_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    main_pixels = labels == largest_component
+    main_left = int(stats[largest_component, cv2.CC_STAT_LEFT])
+    main_top = int(stats[largest_component, cv2.CC_STAT_TOP])
+    main_width = int(stats[largest_component, cv2.CC_STAT_WIDTH])
+    main_height = int(stats[largest_component, cv2.CC_STAT_HEIGHT])
+    if main_width < 20 or main_height < 20:
+        return False
+
+    central_left = main_left + round(main_width * 0.10)
+    central_right = main_left + main_width - round(main_width * 0.10)
+    lower_start = main_top + round(main_height * 0.80)
+    maximum_recovery_rows = max(
+        3,
+        min(7, round(main_height * 0.010)),
+    )
+    rgb = rgba[:, :, :3]
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    recovery_candidate = np.zeros_like(removed)
+
+    for column in range(central_left, central_right):
+        retained_rows = np.flatnonzero(
+            main_pixels[lower_start:main_top + main_height, column]
+            & (
+                cleaned_alpha[
+                    lower_start:main_top + main_height,
+                    column,
+                ]
+                >= 128
+            )
+        )
+        if not retained_rows.size:
+            continue
+        anchor_row = lower_start + int(retained_rows[-1])
+        anchor_top = max(lower_start, anchor_row - 3)
+        anchor_left = max(central_left, column - 1)
+        anchor_right = min(central_right, column + 2)
+        anchor_pixels = (
+            main_pixels[
+                anchor_top:anchor_row + 1,
+                anchor_left:anchor_right,
+            ]
+            & (
+                cleaned_alpha[
+                    anchor_top:anchor_row + 1,
+                    anchor_left:anchor_right,
+                ]
+                >= 128
+            )
+        )
+        if not np.any(anchor_pixels):
+            continue
+        anchor_lab = np.median(
+            lab[
+                anchor_top:anchor_row + 1,
+                anchor_left:anchor_right,
+            ][anchor_pixels],
+            axis=0,
+        )
+        anchor_hsv = np.median(
+            hsv[
+                anchor_top:anchor_row + 1,
+                anchor_left:anchor_right,
+            ][anchor_pixels],
+            axis=0,
+        )
+
+        for row in range(
+            anchor_row + 1,
+            min(
+                cleaned_alpha.shape[0],
+                anchor_row + maximum_recovery_rows + 1,
+            ),
+        ):
+            if not removed[row, column]:
+                break
+            colour_distance = float(np.linalg.norm(
+                lab[row, column] - anchor_lab
+            ))
+            value_difference = abs(
+                float(hsv[row, column, 2]) - float(anchor_hsv[2])
+            )
+            saturation_difference = abs(
+                float(hsv[row, column, 1]) - float(anchor_hsv[1])
+            )
+            same_local_material = (
+                colour_distance <= 9.0
+                and value_difference <= 9.0
+                and saturation_difference <= 14.0
+            )
+            if not same_local_material:
+                break
+            recovery_candidate[row, column] = True
+
+    if not np.any(recovery_candidate):
+        return False
+
+    # A real base/piping edge has horizontal support. Reject isolated matching
+    # specks, which are common in a softly coloured studio shadow.
+    candidate_count, candidate_labels, candidate_stats, _ = (
+        cv2.connectedComponentsWithStats(
+            recovery_candidate.astype(np.uint8),
+            8,
+        )
+    )
+    supported_recovery = np.zeros_like(recovery_candidate)
+    minimum_width = max(8, round(main_width * 0.025))
+    retained_neighbourhood = cv2.dilate(
+        (cleaned_alpha >= 128).astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1,
+    ).astype(bool)
+    for component in range(1, candidate_count):
+        component_pixels = candidate_labels == component
+        component_width = int(
+            candidate_stats[component, cv2.CC_STAT_WIDTH]
+        )
+        if (
+            component_width >= minimum_width
+            and np.any(component_pixels & retained_neighbourhood)
+        ):
+            supported_recovery |= component_pixels
+
+    if not np.any(supported_recovery):
+        return False
+    cleaned_alpha[supported_recovery] = original_alpha[supported_recovery]
+    return True
+
+
+def _remove_central_bottom_orphan_tails(
+    alpha: np.ndarray,
+    *,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+    protected_hardware: np.ndarray,
+    maximum_height: int,
+) -> bool:
+    """Remove shallow bottom runs separated vertically from the product."""
+    candidates = np.zeros_like(alpha, dtype=bool)
+    for column in range(max(0, left), min(alpha.shape[1], right)):
+        occupied = alpha[top:bottom, column] > 8
+        occupied_rows = np.flatnonzero(occupied)
+        if occupied_rows.size < 2:
+            continue
+        first_occupied = int(occupied_rows[0])
+        gap_start: int | None = None
+        for local_row in range(first_occupied + 1, occupied.size):
+            if occupied[local_row]:
+                if gap_start is not None:
+                    tail_rows = np.flatnonzero(occupied[local_row:])
+                    if tail_rows.size:
+                        last_tail_row = local_row + int(tail_rows[-1])
+                        if last_tail_row - local_row + 1 <= maximum_height:
+                            candidates[
+                                top + local_row:top + last_tail_row + 1,
+                                column,
+                            ] |= occupied[local_row:last_tail_row + 1]
+                    break
+            elif gap_start is None:
+                gap_start = local_row
+
+    if not np.any(candidates):
+        return False
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidates.astype(np.uint8),
+        8,
+    )
+    removable = np.zeros_like(candidates)
+    for component in range(1, component_count):
+        component_pixels = labels == component
+        component_height = int(stats[component, cv2.CC_STAT_HEIGHT])
+        hardware_fraction = float(np.mean(
+            protected_hardware[component_pixels]
+        ))
+        if (
+            component_height <= maximum_height
+            and hardware_fraction < 0.12
+        ):
+            removable |= component_pixels & ~protected_hardware
+    if not np.any(removable):
+        return False
+    alpha[removable] = 0
+    return True
+
+
 def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
     """Remove faint floor slivers created when a cutout is resized for export."""
     result = image.convert("RGBA").copy()
     rgba = np.asarray(result).copy()
     alpha = rgba[:, :, 3]
+    original_alpha = alpha.copy()
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
         (alpha > 8).astype(np.uint8),
         8,
@@ -4320,6 +4535,8 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
     detached_metal_core = detached_gold_core | detached_silver_core
 
     changed = False
+    deferred_orphan_cleanup: tuple[int, int, int, int, int] | None = None
+    deferred_orphan_hardware: np.ndarray | None = None
     for component in range(1, component_count):
         if component == largest_component:
             continue
@@ -4768,15 +4985,35 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                         & (yy >= dark_contact_start)
                         & (xx >= dark_body_left)
                         & (xx < dark_body_right)
-                        & (
-                            hsv[:, :, 2]
-                            <= max(65.0, median_material_value * 0.72)
-                        )
                         & ~terminal_hardware
                     )
                     if np.any(dark_contact_tail):
                         alpha[dark_contact_tail] = 0
                         changed = True
+
+                    # Mixed-brightness shadows can leave shallow islands just
+                    # above the detected contact start. Defer their removal
+                    # until every later floor pass has run, because those
+                    # passes can be what finally exposes the vertical gap.
+                    orphan_scan_top = max(
+                        main_top,
+                        dark_contact_start
+                        - max(12, round(main_height * 0.025)),
+                    )
+                    deferred_orphan_cleanup = (
+                        dark_body_left,
+                        dark_body_right,
+                        orphan_scan_top,
+                        min(
+                            alpha.shape[0],
+                            main_top + main_height,
+                        ),
+                        max(
+                            4,
+                            round(main_height * 0.015),
+                        ),
+                    )
+                    deferred_orphan_hardware = terminal_hardware.copy()
 
         if floor_row is not None and median_material_value > 105:
             gold_core = (
@@ -5278,6 +5515,34 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                     and mean_alpha < 190
                 ):
                     alpha[component_pixels] = 0
+
+    if (
+        deferred_orphan_cleanup is not None
+        and deferred_orphan_hardware is not None
+    ):
+        (
+            orphan_left,
+            orphan_right,
+            orphan_top,
+            orphan_bottom,
+            orphan_maximum_height,
+        ) = deferred_orphan_cleanup
+        if _remove_central_bottom_orphan_tails(
+            alpha,
+            left=orphan_left,
+            right=orphan_right,
+            top=orphan_top,
+            bottom=orphan_bottom,
+            protected_hardware=deferred_orphan_hardware,
+            maximum_height=orphan_maximum_height,
+        ):
+            changed = True
+
+    # Verify the removal against the product's own local bottom colour. This
+    # can add back a few over-cut edge pixels, but never pixels which were not
+    # present in the incoming matte.
+    if _restore_overcut_bottom_material(rgba, original_alpha, alpha):
+        changed = True
 
     # Lanczos resizing and alpha feathering can leave sub-visible (1..8)
     # colour specks after an attached shadow has been removed. They become a
@@ -6230,10 +6495,18 @@ def _dimension_mm(value: str) -> str:
     return f"{rendered}mm"
 
 
-def _draw_rotated_text(canvas: Image.Image, text: str, xy: tuple[int, int], angle: float, font: ImageFont.ImageFont) -> None:
+def _draw_rotated_text(
+    canvas: Image.Image,
+    text: str,
+    xy: tuple[int, int],
+    angle: float,
+    font: ImageFont.ImageFont,
+    *,
+    fill: str = "#555555",
+) -> None:
     box = font.getbbox(text)
     layer = Image.new("RGBA", (max(1, box[2] - box[0] + 12), max(1, box[3] - box[1] + 12)), (255, 255, 255, 0))
-    ImageDraw.Draw(layer).text((6 - box[0], 6 - box[1]), text, font=font, fill="#555555")
+    ImageDraw.Draw(layer).text((6 - box[0], 6 - box[1]), text, font=font, fill=fill)
     rotated = layer.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
     canvas.paste(rotated, xy, rotated)
 
@@ -6435,6 +6708,17 @@ def _detail_showcase_page(source: Image.Image, adjustment: dict[str, Any] | None
     return canvas
 
 
+def _multi_angle_safe_box(index: int) -> tuple[int, int, int, int]:
+    """Return the non-overlapping editable quadrant for one 606 source."""
+    boxes = (
+        (30, 135, 375, 420),
+        (375, 135, 720, 420),
+        (30, 420, 375, 720),
+        (375, 420, 720, 720),
+    )
+    return boxes[index] if 0 <= index < len(boxes) else boxes[0]
+
+
 def _multi_angle_page(
     image_ids: list[int],
     adjustments: list[dict[str, Any]] | None = None,
@@ -6458,11 +6742,7 @@ def _multi_angle_page(
         adjustment = adjustments[index] if index < len(adjustments) else None
         row_shift = visual_row_shift if index < 2 else -visual_row_shift
         shifted_box = (box[0], box[1] + row_shift, box[2], box[3] + row_shift)
-        clip_box = (
-            _expanded_safe_box(shifted_box, canvas.size, padding_ratio=0.06)
-            if _has_manual_layout_adjustment(adjustment)
-            else None
-        )
+        clip_box = _multi_angle_safe_box(index) if _has_manual_layout_adjustment(adjustment) else None
         _paste_product(canvas, source, shifted_box, adjustment, clip_box=clip_box)
     draw.line((346, 420, 404, 420), fill="#a8a8a8", width=2)
     draw.line((375, 391, 375, 449), fill="#a8a8a8", width=2)
@@ -6723,6 +7003,7 @@ def _jd_size_product_layout(
     safe_right = round(width * 0.96)
     safe_bottom = round(height * 0.96)
     object_gap = max(16, round(width * 0.025))
+    phone_default_shift_x = 8 if height > width else 12
     product_ruler_gap = max(28, round(width * 0.045))
     product_left_allowance = product_ruler_gap + max(24, round(width * 0.03))
     phone_ruler_gap = max(22, round(width * 0.035))
@@ -6744,7 +7025,12 @@ def _jd_size_product_layout(
             height * 0.095,
             min(height * 0.46, body_height * base_scale * JD_PHONE_HEIGHT_MM / height_mm),
         )
-        group_width = body_width * base_scale + object_gap + fitted_phone_height * JD_PHONE_ASPECT_RATIO
+        group_width = (
+            body_width * base_scale
+            + object_gap
+            + phone_default_shift_x
+            + fitted_phone_height * JD_PHONE_ASPECT_RATIO
+        )
         base_scale *= min(1.0, group_available_width / max(1.0, group_width))
     scale = base_scale * normalized["zoom"]
     rendered_width = max(1, round(cutout.width * scale))
@@ -6761,7 +7047,11 @@ def _jd_size_product_layout(
         min(height * 0.46, body_height * base_scale * JD_PHONE_HEIGHT_MM / height_mm),
     )
     base_group_width = body_width * base_scale + object_gap + base_phone_height * JD_PHONE_ASPECT_RATIO
-    base_group_left = group_left_bound + max(0.0, group_available_width - base_group_width) / 2
+    centered_group_left = group_left_bound + max(0.0, group_available_width - base_group_width) / 2
+    base_group_left = max(
+        group_left_bound,
+        min(centered_group_left, group_right_bound - base_group_width - phone_default_shift_x),
+    )
     desired_body_center_x = (
         base_group_left
         + body_width * base_scale / 2
@@ -6820,6 +7110,10 @@ def _jd_size_product_layout(
     }
 
 
+def _jd_measure_font(size: tuple[int, int]) -> ImageFont.ImageFont:
+    return _font(max(14, round(min(size) * 0.022)))
+
+
 def _draw_jd_dimension_bar(
     canvas: Image.Image,
     start: tuple[int, int],
@@ -6833,7 +7127,7 @@ def _draw_jd_dimension_bar(
     color = JD_MEASURE_COLOR
     stroke = max(2, round(min(canvas.size) / 400))
     cap = max(8, round(min(canvas.size) * 0.014))
-    font = _font(max(14, round(min(canvas.size) * 0.022)))
+    font = _jd_measure_font(canvas.size)
     draw.line((start, end), fill=color, width=stroke)
     if vertical:
         draw.line((start[0] - cap, start[1], start[0] + cap, start[1]), fill=color, width=stroke)
@@ -6847,6 +7141,7 @@ def _draw_jd_dimension_bar(
             (text_x, round((start[1] + end[1]) / 2 - 30)),
             90,
             font,
+            fill=color,
         )
     else:
         draw.line((start[0], start[1] - cap, start[0], start[1] + cap), fill=color, width=stroke)
@@ -6987,6 +7282,18 @@ def _jd_aligned_phone_top(
     return round((body_top + body_bottom - phone_height) / 2)
 
 
+def _jd_adaptive_phone_extra_gap(size: tuple[int, int], available_extra_gap: int) -> int:
+    """Use spare right-side room to separate the phone without risking overflow."""
+    width, height = size
+    portrait_output = height > width
+    available = max(0, available_extra_gap)
+    minimum = 8 if portrait_output else 12
+    maximum = 28 if portrait_output else 48
+    spare_room_share = 0.4 if portrait_output else 0.55
+    preferred = max(minimum, min(maximum, round(available * spare_room_share)))
+    return min(available, preferred)
+
+
 def _jd_comparison_product_layout(
     cutout: Image.Image,
     body_bbox: tuple[int, int, int, int],
@@ -7068,7 +7375,10 @@ def _jd_size_comparison_page(
     phone_right_allowance = phone_ruler_gap + phone_label_clearance
     phone_bottom_allowance = max(28, round(height * 0.055))
     object_gap = max(16, round(width * 0.025))
-    base_phone_left = base_layout["body_box"][2] + object_gap
+    minimum_phone_left = base_layout["body_box"][2] + object_gap
+    maximum_phone_left = safe_right - base_phone_width - phone_right_allowance
+    available_extra_gap = max(0, maximum_phone_left - minimum_phone_left)
+    base_phone_left = minimum_phone_left + _jd_adaptive_phone_extra_gap(size, available_extra_gap)
     base_phone_top = _jd_aligned_phone_top(
         base_layout["body_box"],
         base_phone_height,
@@ -7190,7 +7500,7 @@ def _jd_size_comparison_page(
         vertical=True,
         vertical_label_side="right",
     )
-    label_font = _font(max(14, round(min(size) * 0.022)))
+    label_font = _jd_measure_font(size)
     phone_label = JD_PHONE_LABEL
     label_box = draw.textbbox((0, 0), phone_label, font=label_font)
     draw.text(

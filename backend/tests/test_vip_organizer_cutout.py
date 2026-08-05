@@ -539,6 +539,95 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[661, 400, 3]), 0)
         self.assertEqual(int(cleaned[661, 315, 3]), 255)
 
+    def test_export_cleanup_clears_mixed_brightness_after_confirmed_contact_edge(self):
+        image = Image.new("RGBA", (800, 800), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((180, 170, 620, 650), fill=(190, 170, 135, 255))
+        draw.rectangle((190, 651, 610, 656), fill=(98, 60, 31, 255))
+        draw.rectangle((245, 657, 555, 665), fill=(61, 37, 24, 255))
+        draw.rectangle((270, 659, 315, 663), fill=(185, 170, 145, 255))
+        draw.rectangle((460, 658, 520, 664), fill=(145, 139, 125, 255))
+        draw.rectangle((330, 657, 350, 665), fill=(220, 165, 35, 255))
+
+        cleaned = np.asarray(service._remove_detached_floor_fragments(image))
+
+        self.assertEqual(int(cleaned[653, 400, 3]), 255)
+        self.assertEqual(int(cleaned[661, 285, 3]), 0)
+        self.assertEqual(int(cleaned[661, 480, 3]), 0)
+        self.assertEqual(int(cleaned[661, 340, 3]), 255)
+
+    def test_second_pass_restores_matching_white_base_but_not_shadow(self):
+        rgba = np.zeros((220, 220, 4), dtype=np.uint8)
+        rgba[40:154, 40:180, :3] = (226, 224, 218)
+        rgba[40:154, 40:180, 3] = 255
+        rgba[154:160, 40:180, :3] = (165, 163, 160)
+        rgba[154:160, 40:180, 3] = 220
+        original_alpha = rgba[:, :, 3].copy()
+        cleaned_alpha = original_alpha.copy()
+        # Simulate an aggressive first pass which removed two real base rows
+        # together with the darker contact shadow below them.
+        cleaned_alpha[152:160, 40:180] = 0
+
+        restored = service._restore_overcut_bottom_material(
+            rgba,
+            original_alpha,
+            cleaned_alpha,
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(int(cleaned_alpha[152, 110]), 255)
+        self.assertEqual(int(cleaned_alpha[153, 110]), 255)
+        self.assertEqual(int(cleaned_alpha[154, 110]), 0)
+        self.assertEqual(int(cleaned_alpha[158, 110]), 0)
+
+    def test_second_pass_restores_matching_bucket_piping_only(self):
+        rgba = np.zeros((220, 220, 4), dtype=np.uint8)
+        rgba[35:148, 35:185, :3] = (190, 170, 135)
+        rgba[35:148, 35:185, 3] = 255
+        rgba[148:154, 45:175, :3] = (96, 58, 35)
+        rgba[148:154, 45:175, 3] = 255
+        rgba[154:160, 45:175, :3] = (52, 42, 37)
+        rgba[154:160, 45:175, 3] = 230
+        original_alpha = rgba[:, :, 3].copy()
+        cleaned_alpha = original_alpha.copy()
+        cleaned_alpha[151:160, 45:175] = 0
+
+        restored = service._restore_overcut_bottom_material(
+            rgba,
+            original_alpha,
+            cleaned_alpha,
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(int(cleaned_alpha[151, 110]), 255)
+        self.assertEqual(int(cleaned_alpha[153, 110]), 255)
+        self.assertEqual(int(cleaned_alpha[154, 110]), 0)
+        self.assertEqual(int(cleaned_alpha[158, 110]), 0)
+
+    def test_bottom_orphan_pass_removes_gap_separated_shadow_not_hardware(self):
+        alpha = np.zeros((120, 180), dtype=np.uint8)
+        alpha[20:91, 25:155] = 255
+        # A shallow residual strip sits below a transparent gap.
+        alpha[94:98, 45:135] = 255
+        protected = np.zeros_like(alpha, dtype=bool)
+        # Simulate a small gold fitting crossing the same terminal strip.
+        protected[94:98, 120:130] = True
+
+        changed = service._remove_central_bottom_orphan_tails(
+            alpha,
+            left=35,
+            right=145,
+            top=84,
+            bottom=105,
+            protected_hardware=protected,
+            maximum_height=6,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(int(alpha[95, 80]), 0)
+        self.assertEqual(int(alpha[95, 125]), 255)
+        self.assertEqual(int(alpha[88, 80]), 255)
+
     def test_colour_cast_contact_cleanup_generalises_across_bag_shapes(self):
         cases = (
             ("bucket", (620, 760), (150, 150, 470, 625)),

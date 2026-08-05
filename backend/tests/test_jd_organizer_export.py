@@ -1099,6 +1099,8 @@ def test_jd_phone_first_zoom_step_keeps_the_automatic_anchor():
 
 
 def test_jd_default_comparison_group_keeps_a_safe_gap_and_ruler_clearance():
+    assert service._jd_adaptive_phone_extra_gap((800, 800), 200) == 48
+    assert service._jd_adaptive_phone_extra_gap((750, 1000), 200) == 28
     source = Image.new("RGBA", (700, 250), (80, 90, 105, 255))
     body_box = (0, 0, 700, 250)
     info = {"product_length": "400", "product_height": "60"}
@@ -1107,6 +1109,7 @@ def test_jd_default_comparison_group_keeps_a_safe_gap_and_ruler_clearance():
         layout = service._jd_size_product_layout(source, body_box, (width, height), info, None)
         safe_right = layout["safe_box"][2]
         object_gap = max(16, round(width * 0.025))
+        phone_default_shift_x = 8 if height > width else 12
         phone_ruler_gap = max(22, round(width * 0.035))
         phone_label_clearance = max(40, round(width * 0.05))
         phone_height = max(
@@ -1117,10 +1120,23 @@ def test_jd_default_comparison_group_keeps_a_safe_gap_and_ruler_clearance():
             ),
         )
         phone_width = max(42, round(phone_height * service.JD_PHONE_ASPECT_RATIO))
-        phone_left = layout["body_box"][2] + object_gap
+        minimum_phone_left = layout["body_box"][2] + object_gap
+        maximum_phone_left = safe_right - phone_width - phone_ruler_gap - phone_label_clearance
+        available_extra_gap = max(0, maximum_phone_left - minimum_phone_left)
+        phone_left = minimum_phone_left + service._jd_adaptive_phone_extra_gap((width, height), available_extra_gap)
 
-        assert phone_left - layout["body_box"][2] == object_gap
+        assert phone_left - layout["body_box"][2] >= object_gap
+        if available_extra_gap >= phone_default_shift_x:
+            assert phone_left - layout["body_box"][2] >= object_gap + phone_default_shift_x
         assert phone_left + phone_width + phone_ruler_gap + phone_label_clearance <= safe_right + 2
+
+
+def test_jd_vertical_dimension_text_uses_the_shared_measure_color():
+    canvas = Image.new("RGB", (800, 800), "white")
+    service._draw_jd_dimension_bar(canvas, (120, 240), (120, 560), "200mm", vertical=True)
+    pixels = np.asarray(canvas)
+    assert np.any(np.all(pixels == (112, 112, 112), axis=2))
+    assert not np.any(np.all(pixels == (85, 85, 85), axis=2))
 
 
 def test_jd_size_rulers_stay_visible_when_adjusting_objects_only():
@@ -1369,6 +1385,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_default_comparison_group_keeps_safe_spacing(self):
         test_jd_default_comparison_group_keeps_a_safe_gap_and_ruler_clearance()
+
+    def test_vertical_dimension_text_uses_shared_color(self):
+        test_jd_vertical_dimension_text_uses_the_shared_measure_color()
 
     def test_jd_object_only_modes_keep_rulers_visible(self):
         test_jd_size_rulers_stay_visible_when_adjusting_objects_only()

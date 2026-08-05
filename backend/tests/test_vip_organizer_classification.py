@@ -20,6 +20,7 @@ from backend.services.vip_organizer_service import (
     _jd_size_product_layout,
     _model_showcase_page,
     _multi_angle_page,
+    _multi_angle_safe_box,
     _multi_angle_visual_row_shift,
     _normalized_product_page,
     _paste_layer,
@@ -155,6 +156,29 @@ class VipOrganizerClassificationTests(unittest.TestCase):
         self.assertEqual(centered_top[3] - baseline_top[3], 13)
         self.assertEqual(centered_bottom[1] - baseline_bottom[1], -13)
         self.assertEqual(centered_bottom[3] - baseline_bottom[3], -13)
+
+    def test_multi_angle_manual_movement_is_clipped_to_its_larger_quadrant(self):
+        source = Image.new("RGBA", (200, 200), (190, 55, 65, 255))
+        adjustment = {"offset_x": 0.8, "offset_y": 0.8}
+        with (
+            patch("backend.services.vip_organizer_service._load_image", return_value=source),
+            patch("backend.services.vip_organizer_service._multi_angle_visual_row_shift", return_value=0),
+        ):
+            rendered = _multi_angle_page([1], [adjustment])
+
+        pixels = np.asarray(rendered)
+        foreground = (pixels[:, :, 0] > 150) & (pixels[:, :, 1] < 100) & (pixels[:, :, 2] < 100)
+        bbox = Image.fromarray((foreground * 255).astype(np.uint8), mode="L").getbbox()
+        self.assertIsNotNone(bbox)
+        assert bbox is not None
+        safe_box = _multi_angle_safe_box(0)
+        self.assertEqual(safe_box, (30, 135, 375, 420))
+        self.assertGreaterEqual(bbox[0], safe_box[0])
+        self.assertGreaterEqual(bbox[1], safe_box[1])
+        self.assertLessEqual(bbox[2], safe_box[2])
+        self.assertLessEqual(bbox[3], safe_box[3])
+        self.assertEqual(bbox[2], safe_box[2])
+        self.assertEqual(bbox[3], safe_box[3])
 
     def test_vip_second_catalog_slot_lowers_only_tall_handle_bags_a_little_more(self):
         tote = Image.new("RGBA", (440, 440), (0, 0, 0, 0))

@@ -120,6 +120,10 @@ type PreviewFolder = "800" | "750";
 const JD_SINGLE_FOLDER_FILES = new Set(["0-无logo.jpg", "透明.png"]);
 const JD_MEASURE_COLOR = "#707070";
 
+function jdMeasureFont(output: { width: number; height: number }) {
+  return `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+}
+
 const DEFAULT_ADJUSTMENT: ImageAdjustment = {
   zoom: 1,
   offset_x: 0,
@@ -480,14 +484,21 @@ function slotEditorSafeAreaLayout(slot: Slot, platform: OrganizerPlatform, sourc
   if (platform === "vip" && ["2.jpg", "3.jpg", "4.jpg"].includes(slot.file_name)) {
     return { x: 0.04, y: 0.04, width: 0.92, height: 0.92 };
   }
+  if (platform === "vip" && slot.file_name === "606.jpg") {
+    const areas = [
+      { x: 30 / 750, y: 135 / 750, width: 345 / 750, height: 285 / 750 },
+      { x: 375 / 750, y: 135 / 750, width: 345 / 750, height: 285 / 750 },
+      { x: 30 / 750, y: 420 / 750, width: 345 / 750, height: 300 / 750 },
+      { x: 375 / 750, y: 420 / 750, width: 345 / 750, height: 300 / 750 }
+    ];
+    return areas[sourceIndex] || areas[0];
+  }
   if (slot.file_name.endsWith(".png")) return { x: 0.04, y: 0.04, width: 0.92, height: 0.92 };
   const template = slotPreviewLayout(slot, platform, sourceIndex, targetFolder);
   if (template.x <= 0.04 && template.y <= 0.04 && template.x + template.width >= 0.96 && template.y + template.height >= 0.96) {
     return template;
   }
-  const padding = slot.file_name === "606.jpg"
-    ? 0.06
-    : ["604.jpg", "605.jpg"].includes(slot.file_name) ? 0.14 : 0.055;
+  const padding = ["604.jpg", "605.jpg"].includes(slot.file_name) ? 0.14 : 0.055;
   const left = Math.max(0.04, template.x - padding);
   const top = Math.max(0.04, template.y - padding);
   const right = Math.min(0.96, template.x + template.width + padding);
@@ -655,6 +666,40 @@ function livePreviewImage(url: string) {
   image.src = url;
   livePreviewImageCache.set(url, image);
   return image;
+}
+
+function preloadExactPreview(url: string, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    let settled = false;
+    const cleanup = () => {
+      image.onload = null;
+      image.onerror = null;
+      signal.removeEventListener("abort", abort);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = () => finish(new DOMException("Preview request aborted", "AbortError"));
+    image.onload = () => {
+      void image.decode().catch(() => undefined).then(() => {
+        if (signal.aborted) abort();
+        else finish();
+      });
+    };
+    image.onerror = () => finish(new Error("精确预览图片加载失败"));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    image.src = url;
+  });
 }
 
 function preparedProductCutout(url: string, image: HTMLImageElement) {
@@ -1338,6 +1383,7 @@ function jdProductGeometry(
   const preferredBodyWidth = output.width * profile.preferredWidth * Math.max(0.82, Math.min(1.08, lengthMm / 205));
   const safe = { left: output.width * 0.04, top: output.height * 0.04, right: output.width * 0.96, bottom: output.height * 0.96 };
   const objectGap = Math.max(16, output.width * 0.025);
+  const phoneDefaultShiftX = output.height > output.width ? 8 : 12;
   const productRulerGap = Math.max(28, output.width * 0.045);
   const productLeftAllowance = productRulerGap + Math.max(24, output.width * 0.03);
   const phoneRulerGap = Math.max(22, output.width * 0.035);
@@ -1357,7 +1403,8 @@ function jdProductGeometry(
       output.height * 0.095,
       Math.min(output.height * 0.46, bodyHeight * baseScale * (163 / heightMm))
     );
-    const groupWidth = bodyWidth * baseScale + objectGap + fittedPhoneHeight * JD_PHONE_ASPECT_RATIO;
+    const groupWidth = bodyWidth * baseScale + objectGap + phoneDefaultShiftX
+      + fittedPhoneHeight * JD_PHONE_ASPECT_RATIO;
     baseScale *= Math.min(1, groupAvailableWidth / Math.max(1, groupWidth));
   }
   const scale = baseScale * draft.zoom;
@@ -1374,7 +1421,11 @@ function jdProductGeometry(
     Math.min(output.height * 0.46, bodyHeight * baseScale * (163 / heightMm))
   );
   const baseGroupWidth = bodyWidth * baseScale + objectGap + basePhoneHeight * JD_PHONE_ASPECT_RATIO;
-  const baseGroupLeft = groupLeftBound + Math.max(0, groupAvailableWidth - baseGroupWidth) / 2;
+  const centeredGroupLeft = groupLeftBound + Math.max(0, groupAvailableWidth - baseGroupWidth) / 2;
+  const baseGroupLeft = Math.max(
+    groupLeftBound,
+    Math.min(centeredGroupLeft, groupRightBound - baseGroupWidth - phoneDefaultShiftX)
+  );
   const desiredBodyCenterX = baseGroupLeft + bodyWidth * baseScale / 2 + draft.offset_x * output.width * 0.18;
   let x = desiredBodyCenterX - (scaledBody.left + scaledBody.right) / 2;
   let y = output.height * (output.height > output.width ? 0.70 : 0.73) + draft.offset_y * output.height * 0.18 - scaledBody.bottom;
@@ -1484,7 +1535,19 @@ function jdComparisonPhoneLayout(
     : height * 0.78;
   const basePhoneWidth = phoneWidthForHeight(basePhoneHeight);
   const objectGap = Math.max(16, output.width * 0.025);
-  let basePhoneLeft = baseGeometry.body.right + objectGap;
+  const minimumPhoneLeft = baseGeometry.body.right + objectGap;
+  const maximumPhoneLeft = geometry.safe.right - basePhoneWidth - phoneRightAllowance;
+  const availableExtraGap = Math.max(0, maximumPhoneLeft - minimumPhoneLeft);
+  const portraitOutput = output.height > output.width;
+  const minimumExtraGap = portraitOutput ? 8 : 12;
+  const maximumExtraGap = portraitOutput ? 28 : 48;
+  const spareRoomShare = portraitOutput ? 0.4 : 0.55;
+  const preferredExtraGap = Math.max(
+    minimumExtraGap,
+    Math.min(maximumExtraGap, availableExtraGap * spareRoomShare)
+  );
+  const adaptiveExtraGap = Math.min(availableExtraGap, preferredExtraGap);
+  let basePhoneLeft = minimumPhoneLeft + adaptiveExtraGap;
   let basePhoneTop = (draft.phone_alignment || "bottom") === "bottom"
     ? baseGeometry.body.bottom - basePhoneHeight
     : (baseGeometry.body.top + baseGeometry.body.bottom - basePhoneHeight) / 2;
@@ -1555,7 +1618,7 @@ function drawCanvasRuler(
   context.strokeStyle = JD_MEASURE_COLOR;
   context.fillStyle = JD_MEASURE_COLOR;
   context.lineWidth = Math.max(1, output.width * 0.002);
-  context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+  context.font = jdMeasureFont(output);
   context.textAlign = "center";
   context.beginPath();
   context.moveTo(start.x, start.y);
@@ -1677,7 +1740,7 @@ function drawJdComparisonPreview(
   );
   context.save();
   context.fillStyle = JD_MEASURE_COLOR;
-  context.font = `500 ${Math.max(12, Math.round(output.width * 0.017))}px sans-serif`;
+  context.font = jdMeasureFont(output);
   context.textAlign = "center";
   context.fillText("iPhone 17 Pro Max", phone.left + phone.width / 2, phone.top + phone.height + 22);
   context.restore();
@@ -2272,6 +2335,7 @@ function SlotAdjustmentEditor({
   const [editorLayerInfo, setEditorLayerInfo] = useState<OrganizerLayerInfo | null>(null);
   const [logoColor, setLogoColor] = useState<LogoColor>(slot.logo_color === "white" ? "white" : "black");
   const [renderedPreview, setRenderedPreview] = useState(usableInitialPreview);
+  const [loadedExactPreview, setLoadedExactPreview] = useState("");
   const [previewSynced, setPreviewSynced] = useState(Boolean(usableInitialPreview));
   const [holdExactPreview, setHoldExactPreview] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -2404,14 +2468,18 @@ function SlotAdjustmentEditor({
     if (!isInfoPage && !isPhoneComparison) return null;
     if (isInfoPage) {
       const body = organizerLayerBounds(editorLayerInfo?.product_body_bbox);
-      return body && editorLayerInfo
-        ? positionedInfoProductBody(
+      if (body && editorLayerInfo) {
+        return positionedInfoProductBody(
           editorLayerInfo.width,
           editorLayerInfo.height,
           body,
           nextDraft,
           editorLayerInfo.handle_lift
-        )
+        );
+      }
+      const sourceImage = sourceImageRef.current;
+      return sourceImage?.naturalWidth
+        ? liveInfoProductBody(sourceUrl, sourceImage, nextDraft)
         : null;
     }
     if (!sourceImageRef.current?.naturalWidth) return null;
@@ -2576,6 +2644,7 @@ function SlotAdjustmentEditor({
         platform,
         target_folder: targetFolder
       }, controller.signal);
+      await preloadExactPreview(result.preview_url, controller.signal);
       if (requestId === previewRequestRef.current) {
         renderedPreviewRef.current = result.preview_url;
         setRenderedPreview(result.preview_url);
@@ -3012,10 +3081,12 @@ function SlotAdjustmentEditor({
                 onLayerInfoChange={setEditorLayerInfo}
               />
               {renderedPreview && <img
-                className={`slot-exact-preview${previewSynced || holdExactPreview ? " is-visible" : ""}`}
+                key={renderedPreview}
+                className={`slot-exact-preview${(previewSynced || holdExactPreview) && loadedExactPreview === renderedPreview ? " is-visible" : ""}`}
                 src={renderedPreview}
                 alt={`${slot.file_name} 精确成品预览`}
                 draggable={false}
+                onLoad={() => setLoadedExactPreview(renderedPreview)}
               />}
               <SlotSafeAreaOverlay
                 slot={slot}
@@ -3066,7 +3137,7 @@ function SlotAdjustmentEditor({
                 // Keep the independently positioned ruler baseline intact.
                 // Subsequent linked moves transform it by the same product
                 // delta instead of snapping it back onto the product body.
-                applyDraft({ ...draftRef.current, product_show_ruler: true }, false);
+                applyDraft({ ...draftRef.current, product_show_ruler: true }, true);
               }}>全部</button>
               <button type="button" className={infoMoveTarget === "product" ? "active-tool" : ""} onClick={() => {
                 setInfoMoveTarget("product");
