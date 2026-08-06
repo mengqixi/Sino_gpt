@@ -773,6 +773,50 @@ class PreparedProductCutoutTests(unittest.TestCase):
         self.assertEqual(int(cleaned[660, 274, 3]), 255)
         self.assertEqual(int(cleaned[662, 540, 3]), 255)
 
+    def test_woven_bottom_repair_restores_piping_and_removes_floor_tail(self):
+        rgba = np.zeros((240, 240, 4), dtype=np.uint8)
+        rgba[30:190, 50:190] = (190, 170, 135, 255)
+        rgba[181:186, 55:185] = (92, 55, 35, 255)
+        rgba[186:194, 60:180] = (30, 25, 22, 220)
+        rgba[186:188, 38:46] = (210, 208, 200, 255)
+        rgba[165:186, 25:43] = (213, 173, 85, 255)
+        rgba[190:193, 22:43] = (213, 173, 85, 255)
+        original_alpha = rgba[:, :, 3].copy()
+        cleaned_alpha = original_alpha.copy()
+        cleaned_alpha[181:186, 90:151] = 0
+
+        changed = service._repair_continuous_woven_bottom_edge(
+            rgba,
+            original_alpha,
+            cleaned_alpha,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(int(cleaned_alpha[183, 120]), 255)
+        self.assertEqual(int(cleaned_alpha[190, 120]), 0)
+        self.assertEqual(int(cleaned_alpha[187, 41]), 0)
+        self.assertEqual(int(cleaned_alpha[175, 32]), 255)
+        self.assertEqual(int(cleaned_alpha[191, 30]), 255)
+
+    def test_woven_bottom_repair_does_not_change_white_or_pink_bags(self):
+        for colour in ((226, 224, 218, 255), (204, 151, 169, 255)):
+            with self.subTest(colour=colour):
+                rgba = np.zeros((240, 240, 4), dtype=np.uint8)
+                rgba[30:190, 50:190] = colour
+                rgba[186:194, 60:180] = (80, 75, 72, 180)
+                original_alpha = rgba[:, :, 3].copy()
+                cleaned_alpha = original_alpha.copy()
+                before = cleaned_alpha.copy()
+
+                changed = service._repair_continuous_woven_bottom_edge(
+                    rgba,
+                    original_alpha,
+                    cleaned_alpha,
+                )
+
+                self.assertFalse(changed)
+                self.assertTrue(np.array_equal(cleaned_alpha, before))
+
     def test_residue_audit_clears_small_white_hardware_pocket_only(self):
         shape = (120, 120)
         alpha = np.zeros(shape, dtype=np.uint8)
