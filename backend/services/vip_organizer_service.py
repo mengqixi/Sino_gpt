@@ -4263,218 +4263,290 @@ def _retain_compact_terminal_hardware(
     return retained
 
 
-def _restore_overcut_bottom_material(
+def _repair_continuous_woven_bottom_edge(
     rgba: np.ndarray,
     original_alpha: np.ndarray,
     cleaned_alpha: np.ndarray,
 ) -> bool:
-    """Restore a short, colour-continuous product edge removed as floor.
+    """Restore dark terminal piping and remove the white-floor tail below it.
 
-    This is deliberately a validation pass, not a new foreground detector. It
-    can only restore pixels which were present before floor cleanup, touch the
-    retained central product base, and match the local material immediately
-    above them. Once colour or opacity stops matching, the column is closed so
-    the recovery cannot continue into the studio shadow.
+    This pass is intentionally narrow. It requires a light/coloured body, a
+    horizontally supported dark terminal plateau and a second darker drop.
+    White, pastel and dark bags which do not provide all three signals are
+    returned unchanged.
     """
-    # Genuine product material which was cut too high normally kept an opaque
-    # model prediction. A confidence-collapse tail is precisely the opposite;
-    # never use this pass to undo that lower-confidence evidence.
-    removed = (original_alpha >= 230) & (cleaned_alpha <= 8)
-    if not np.any(removed):
+    foreground = original_alpha > 8
+    foreground_y, foreground_x = np.where(foreground)
+    if not len(foreground_x):
         return False
 
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (cleaned_alpha > 8).astype(np.uint8),
-        8,
-    )
-    if component_count <= 1:
-        return False
-    largest_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    main_pixels = labels == largest_component
-    main_left = int(stats[largest_component, cv2.CC_STAT_LEFT])
-    main_top = int(stats[largest_component, cv2.CC_STAT_TOP])
-    main_width = int(stats[largest_component, cv2.CC_STAT_WIDTH])
-    main_height = int(stats[largest_component, cv2.CC_STAT_HEIGHT])
-    if main_width < 20 or main_height < 20:
+    main_left = int(foreground_x.min())
+    main_right = int(foreground_x.max()) + 1
+    main_top = int(foreground_y.min())
+    main_bottom = int(foreground_y.max()) + 1
+    main_width = main_right - main_left
+    main_height = main_bottom - main_top
+    if main_width < 40 or main_height < 40:
         return False
 
     central_left = main_left + round(main_width * 0.10)
-    central_right = main_left + main_width - round(main_width * 0.10)
-    lower_start = main_top + round(main_height * 0.80)
-    maximum_recovery_rows = max(
-        3,
-        min(7, round(main_height * 0.010)),
-    )
+    central_right = main_right - round(main_width * 0.10)
     rgb = rgba[:, :, :3]
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-    recovery_candidate = np.zeros_like(removed)
-
-    for column in range(central_left, central_right):
-        retained_rows = np.flatnonzero(
-            main_pixels[lower_start:main_top + main_height, column]
-            & (
-                cleaned_alpha[
-                    lower_start:main_top + main_height,
-                    column,
-                ]
-                >= 128
-            )
-        )
-        if not retained_rows.size:
-            continue
-        anchor_row = lower_start + int(retained_rows[-1])
-        anchor_top = max(lower_start, anchor_row - 3)
-        anchor_left = max(central_left, column - 1)
-        anchor_right = min(central_right, column + 2)
-        anchor_pixels = (
-            main_pixels[
-                anchor_top:anchor_row + 1,
-                anchor_left:anchor_right,
-            ]
-            & (
-                cleaned_alpha[
-                    anchor_top:anchor_row + 1,
-                    anchor_left:anchor_right,
-                ]
-                >= 128
-            )
-        )
-        if not np.any(anchor_pixels):
-            continue
-        anchor_lab = np.median(
-            lab[
-                anchor_top:anchor_row + 1,
-                anchor_left:anchor_right,
-            ][anchor_pixels],
-            axis=0,
-        )
-        anchor_hsv = np.median(
-            hsv[
-                anchor_top:anchor_row + 1,
-                anchor_left:anchor_right,
-            ][anchor_pixels],
-            axis=0,
-        )
-
-        for row in range(
-            anchor_row + 1,
-            min(
-                cleaned_alpha.shape[0],
-                anchor_row + maximum_recovery_rows + 1,
-            ),
-        ):
-            if not removed[row, column]:
-                break
-            colour_distance = float(np.linalg.norm(
-                lab[row, column] - anchor_lab
-            ))
-            value_difference = abs(
-                float(hsv[row, column, 2]) - float(anchor_hsv[2])
-            )
-            saturation_difference = abs(
-                float(hsv[row, column, 1]) - float(anchor_hsv[1])
-            )
-            same_local_material = (
-                colour_distance <= 9.0
-                and value_difference <= 9.0
-                and saturation_difference <= 14.0
-            )
-            if not same_local_material:
-                break
-            recovery_candidate[row, column] = True
-
-    if not np.any(recovery_candidate):
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    material = foreground & (saturation >= 45) & (value <= 220)
+    sample = material.copy()
+    sample[: main_top + round(main_height * 0.30)] = False
+    sample[main_top + round(main_height * 0.75) :] = False
+    sample[:, :central_left] = False
+    sample[:, central_right:] = False
+    if not np.any(sample):
+        return False
+    material_value = float(np.median(value[sample]))
+    material_saturation = float(np.median(saturation[sample]))
+    if material_value <= 105:
         return False
 
-    # A real base/piping edge has horizontal support. Reject isolated matching
-    # specks, which are common in a softly coloured studio shadow.
-    candidate_count, candidate_labels, candidate_stats, _ = (
-        cv2.connectedComponentsWithStats(
-            recovery_candidate.astype(np.uint8),
-            8,
+    minimum_count = max(20, round(main_width * 0.28))
+    measurements: list[tuple[int, float, float, float]] = []
+    scan_start = main_top + round(main_height * 0.88)
+    for row in range(scan_start, main_bottom):
+        row_pixels = foreground[row, central_left:central_right]
+        if int(np.count_nonzero(row_pixels)) < minimum_count:
+            continue
+        measurements.append(
+            (
+                row,
+                float(np.median(value[row, central_left:central_right][row_pixels])),
+                float(np.median(saturation[row, central_left:central_right][row_pixels])),
+                float(np.median(original_alpha[row, central_left:central_right][row_pixels])),
+            )
         )
-    )
-    supported_recovery = np.zeros_like(recovery_candidate)
-    minimum_width = max(8, round(main_width * 0.025))
-    retained_neighbourhood = cv2.dilate(
-        (cleaned_alpha >= 128).astype(np.uint8),
-        np.ones((3, 3), dtype=np.uint8),
-        iterations=1,
-    ).astype(bool)
-    for component in range(1, candidate_count):
-        component_pixels = candidate_labels == component
-        component_width = int(
-            candidate_stats[component, cv2.CC_STAT_WIDTH]
-        )
+
+    first_dark: int | None = None
+    for index, (_, row_value, _, _) in enumerate(measurements):
+        preceding = measurements[max(0, index - 8):index]
         if (
-            component_width >= minimum_width
-            and np.any(component_pixels & retained_neighbourhood)
+            preceding
+            and row_value <= max(45.0, material_value * 0.56)
+            and float(np.median([item[1] for item in preceding]))
+            >= material_value * 0.66
         ):
-            supported_recovery |= component_pixels
-
-    if not np.any(supported_recovery):
+            first_dark = index
+            break
+    if first_dark is None:
         return False
-    cleaned_alpha[supported_recovery] = original_alpha[supported_recovery]
-    return True
 
-
-def _remove_central_bottom_orphan_tails(
-    alpha: np.ndarray,
-    *,
-    left: int,
-    right: int,
-    top: int,
-    bottom: int,
-    protected_hardware: np.ndarray,
-    maximum_height: int,
-) -> bool:
-    """Remove shallow bottom runs separated vertically from the product."""
-    candidates = np.zeros_like(alpha, dtype=bool)
-    for column in range(max(0, left), min(alpha.shape[1], right)):
-        occupied = alpha[top:bottom, column] > 8
-        occupied_rows = np.flatnonzero(occupied)
-        if occupied_rows.size < 2:
-            continue
-        first_occupied = int(occupied_rows[0])
-        gap_start: int | None = None
-        for local_row in range(first_occupied + 1, occupied.size):
-            if occupied[local_row]:
-                if gap_start is not None:
-                    tail_rows = np.flatnonzero(occupied[local_row:])
-                    if tail_rows.size:
-                        last_tail_row = local_row + int(tail_rows[-1])
-                        if last_tail_row - local_row + 1 <= maximum_height:
-                            candidates[
-                                top + local_row:top + last_tail_row + 1,
-                                column,
-                            ] |= occupied[local_row:last_tail_row + 1]
-                    break
-            elif gap_start is None:
-                gap_start = local_row
-
-    if not np.any(candidates):
-        return False
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        candidates.astype(np.uint8),
-        8,
-    )
-    removable = np.zeros_like(candidates)
-    for component in range(1, component_count):
-        component_pixels = labels == component
-        component_height = int(stats[component, cv2.CC_STAT_HEIGHT])
-        hardware_fraction = float(np.mean(
-            protected_hardware[component_pixels]
+    plateau_end = first_dark
+    minimum_trim_value = max(22.0, material_value * 0.15)
+    minimum_trim_saturation = max(28.0, material_saturation * 0.52)
+    while plateau_end + 1 < len(measurements):
+        next_row, next_value, next_saturation, _ = measurements[plateau_end + 1]
+        previous_row = measurements[plateau_end][0]
+        reference_value = float(np.median(
+            [item[1] for item in measurements[first_dark:plateau_end + 1]]
         ))
         if (
-            component_height <= maximum_height
-            and hardware_fraction < 0.12
+            next_row != previous_row + 1
+            or next_value < max(minimum_trim_value, reference_value * 0.70)
+            or next_value > reference_value * 1.40
+            or next_saturation < minimum_trim_saturation
         ):
-            removable |= component_pixels & ~protected_hardware
-    if not np.any(removable):
+            break
+        plateau_end += 1
+
+    following = plateau_end + 1
+    if plateau_end - first_dark + 1 < 3 or following >= len(measurements):
         return False
-    alpha[removable] = 0
-    return True
+    reference_value = float(np.median(
+        [item[1] for item in measurements[first_dark:plateau_end + 1]]
+    ))
+    shadow_start, shadow_value, _, _ = measurements[following]
+    if shadow_value > max(18.0, reference_value * 0.72):
+        return False
+    trim_start = measurements[first_dark][0]
+
+    before = cleaned_alpha.copy()
+    yy = np.arange(cleaned_alpha.shape[0])[:, None]
+    xx = np.arange(cleaned_alpha.shape[1])[None, :]
+    central = (xx >= central_left) & (xx < central_right)
+    red = rgb[:, :, 0].astype(np.int16)
+    green = rgb[:, :, 1].astype(np.int16)
+    blue = rgb[:, :, 2].astype(np.int16)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    gradient = cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    gold = (
+        (hue >= 6)
+        & (hue <= 42)
+        & (saturation >= 75)
+        & (value >= 90)
+        & (red >= blue + 10)
+        & (green >= blue + 5)
+    )
+    silver = (
+        (saturation <= 38)
+        & (value >= 90)
+        & (gradient >= 50)
+    )
+
+    trim_region = (
+        central
+        & (yy >= trim_start)
+        & (yy < shadow_start)
+        & (original_alpha > 8)
+    )
+    cleaned_alpha[trim_region] = 0
+    trim_core = (
+        trim_region
+        & (original_alpha >= 230)
+        & (
+            ((saturation >= 48) & (value <= 210))
+            | (value <= 145)
+            | gold
+        )
+    ).astype(np.uint8)
+    trim_support = cv2.morphologyEx(
+        trim_core,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)),
+    ).astype(bool)
+    restore_trim = trim_region & (original_alpha >= 230) & trim_support
+    cleaned_alpha[restore_trim] = original_alpha[restore_trim]
+    cleaned_alpha[central & (yy >= shadow_start) & ~gold] = 0
+
+    side_overlap = max(4, round(main_width * 0.10))
+    side_ranges = (
+        (main_left, min(central_right, central_left + side_overlap)),
+        (max(central_left, central_right - side_overlap), main_right),
+    )
+    for side_left, side_right in side_ranges:
+        side_width = side_right - side_left
+        if side_width < 5:
+            continue
+        side_original_alpha = original_alpha[:, side_left:side_right]
+        side_saturation = saturation[:, side_left:side_right]
+        side_value = value[:, side_left:side_right]
+        side_gold = gold[:, side_left:side_right]
+        anchor = (
+            (side_original_alpha >= 180)
+            & (
+                ((side_saturation >= 55) & (side_value <= 225))
+                | (side_value <= 120)
+            )
+        )
+        counts = anchor.sum(axis=1)
+        anchor_rows = np.where(
+            (np.arange(cleaned_alpha.shape[0]) >= trim_start - 30)
+            & (counts >= max(4, round(side_width * 0.06)))
+        )[0]
+        if not len(anchor_rows):
+            continue
+        anchor_bottom = int(anchor_rows[-1])
+        object_core = (
+            (side_original_alpha > 8)
+            & (
+                ((side_saturation >= 72) & (side_value <= 235))
+                | (side_value <= 112)
+                | side_gold
+            )
+        )
+        core_bottom = np.full(side_width, -1, dtype=np.int32)
+        for column in range(side_width):
+            core_rows = np.where(object_core[:, column])[0]
+            if len(core_rows):
+                core_bottom[column] = int(core_rows[-1])
+        local_bottom = core_bottom.copy()
+        for column in range(side_width):
+            start = max(0, column - 4)
+            end = min(side_width, column + 5)
+            local_bottom[column] = int(np.max(core_bottom[start:end]))
+        below_local_object = (
+            yy[:, :side_width] > local_bottom[None, :] + 2
+        ) & (local_bottom[None, :] >= 0)
+        white_floor = (
+            (yy[:, :side_width] >= trim_start - 35)
+            & (side_original_alpha > 8)
+            & (side_saturation <= 55)
+            & (side_value >= 120)
+            & below_local_object
+        )
+        cleaned_alpha[:, side_left:side_right][white_floor] = 0
+        side_shadow = (
+            (yy[:, :side_width] > anchor_bottom)
+            & (side_original_alpha < 230)
+            & (side_saturation <= 58)
+            & (side_value >= 75)
+            & ~side_gold
+            & ~(
+                silver[:, side_left:side_right]
+                & (side_original_alpha >= 245)
+            )
+        )
+        cleaned_alpha[:, side_left:side_right][side_shadow] = 0
+
+    for confidence in (160, 96, 32):
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (cleaned_alpha > confidence).astype(np.uint8),
+            8,
+        )
+        if count <= 1:
+            continue
+        main_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        for component in range(1, count):
+            if component == main_component:
+                continue
+            left = int(stats[component, cv2.CC_STAT_LEFT])
+            top = int(stats[component, cv2.CC_STAT_TOP])
+            width = int(stats[component, cv2.CC_STAT_WIDTH])
+            height = int(stats[component, cv2.CC_STAT_HEIGHT])
+            area = int(stats[component, cv2.CC_STAT_AREA])
+            if (
+                top < trim_start - 35
+                or height > 6
+                or width > round(main_width * 0.16)
+                or area > 180
+            ):
+                continue
+            component_pixels = labels == component
+            gold_fraction = float(np.count_nonzero(gold & component_pixels)) / area
+            if gold_fraction >= 0.45:
+                continue
+            box_left = max(0, left - 2)
+            box_right = min(cleaned_alpha.shape[1], left + width + 2)
+            box_bottom = min(cleaned_alpha.shape[0], top + height + 2)
+            box = np.zeros_like(cleaned_alpha, dtype=bool)
+            box[top:box_bottom, box_left:box_right] = True
+            cleaned_alpha[box & (labels != main_component)] = 0
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (cleaned_alpha > 8).astype(np.uint8),
+        8,
+    )
+    if count > 1:
+        main_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        maximum_fragment_height = max(6, round((shadow_start - trim_start) * 1.2))
+        for component in range(1, count):
+            if component == main_component:
+                continue
+            top = int(stats[component, cv2.CC_STAT_TOP])
+            height = int(stats[component, cv2.CC_STAT_HEIGHT])
+            component_pixels = labels == component
+            component_area = int(stats[component, cv2.CC_STAT_AREA])
+            gold_fraction = (
+                float(np.count_nonzero(gold & component_pixels))
+                / component_area
+            )
+            if (
+                top >= trim_start - 35
+                and height <= maximum_fragment_height
+                and gold_fraction < 0.45
+            ):
+                cleaned_alpha[component_pixels] = 0
+
+    return not np.array_equal(before, cleaned_alpha)
 
 
 def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
@@ -4535,8 +4607,6 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
     detached_metal_core = detached_gold_core | detached_silver_core
 
     changed = False
-    deferred_orphan_cleanup: tuple[int, int, int, int, int] | None = None
-    deferred_orphan_hardware: np.ndarray | None = None
     for component in range(1, component_count):
         if component == largest_component:
             continue
@@ -4985,35 +5055,16 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                         & (yy >= dark_contact_start)
                         & (xx >= dark_body_left)
                         & (xx < dark_body_right)
+                        & (
+                            hsv[:, :, 2]
+                            <= max(65.0, median_material_value * 0.72)
+                        )
                         & ~terminal_hardware
                     )
                     if np.any(dark_contact_tail):
                         alpha[dark_contact_tail] = 0
                         changed = True
 
-                    # Mixed-brightness shadows can leave shallow islands just
-                    # above the detected contact start. Defer their removal
-                    # until every later floor pass has run, because those
-                    # passes can be what finally exposes the vertical gap.
-                    orphan_scan_top = max(
-                        main_top,
-                        dark_contact_start
-                        - max(12, round(main_height * 0.025)),
-                    )
-                    deferred_orphan_cleanup = (
-                        dark_body_left,
-                        dark_body_right,
-                        orphan_scan_top,
-                        min(
-                            alpha.shape[0],
-                            main_top + main_height,
-                        ),
-                        max(
-                            4,
-                            round(main_height * 0.015),
-                        ),
-                    )
-                    deferred_orphan_hardware = terminal_hardware.copy()
 
         if floor_row is not None and median_material_value > 105:
             gold_core = (
@@ -5516,34 +5567,6 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
                 ):
                     alpha[component_pixels] = 0
 
-    if (
-        deferred_orphan_cleanup is not None
-        and deferred_orphan_hardware is not None
-    ):
-        (
-            orphan_left,
-            orphan_right,
-            orphan_top,
-            orphan_bottom,
-            orphan_maximum_height,
-        ) = deferred_orphan_cleanup
-        if _remove_central_bottom_orphan_tails(
-            alpha,
-            left=orphan_left,
-            right=orphan_right,
-            top=orphan_top,
-            bottom=orphan_bottom,
-            protected_hardware=deferred_orphan_hardware,
-            maximum_height=orphan_maximum_height,
-        ):
-            changed = True
-
-    # Verify the removal against the product's own local bottom colour. This
-    # can add back a few over-cut edge pixels, but never pixels which were not
-    # present in the incoming matte.
-    if _restore_overcut_bottom_material(rgba, original_alpha, alpha):
-        changed = True
-
     # Lanczos resizing and alpha feathering can leave sub-visible (1..8)
     # colour specks after an attached shadow has been removed. They become a
     # dirty dotted line on a grey marketplace preview even though they carry
@@ -5552,6 +5575,9 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
     numerical_alpha_tail = (alpha > 0) & (alpha <= 8)
     if np.any(numerical_alpha_tail):
         alpha[numerical_alpha_tail] = 0
+        changed = True
+
+    if _repair_continuous_woven_bottom_edge(rgba, original_alpha, alpha):
         changed = True
 
     if changed:
