@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from ..services.vip_organizer_service import (
+    ORGANIZER_LAYER_RENDER_VERSION,
     analysis_config_status,
     asset_original,
     asset_organizer_layer,
@@ -23,6 +24,7 @@ from ..services.vip_organizer_service import (
     prepared_cutout_file,
     render_previews,
     render_slot_preview,
+    resume_session,
     save_analysis_config,
     save_assets,
     start_session,
@@ -73,6 +75,10 @@ class SessionCleanupPayload(BaseModel):
     session_id: str
 
 
+class SessionResumePayload(BaseModel):
+    session_id: str
+
+
 @router.post("/session")
 def create_session(payload: SessionPayload | None = None):
     return start_session(payload.previous_session_id if payload else None)
@@ -81,6 +87,14 @@ def create_session(payload: SessionPayload | None = None):
 @router.post("/session/cleanup", status_code=204)
 def cleanup_session(payload: SessionCleanupPayload):
     delete_session(payload.session_id)
+
+
+@router.post("/session/resume")
+def resume_existing_session(payload: SessionResumePayload):
+    try:
+        return resume_session(payload.session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/upload")
@@ -152,8 +166,11 @@ def get_asset_organizer_layer(
     crop_y: float = 0.0,
     crop_width: float = 1.0,
     crop_height: float = 1.0,
+    v: int | None = None,
 ):
     try:
+        if v is not None and v != ORGANIZER_LAYER_RENDER_VERSION:
+            raise ValueError("商品编辑层版本已过期，请刷新页面")
         path = asset_organizer_layer(image_id, {
             "crop_x": crop_x,
             "crop_y": crop_y,

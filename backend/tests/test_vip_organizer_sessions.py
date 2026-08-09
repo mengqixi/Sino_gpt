@@ -109,6 +109,65 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
             ids = {row["id"] for row in conn.execute("SELECT id FROM vip_organizer_sessions")}
         self.assertEqual(ids, {session_b_next})
 
+    def test_resume_session_restores_assets_without_replacing_session(self):
+        session_id = service.start_session()["session_id"]
+        product_path = self._add_asset(session_id, "product.jpg")
+        model_path = self._add_asset(session_id, "model.jpg")
+        tag_path = self._add_asset(session_id, "tag.jpg")
+        with database.db_session() as conn:
+            rows = conn.execute(
+                "SELECT id, file_path FROM vip_organizer_assets ORDER BY id"
+            ).fetchall()
+            asset_types = {
+                str(product_path): "product",
+                str(model_path): "model",
+                str(tag_path): "tag",
+            }
+            for row in rows:
+                conn.execute(
+                    "UPDATE vip_organizer_assets SET asset_type = ? WHERE id = ?",
+                    (asset_types[row["file_path"]], row["id"]),
+                )
+
+        resumed = service.resume_session(session_id)
+
+        self.assertEqual(resumed["session_id"], session_id)
+        self.assertEqual(
+            {name: [item["file_name"] for item in items] for name, items in resumed["assets"].items()},
+            {
+                "product": ["product.jpg"],
+                "model": ["model.jpg"],
+                "tag": ["tag.jpg"],
+            },
+        )
+        for items in resumed["assets"].values():
+            for item in items:
+                self.assertEqual(
+                    set(item),
+                    {"image_id", "file_name", "preview_url", "original_url", "width", "height"},
+                )
+        with database.db_session() as conn:
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT id FROM vip_organizer_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            )
+
+    def test_resume_session_rejects_expired_session(self):
+        session_id = service.start_session()["session_id"]
+        with database.db_session() as conn:
+            conn.execute(
+                "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00", session_id),
+            )
+
+        service._cleanup_expired_sessions()
+
+        with self.assertRaises(ValueError):
+            service.resume_session(session_id)
+        self.assertTrue(service._session_tombstone_path(session_id).is_file())
+
     def test_delete_asset_only_deletes_asset_owned_by_session(self):
         session_a = service.start_session()["session_id"]
         asset_a = self._add_asset(session_a, "a.jpg")
@@ -212,6 +271,243 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
         self.assertTrue(preview_path.is_file())
         with Image.open(preview_path) as preview:
             self.assertEqual(preview.size, (800, 800))
+
+    def test_organizer_layer_algorithm_version_changes_disk_url_and_lru_key(self):
+        session_id = service.start_session()["session_id"]
+        image_id, source_path = self._add_image_asset(session_id)
+        modified_ns = source_path.stat().st_mtime_ns
+        crop_key = service._crop_cache_key(None)
+        service._cached_product_cutout.cache_clear()
+
+        with (
+            patch.object(service, "ORGANIZER_LAYER_RENDER_VERSION", 101),
+            patch.object(
+                service,
+                "_product_cutout",
+                return_value=Image.new("RGBA", (20, 20), "red"),
+            ) as renderer,
+        ):
+            first = service._cached_product_cutout(image_id, modified_ns, crop_key)
+            first_path = service._organizer_layer_cache_path(image_id, modified_ns, crop_key)
+            first_info = service.asset_organizer_layer_info(image_id)
+        renderer.assert_called_once()
+
+        with (
+            patch.object(service, "ORGANIZER_LAYER_RENDER_VERSION", 102),
+            patch.object(
+                service,
+                "_product_cutout",
+                return_value=Image.new("RGBA", (20, 20), "blue"),
+            ) as renderer,
+        ):
+            second = service._cached_product_cutout(image_id, modified_ns, crop_key)
+            second_path = service._organizer_layer_cache_path(image_id, modified_ns, crop_key)
+            second_info = service.asset_organizer_layer_info(image_id)
+        renderer.assert_called_once()
+
+        self.assertNotEqual(first_path, second_path)
+        self.assertIn("organizer-layer-v101-", first_path.name)
+        self.assertIn("organizer-layer-v102-", second_path.name)
+        self.assertIn("&v=101", first_info["url"])
+        self.assertIn("&v=102", second_info["url"])
+        self.assertEqual(first.getpixel((0, 0)), (255, 0, 0, 255))
+        self.assertEqual(second.getpixel((0, 0)), (0, 0, 255, 255))
+        service._cached_product_cutout.cache_clear()
+
+    def test_jd5_fast_preview_reuses_disk_layer_without_decoding_or_cutting_source(self):
+        session_id = service.start_session()["session_id"]
+        image_id, source_path = self._add_image_asset(session_id)
+        adjustment = service._normalize_adjustment(None)
+        with patch.object(
+            service,
+            "_product_cutout",
+            return_value=Image.new("RGBA", (120, 150), (40, 60, 80, 255)),
+        ):
+            service._cached_product_cutout(
+                image_id,
+                source_path.stat().st_mtime_ns,
+                service._crop_cache_key(adjustment),
+            )
+        service._cached_product_cutout.cache_clear()
+        slots = [{
+            "file_name": "5.jpg",
+            "image_ids": [image_id],
+            "adjustments": [adjustment],
+            "logo_color": "black",
+        }]
+
+        with (
+            patch.object(service, "_product_cutout", side_effect=AssertionError("cutout recomputed")),
+            patch.object(service, "_load_image", side_effect=AssertionError("source decoded")),
+            patch.object(service, "run_heavy_task") as worker,
+        ):
+            result = service.render_slot_preview(
+                session_id,
+                slots,
+                {"product_length": "180", "product_height": "105"},
+                "5.jpg",
+                "jd",
+                "800",
+            )
+
+        worker.assert_not_called()
+        self.assertEqual(result["file_name"], "5.jpg")
+        preview_parts = result["preview_url"].removeprefix(
+            "/api/vip-organizer/previews/"
+        ).split("/")
+        self.assertTrue(
+            service.preview_file(
+                preview_parts[0], preview_parts[1], preview_parts[2]
+            ).is_file()
+        )
+
+    def test_deleted_session_cannot_be_recreated_by_finishing_preview(self):
+        session_id = service.start_session()["session_id"]
+        slot = {
+            "image_ids": [1],
+            "adjustments": [],
+            "logo_color": "black",
+        }
+
+        def delete_during_render(*_args, **_kwargs):
+            service.delete_session(session_id)
+            return Image.new("RGB", (16, 16), "red")
+
+        with patch.object(service, "_render_slot_image", side_effect=delete_during_render):
+            with self.assertRaises(ValueError):
+                service._render_cached_slot_preview(
+                    session_id,
+                    "2.jpg",
+                    slot,
+                    {},
+                    "vip",
+                )
+
+        self.assertFalse(service._session_upload_dir(session_id).exists())
+        self.assertFalse(service._session_result_dir(session_id).exists())
+        self.assertTrue(service._session_tombstone_path(session_id).is_file())
+
+    def test_orphan_session_directories_are_swept_safely(self):
+        orphan_id = "f" * 32
+        upload = service._session_upload_dir(orphan_id)
+        result = service._session_result_dir(orphan_id)
+        upload.mkdir(parents=True)
+        result.mkdir(parents=True)
+        (result / "stale.jpg").write_bytes(b"stale")
+
+        service._cleanup_orphan_session_directories()
+
+        self.assertFalse(upload.exists())
+        self.assertFalse(result.exists())
+
+    def test_orphan_sweep_rechecks_session_created_after_database_snapshot(self):
+        session_id = "e" * 32
+        upload = service._session_upload_dir(session_id)
+        result = service._session_result_dir(session_id)
+        upload.mkdir(parents=True)
+        result.mkdir(parents=True)
+        original_is_active = service._session_is_active
+        activated = False
+
+        def activate_before_delete(candidate: str) -> bool:
+            nonlocal activated
+            if candidate == session_id and not activated:
+                activated = True
+                timestamp = database.now_iso()
+                with database.db_session() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO vip_organizer_sessions
+                            (id, created_at, updated_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (session_id, timestamp, timestamp),
+                    )
+            return original_is_active(candidate)
+
+        with patch.object(
+            service,
+            "_session_is_active",
+            side_effect=activate_before_delete,
+        ):
+            service._cleanup_orphan_session_directories()
+
+        self.assertTrue(activated)
+        self.assertTrue(upload.is_dir())
+        self.assertTrue(result.is_dir())
+
+    def test_preview_cache_version_change_forces_a_fresh_render(self):
+        session_id = service.start_session()["session_id"]
+        slot = {
+            "image_ids": [1],
+            "adjustments": [],
+            "logo_color": "black",
+        }
+
+        with patch.object(
+            service,
+            "_render_slot_image",
+            return_value=Image.new("RGB", (16, 16), "black"),
+        ) as renderer:
+            first_url = service._render_cached_slot_preview(
+                session_id,
+                "2.jpg",
+                slot,
+                {},
+                "vip",
+            )
+            cached_url = service._render_cached_slot_preview(
+                session_id,
+                "2.jpg",
+                slot,
+                {},
+                "vip",
+            )
+
+        self.assertEqual(first_url, cached_url)
+        self.assertEqual(renderer.call_count, 1)
+
+        with (
+            patch.object(service, "PREVIEW_RENDER_VERSION", service.PREVIEW_RENDER_VERSION + 1),
+            patch.object(
+                service,
+                "_render_slot_image",
+                return_value=Image.new("RGB", (16, 16), "red"),
+            ) as renderer,
+        ):
+            refreshed_url = service._render_cached_slot_preview(
+                session_id,
+                "2.jpg",
+                slot,
+                {},
+                "vip",
+            )
+
+        self.assertNotEqual(first_url, refreshed_url)
+        renderer.assert_called_once()
+
+        with (
+            patch.object(
+                service,
+                "ORGANIZER_LAYER_RENDER_VERSION",
+                service.ORGANIZER_LAYER_RENDER_VERSION + 1,
+            ),
+            patch.object(
+                service,
+                "_render_slot_image",
+                return_value=Image.new("RGB", (16, 16), "blue"),
+            ) as renderer,
+        ):
+            refreshed_layer_url = service._render_cached_slot_preview(
+                session_id,
+                "2.jpg",
+                slot,
+                {},
+                "vip",
+            )
+
+        self.assertNotEqual(first_url, refreshed_layer_url)
+        renderer.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Lock
 from unittest.mock import patch
 
@@ -46,6 +48,25 @@ class HeavyTaskServiceTests(unittest.TestCase):
 
     def test_prewarm_waits_three_minutes_before_idle_exit(self):
         self.assertEqual(prewarm_worker.PREWARM_IDLE_SECONDS, 180)
+
+    def test_worker_input_is_published_only_after_complete_json_is_written(self):
+        with TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.json"
+            real_replace = service.os.replace
+            observed_payloads = []
+
+            def inspect_then_replace(source, destination):
+                self.assertFalse(input_path.exists())
+                observed_payloads.append(service.json.loads(Path(source).read_text(encoding="utf-8")))
+                real_replace(source, destination)
+
+            payload = {"text": "中文" * 1000, "values": list(range(200))}
+            with patch.object(service.os, "replace", side_effect=inspect_then_replace):
+                service._write_json_atomically(input_path, payload)
+
+            self.assertEqual(observed_payloads, [payload])
+            self.assertEqual(service.json.loads(input_path.read_text(encoding="utf-8")), payload)
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

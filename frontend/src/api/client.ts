@@ -97,8 +97,8 @@ export const api = {
     request<{ feature: string; status: string }>(`/api/heavy-tasks/prewarm/${feature}`, { method: "POST" }),
   deleteProductSources: (taskId: string) =>
     request<any>(`/api/product-images/tasks/${taskId}/sources/cleanup`, { method: "POST" }),
-  analyzeVipOrganizer: (payload: any) => request<any>("/api/vip-organizer/analyze", { method: "POST", body: JSON.stringify(payload) }),
-  analyzeVipOrganizerWithApi: (payload: any) => request<any>("/api/vip-organizer/analyze-with-api", { method: "POST", body: JSON.stringify(payload) }),
+  analyzeVipOrganizer: (payload: any, signal?: AbortSignal) => request<any>("/api/vip-organizer/analyze", { method: "POST", body: JSON.stringify(payload), signal }),
+  analyzeVipOrganizerWithApi: (payload: any, signal?: AbortSignal) => request<any>("/api/vip-organizer/analyze-with-api", { method: "POST", body: JSON.stringify(payload), signal }),
   getVipAnalysisConfig: () => request<any>("/api/vip-organizer/analysis-config"),
   previewVipOrganizer: (payload: any, signal?: AbortSignal) => request<any>("/api/vip-organizer/preview", {
     method: "POST",
@@ -120,6 +120,10 @@ export const api = {
   startVipOrganizerSession: (previousSessionId?: string) => request<{ session_id: string }>("/api/vip-organizer/session", {
     method: "POST",
     body: JSON.stringify({ previous_session_id: previousSessionId || null })
+  }),
+  resumeVipOrganizerSession: (sessionId: string) => request<{ session_id: string; assets: Record<string, any[]> }>("/api/vip-organizer/session/resume", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId })
   }),
   cleanupVipOrganizerSession: (sessionId: string) =>
     request<{ deleted: boolean }>("/api/vip-organizer/session/cleanup", {

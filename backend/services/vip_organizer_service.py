@@ -16,6 +16,7 @@ import textwrap
 import uuid
 import zipfile
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -39,6 +40,7 @@ ORGANIZER_UPLOAD_DIR = ORGANIZER_DATA_DIR / "uploads"
 ORGANIZER_RESULT_DIR = ORGANIZER_DATA_DIR / "results"
 UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
 ORGANIZER_SESSION_TTL_HOURS = 24
+ORGANIZER_SESSION_TOMBSTONE_TTL_HOURS = 48
 BUNDLED_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "NotoSansSC-VF-GB2312.ttf"
 JD_LOGO_FONT_PATH = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "LibreBodoni-VariableFont_wght.ttf"
 JD_PHONE_REFERENCE_PATH = Path(__file__).resolve().parents[1] / "assets" / "iphone_reference.png"
@@ -49,7 +51,8 @@ CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 _FAST_SLOT_PREVIEW_LOCK = Lock()
-PREVIEW_RENDER_VERSION = 31
+PREVIEW_RENDER_VERSION = 33
+ORGANIZER_LAYER_RENDER_VERSION = 1
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
@@ -972,10 +975,101 @@ def _session_result_dir(session_id: str) -> Path:
     return ORGANIZER_RESULT_DIR / session_id
 
 
+def _session_tombstone_path(session_id: str) -> Path:
+    if not _valid_session_id(session_id):
+        raise ValueError("Invalid organizer session")
+    return ORGANIZER_DATA_DIR / ".session-tombstones" / session_id
+
+
+def _session_is_active(session_id: str) -> bool:
+    """Check both durable deletion intent and the database session record.
+
+    Organizer rendering happens in disposable worker processes.  A tombstone
+    closes the race where a worker saw the database row immediately before the
+    API process deleted it and would otherwise recreate a result directory.
+    """
+    if not _valid_session_id(session_id):
+        return False
+    tombstone = _session_tombstone_path(session_id)
+    if tombstone.is_file():
+        return False
+    with db_session() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM vip_organizer_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return bool(exists) and not tombstone.is_file()
+
+
+def _assert_session_active(session_id: str) -> None:
+    if not _session_is_active(session_id):
+        raise ValueError("整理会话已失效，请重新开始")
+
+
+def _remove_session_artifacts_if_inactive(session_id: str) -> None:
+    """Best-effort cleanup for a worker which lost a deletion race."""
+    if _session_is_active(session_id):
+        return
+    shutil.rmtree(_session_upload_dir(session_id), ignore_errors=True)
+    shutil.rmtree(_session_result_dir(session_id), ignore_errors=True)
+
+
+def _session_write_checkpoint(session_id: str) -> None:
+    """Reject a deleted session and remove anything a racing worker rebuilt."""
+    try:
+        _assert_session_active(session_id)
+    except ValueError:
+        _remove_session_artifacts_if_inactive(session_id)
+        raise
+
+
+def _cleanup_orphan_session_directories() -> None:
+    """Remove old upload/result roots which no longer have a live session."""
+    with db_session() as conn:
+        active_ids = {
+            str(row["id"])
+            for row in conn.execute("SELECT id FROM vip_organizer_sessions")
+        }
+    for root in (ORGANIZER_UPLOAD_DIR, ORGANIZER_RESULT_DIR):
+        if not root.is_dir():
+            continue
+        for path in root.iterdir():
+            if not path.is_dir() or not _valid_session_id(path.name):
+                continue
+            deletion_candidate = (
+                path.name not in active_ids
+                or _session_tombstone_path(path.name).is_file()
+            )
+            # The active-id query is only a snapshot. A concurrent
+            # start_session may insert its row and create this directory after
+            # that snapshot, so re-check immediately before destructive work.
+            if deletion_candidate and not _session_is_active(path.name):
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def _cleanup_stale_session_tombstones() -> None:
+    root = ORGANIZER_DATA_DIR / ".session-tombstones"
+    if not root.is_dir():
+        return
+    cutoff = (
+        datetime.now()
+        - timedelta(hours=ORGANIZER_SESSION_TOMBSTONE_TTL_HOURS)
+    ).timestamp()
+    for path in root.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def delete_session(session_id: str) -> None:
     """Delete one organizer session without touching other users."""
     if not _valid_session_id(session_id):
         return
+    tombstone = _session_tombstone_path(session_id)
+    tombstone.parent.mkdir(parents=True, exist_ok=True)
+    tombstone.touch(exist_ok=True)
     with db_session() as conn:
         rows = conn.execute(
             "SELECT id, file_path FROM vip_organizer_assets WHERE session_id = ?",
@@ -1014,6 +1108,8 @@ def start_session(previous_session_id: str | None = None) -> dict[str, str]:
     ORGANIZER_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ORGANIZER_RESULT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_expired_sessions()
+    _cleanup_orphan_session_directories()
+    _cleanup_stale_session_tombstones()
     if _valid_session_id(previous_session_id):
         delete_session(previous_session_id)
 
@@ -1027,6 +1123,48 @@ def start_session(previous_session_id: str | None = None) -> dict[str, str]:
     _session_upload_dir(session_id).mkdir(parents=True, exist_ok=True)
     _session_result_dir(session_id).mkdir(parents=True, exist_ok=True)
     return {"session_id": session_id}
+
+
+def _session_asset_payload(row: Any) -> dict[str, Any]:
+    image_id = int(row["id"])
+    return {
+        "image_id": image_id,
+        "file_name": str(row["file_name"] or "image.png"),
+        "preview_url": f"/api/vip-organizer/assets/{image_id}/thumbnail",
+        "original_url": f"/api/vip-organizer/assets/{image_id}/original",
+        "width": int(row["width"] or 0),
+        "height": int(row["height"] or 0),
+    }
+
+
+def resume_session(session_id: str) -> dict[str, Any]:
+    """Resume an existing browser session without replacing or deleting it."""
+    _assert_session_active(session_id)
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, asset_type, file_name, file_path, width, height
+            FROM vip_organizer_assets
+            WHERE session_id = ?
+            ORDER BY id
+            """,
+            (session_id,),
+        ).fetchall()
+        conn.execute(
+            "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
+            (now_iso(), session_id),
+        )
+    _assert_session_active(session_id)
+    assets: dict[str, list[dict[str, Any]]] = {
+        "product": [],
+        "model": [],
+        "tag": [],
+    }
+    for row in rows:
+        asset_type = str(row["asset_type"])
+        if asset_type in assets and Path(row["file_path"]).is_file():
+            assets[asset_type].append(_session_asset_payload(row))
+    return {"session_id": session_id, "assets": assets}
 
 
 def delete_asset(session_id: str, image_id: int) -> None:
@@ -1068,12 +1206,10 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
         raise ValueError("素材类型不正确")
     if not files:
         raise ValueError("请选择要上传的图片")
-    with db_session() as conn:
-        exists = conn.execute("SELECT id FROM vip_organizer_sessions WHERE id = ?", (session_id,)).fetchone()
-    if not exists:
-        raise ValueError("整理会话已失效，请重新开始")
+    _assert_session_active(session_id)
     session_upload_dir = _session_upload_dir(session_id)
     session_upload_dir.mkdir(parents=True, exist_ok=True)
+    _session_write_checkpoint(session_id)
     prepared: list[dict[str, Any]] = []
     for file in files:
         original_name = file.filename or "image.png"
@@ -1087,6 +1223,7 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
             with Image.open(path) as image:
                 width, height = image.size
                 image.verify()
+            _session_write_checkpoint(session_id)
             prepared.append({
                 "file_name": original_name,
                 "path": path,
@@ -1101,7 +1238,7 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
     try:
         with db_session() as conn:
             still_exists = conn.execute("SELECT id FROM vip_organizer_sessions WHERE id = ?", (session_id,)).fetchone()
-            if not still_exists:
+            if not still_exists or _session_tombstone_path(session_id).is_file():
                 raise ValueError("整理会话已失效，请重新开始")
             for item in prepared:
                 cursor = conn.execute(
@@ -1134,6 +1271,7 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
                 "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
                 (now_iso(), session_id),
             )
+        _session_write_checkpoint(session_id)
     except Exception:
         for item in prepared:
             item["path"].unlink(missing_ok=True)
@@ -1143,10 +1281,7 @@ def save_assets(session_id: str, asset_type: str, files: list[UploadFile]) -> li
 
 def prepare_product_cutout(session_id: str, file: UploadFile) -> dict[str, str]:
     """Create an optional transparent product image without adding it to the organizer inputs."""
-    with db_session() as conn:
-        exists = conn.execute("SELECT id FROM vip_organizer_sessions WHERE id = ?", (session_id,)).fetchone()
-    if not exists:
-        raise ValueError("整理会话已失效，请重新开始")
+    _assert_session_active(session_id)
     original_name = file.filename or "front.jpg"
     suffix = Path(original_name).suffix.lower()
     if suffix not in ALLOWED_IMAGE_EXTENSIONS:
@@ -1155,6 +1290,7 @@ def prepare_product_cutout(session_id: str, file: UploadFile) -> dict[str, str]:
     prepared_id = uuid.uuid4().hex
     prepared_dir = _session_result_dir(session_id) / "prepared" / prepared_id
     prepared_dir.mkdir(parents=True, exist_ok=True)
+    _session_write_checkpoint(session_id)
     source_path = prepared_dir / f"source{suffix}"
     transparent_path = prepared_dir / "transparent.png"
     gray_path = prepared_dir / "gray-preview.png"
@@ -1174,12 +1310,14 @@ def prepare_product_cutout(session_id: str, file: UploadFile) -> dict[str, str]:
         )
         if not transparent_path.is_file() or not gray_path.is_file():
             raise ValueError("抠图结果生成失败")
+        _session_write_checkpoint(session_id)
         source_path.unlink(missing_ok=True)
         with db_session() as conn:
             conn.execute(
                 "UPDATE vip_organizer_sessions SET updated_at = ? WHERE id = ?",
                 (now_iso(), session_id),
             )
+        _session_write_checkpoint(session_id)
     except Exception:
         shutil.rmtree(prepared_dir, ignore_errors=True)
         raise
@@ -1287,6 +1425,7 @@ def asset_organizer_layer_info(
             f"&crop_y={normalized['crop_y']:.6f}"
             f"&crop_width={normalized['crop_width']:.6f}"
             f"&crop_height={normalized['crop_height']:.6f}"
+            f"&v={ORGANIZER_LAYER_RENDER_VERSION}"
         ),
         "width": layer.width,
         "height": layer.height,
@@ -2549,7 +2688,10 @@ def _prepared_product_cutout(
     pale_product = False
     elle_hardware_protection = np.zeros((height, width), dtype=bool)
     silver_hardware_protection = np.zeros((height, width), dtype=bool)
+    strict_gold_hardware = np.zeros((height, width), dtype=bool)
     strict_silver_hardware = np.zeros((height, width), dtype=bool)
+    source_verified_upper_gold = np.zeros((height, width), dtype=bool)
+    verified_hardware_surface = np.zeros((height, width), dtype=bool)
     restore_source_silver = False
     strict_hardware_protection = np.zeros((height, width), dtype=bool)
     hardware_protection = np.zeros((height, width), dtype=bool)
@@ -2800,6 +2942,15 @@ def _prepared_product_cutout(
                     & (gradient >= 10)
                 )
             )
+            # The segmentation matte is weakest on the almost-white face of a
+            # small champagne-gold clasp.  The source image already gives us a
+            # safer signal here: this is a gold-coloured connected component
+            # which contains a saturated gold seed.  Keep that complete source
+            # component in the upper product area.  Unlike a convex hull or a
+            # broad dilation this does not fill the holes inside links/clasps.
+            source_verified_upper_gold = (
+                strict_gold_hardware | upper_hardware_region
+            )
 
         # White-background ELLE photos also use silver chains and fittings.
         # Protect only high-contrast neutral metal immediately beside the
@@ -2913,7 +3064,55 @@ def _prepared_product_cutout(
         strict_hardware_protection = (
             strict_gold_hardware | strict_silver_hardware
         )
-        strict_hardware_protection &= ~locked_white_background
+        verified_hardware_surface = strict_hardware_protection.copy()
+        # Grow a verified metal core only across nearby source pixels which
+        # the segmentation model also considers foreground.  Champagne-gold
+        # clips often contain an almost-white specular face; protecting only
+        # the saturated seed cuts that face in half.  Exact studio white and
+        # the holes inside links fail the source-evidence gate and stay open.
+        if model_matte is not None and np.any(strict_hardware_protection):
+            hardware_surface_candidate = (
+                (model_matte >= 0.52)
+                & (value <= 252)
+                & (lab_distance >= 2)
+                & (
+                    (gradient >= 7)
+                    | (saturation >= 12)
+                )
+            )
+            hardware_growth_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (5, 5),
+            )
+            for _ in range(2):
+                verified_hardware_surface |= (
+                    cv2.dilate(
+                        verified_hardware_surface.astype(np.uint8),
+                        hardware_growth_kernel,
+                        iterations=1,
+                    ).astype(bool)
+                    & hardware_surface_candidate
+                    & (
+                        elle_hardware_protection
+                        | silver_hardware_protection
+                        | cv2.dilate(
+                            strict_hardware_protection.astype(np.uint8),
+                            cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE,
+                                (9, 9),
+                            ),
+                            iterations=1,
+                        ).astype(bool)
+                    )
+                )
+        strict_hardware_protection = verified_hardware_surface
+        # A connected-white flood is allowed to open the holes inside metal,
+        # but it must not override a source-verified metal core.  The old
+        # ordering intersected the core with the white mask and permanently
+        # lost champagne-gold clips at pale, strongly lit edges.
+        locked_white_background &= ~(
+            strict_hardware_protection | source_verified_upper_gold
+        )
 
         hardware_protection = (
             elle_hardware_protection | silver_hardware_protection
@@ -3382,6 +3581,18 @@ def _prepared_product_cutout(
     ).astype(bool)
     cropped_elle_hardware = elle_hardware_protection[top:bottom, left:right]
     cropped_silver_hardware = silver_hardware_protection[top:bottom, left:right]
+    cropped_strict_gold_hardware = strict_gold_hardware[
+        top:bottom,
+        left:right,
+    ]
+    cropped_source_verified_upper_gold = source_verified_upper_gold[
+        top:bottom,
+        left:right,
+    ]
+    cropped_verified_hardware_surface = verified_hardware_surface[
+        top:bottom,
+        left:right,
+    ]
     cropped_strict_silver_hardware = strict_silver_hardware[
         top:bottom,
         left:right,
@@ -3439,6 +3650,9 @@ def _prepared_product_cutout(
             & (cropped_model_matte >= 0.72)
             & (cropped_lab_distance >= 8)
         )
+        # Do not let the model-strict rebuild above discard a source-verified
+        # champagne-gold component accepted before the white-background flood.
+        cropped_tight_hardware |= cropped_verified_hardware_surface
         cropped_colored_material = (
             (cropped_saturation >= 28)
             & (cropped_lab_distance >= 14)
@@ -3502,6 +3716,7 @@ def _prepared_product_cutout(
             & (source_spread <= 20)
             & ~cropped_pale_body_protection
             & ~cropped_tight_hardware
+            & ~cropped_source_verified_upper_gold
         )
         alpha[white_background] = 0
 
@@ -3588,6 +3803,7 @@ def _prepared_product_cutout(
                 regional_cleanup_zone
                 & regional_white
                 & ~cropped_tight_hardware
+                & ~cropped_source_verified_upper_gold
             ] = 0
 
         # Remove only the floor residue below the model's last broad,
@@ -4209,6 +4425,51 @@ def _prepared_product_cutout(
                     gradient=cropped_gradient,
                     strict_seed=cropped_strict_silver_hardware,
                 )
+
+        # Restore the seed-connected champagne-gold source surface, not merely
+        # its saturated seed.  This recovers the pale face of ELLE clasps which
+        # has a weak model matte, while retaining link/clasp holes because the
+        # verified source component never included those white pixels.
+        if np.any(cropped_strict_gold_hardware):
+            source_gold_alpha = np.round(
+                np.clip(
+                    0.60
+                    + (cropped_lab_distance.astype(np.float32) - 7.0) / 30.0,
+                    0.60,
+                    1.0,
+                )
+                * 255.0
+            ).astype(np.uint8)
+            alpha[cropped_strict_gold_hardware] = np.maximum(
+                alpha[cropped_strict_gold_hardware],
+                source_gold_alpha[cropped_strict_gold_hardware],
+            )
+
+        # The complete upper gold component is a deletion guard, not an opaque
+        # stamp.  Restore only the evidence already present in the model/source
+        # and keep the fringe solver's antialiased result.  This avoids the
+        # white halo produced by forcing every pale highlight to >= 60% alpha.
+        if (
+            model_matte is not None
+            and np.any(cropped_source_verified_upper_gold)
+        ):
+            model_gold_alpha = np.clip(
+                model_matte[top:bottom, left:right],
+                0.0,
+                1.0,
+            )
+            contrast_gold_alpha = np.clip(
+                (cropped_lab_distance.astype(np.float32) - 2.0) / 30.0,
+                0.10,
+                0.72,
+            )
+            verified_gold_alpha = np.round(
+                np.maximum(model_gold_alpha, contrast_gold_alpha) * 255.0
+            ).astype(np.uint8)
+            alpha[cropped_source_verified_upper_gold] = np.maximum(
+                alpha[cropped_source_verified_upper_gold],
+                verified_gold_alpha[cropped_source_verified_upper_gold],
+            )
 
         if model_matte is not None and pale_product and restore_source_silver:
             alpha = _model_dominant_pale_silver_alpha(
@@ -5831,6 +6092,222 @@ def _remove_detached_floor_fragments(image: Image.Image) -> Image.Image:
     if _repair_continuous_woven_bottom_edge(rgba, original_alpha, alpha):
         changed = True
 
+    # A resized studio-floor shadow can finish as either one shallow detached
+    # strip or several tiny opaque crumbs on the same terminal row.  Colour is
+    # not a safe discriminator here: a warm floor reflection can look gold and
+    # a grey one can look silver.  Remove only geometry which is already
+    # disconnected from the product, lies under the central body, and is at
+    # the very end of the silhouette.  Side chains and pendants are outside
+    # this central gate; a real central fitting is also too large/tall to match
+    # the crumb rule.  This is deliberately a final pass so an over-cut repair
+    # cannot add the verified floor residue back afterwards.
+    residue_count, residue_labels, residue_stats, _ = (
+        cv2.connectedComponentsWithStats(
+            (alpha > 8).astype(np.uint8),
+            8,
+        )
+    )
+    if residue_count > 1:
+        residue_main = 1 + int(np.argmax(
+            residue_stats[1:, cv2.CC_STAT_AREA]
+        ))
+        residue_left = int(
+            residue_stats[residue_main, cv2.CC_STAT_LEFT]
+        )
+        residue_top = int(
+            residue_stats[residue_main, cv2.CC_STAT_TOP]
+        )
+        residue_width = int(
+            residue_stats[residue_main, cv2.CC_STAT_WIDTH]
+        )
+        residue_height = int(
+            residue_stats[residue_main, cv2.CC_STAT_HEIGHT]
+        )
+        residue_area = int(
+            residue_stats[residue_main, cv2.CC_STAT_AREA]
+        )
+        residue_central_left = residue_left + round(residue_width * 0.12)
+        residue_central_right = (
+            residue_left + residue_width - round(residue_width * 0.12)
+        )
+        residue_lower_start = residue_top + round(residue_height * 0.94)
+        residue_crumb_start = residue_top + round(residue_height * 0.965)
+        residue_maximum_height = max(6, round(residue_height * 0.015))
+        residue_maximum_area = max(220, round(residue_area * 0.0012))
+        wide_residue_components: list[int] = []
+        tiny_residue_components: list[
+            tuple[int, int, int, int, int]
+        ] = []
+
+        for component in range(1, residue_count):
+            if component == residue_main:
+                continue
+            component_left = int(
+                residue_stats[component, cv2.CC_STAT_LEFT]
+            )
+            component_top = int(
+                residue_stats[component, cv2.CC_STAT_TOP]
+            )
+            component_width = int(
+                residue_stats[component, cv2.CC_STAT_WIDTH]
+            )
+            component_height = int(
+                residue_stats[component, cv2.CC_STAT_HEIGHT]
+            )
+            component_area = int(
+                residue_stats[component, cv2.CC_STAT_AREA]
+            )
+            component_center_x = component_left + component_width / 2
+            component_pixels = residue_labels == component
+            component_mean_alpha = float(np.mean(alpha[component_pixels]))
+            in_central_terminal = (
+                residue_central_left
+                <= component_center_x
+                <= residue_central_right
+                and component_top >= residue_lower_start
+                and component_height <= residue_maximum_height
+                and component_area <= residue_maximum_area
+            )
+            if not in_central_terminal:
+                continue
+
+            # A long, translucent shelf is detached floor residue.  Requiring
+            # both a flat aspect ratio and sub-opaque mean alpha keeps compact
+            # locks, feet and ELLE plaques even when they sit at the bottom.
+            if (
+                component_width >= max(12, component_height * 5)
+                and component_mean_alpha < 190
+            ):
+                wide_residue_components.append(component)
+                continue
+
+            # High-alpha residue may break into several 1--3 px islands after
+            # Lanczos resizing.  Defer them and remove only a tight same-row
+            # cluster; a single small hardware highlight is never deleted.
+            if (
+                component_top >= residue_crumb_start
+                and component_height <= 4
+                and component_area <= 12
+            ):
+                tiny_residue_components.append((
+                    component,
+                    component_left,
+                    component_top,
+                    component_left + component_width,
+                    component_top + component_height,
+                ))
+
+        for component in wide_residue_components:
+            alpha[residue_labels == component] = 0
+            changed = True
+
+        if len(tiny_residue_components) >= 3:
+            crumb_left = min(item[1] for item in tiny_residue_components)
+            crumb_top = min(item[2] for item in tiny_residue_components)
+            crumb_right = max(item[3] for item in tiny_residue_components)
+            crumb_bottom = max(item[4] for item in tiny_residue_components)
+            crumb_span_limit = max(56, round(residue_width * 0.13))
+            crumb_row_limit = max(5, round(residue_height * 0.012))
+            crumb_area = sum(
+                int(residue_stats[item[0], cv2.CC_STAT_AREA])
+                for item in tiny_residue_components
+            )
+            if (
+                crumb_right - crumb_left <= crumb_span_limit
+                and crumb_bottom - crumb_top <= crumb_row_limit
+                and crumb_area >= 8
+            ):
+                for component, *_ in tiny_residue_components:
+                    alpha[residue_labels == component] = 0
+                changed = True
+
+        # A dark bag can retain a two-row neutral studio fringe which is still
+        # connected to the real piping.  It is not a detachable component, so
+        # handle it only after proving the preceding row is a broad, opaque
+        # product base and the remaining terminal tail is both extremely
+        # shallow and spread across a large part of the body.  A clasp, foot or
+        # chain is compact/taller (and gold is chromatic), so it cannot satisfy
+        # this combined geometry gate.
+        residue_yy, residue_xx = np.indices(alpha.shape)
+        residue_main_pixels = residue_labels == residue_main
+        dark_material_sample = (
+            residue_main_pixels
+            & (residue_yy >= residue_top + round(residue_height * 0.30))
+            & (residue_yy <= residue_top + round(residue_height * 0.72))
+            & (residue_xx >= residue_central_left)
+            & (residue_xx < residue_central_right)
+            & (alpha >= 230)
+        )
+        dark_material_value = (
+            float(np.median(hsv[:, :, 2][dark_material_sample]))
+            if np.any(dark_material_sample)
+            else 255.0
+        )
+        if dark_material_value <= 105:
+            dark_scan_start = residue_top + round(residue_height * 0.86)
+            dark_opaque_widths = np.count_nonzero(
+                (alpha[:, residue_central_left:residue_central_right] >= 230)
+                & residue_main_pixels[
+                    :,
+                    residue_central_left:residue_central_right,
+                ],
+                axis=1,
+            )
+            dark_scan_widths = dark_opaque_widths[
+                dark_scan_start:residue_top + residue_height
+            ]
+            dark_broad_width = (
+                int(np.max(dark_scan_widths))
+                if dark_scan_widths.size
+                else 0
+            )
+            dark_broad_threshold = max(18, round(dark_broad_width * 0.42))
+            dark_broad_rows = np.flatnonzero(
+                dark_opaque_widths >= dark_broad_threshold
+            )
+            if dark_broad_rows.size:
+                dark_last_broad_row = int(dark_broad_rows.max())
+                dark_terminal_bottom = residue_top + residue_height - 1
+                dark_terminal_depth = (
+                    dark_terminal_bottom - dark_last_broad_row
+                )
+                dark_terminal_tail = (
+                    (residue_yy > dark_last_broad_row)
+                    & (residue_yy <= dark_terminal_bottom)
+                    & (residue_xx >= residue_central_left)
+                    & (residue_xx < residue_central_right)
+                    & (alpha > 8)
+                    & (alpha < 230)
+                    & (hsv[:, :, 1] <= 50)
+                    & (
+                        hsv[:, :, 2]
+                        >= max(45.0, dark_material_value * 1.20)
+                    )
+                )
+                dark_tail_columns = np.flatnonzero(np.any(
+                    dark_terminal_tail,
+                    axis=0,
+                ))
+                dark_tail_count = int(np.count_nonzero(
+                    dark_terminal_tail
+                ))
+                dark_tail_span = (
+                    int(dark_tail_columns[-1] - dark_tail_columns[0] + 1)
+                    if dark_tail_columns.size
+                    else 0
+                )
+                if (
+                    1 <= dark_terminal_depth
+                    <= max(3, round(residue_height * 0.006))
+                    and dark_tail_count >= max(
+                        12,
+                        round(residue_width * 0.025),
+                    )
+                    and dark_tail_span >= round(residue_width * 0.25)
+                ):
+                    alpha[dark_terminal_tail] = 0
+                    changed = True
+
     # Lanczos resizing and alpha feathering can leave sub-visible (1..8)
     # colour specks after an attached shadow has been removed. They become a
     # dirty dotted line on a grey marketplace preview even though they carry
@@ -5883,9 +6360,13 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "phone_scale": number("phone_scale", 1.0, 0.5, 4.0),
         "phone_offset_x": number("phone_offset_x", 0.0, -1.5, 1.5),
         "phone_offset_y": number("phone_offset_y", 0.0, -1.5, 1.5),
-        "phone_label_scale": number("phone_label_scale", 1.0, 0.5, 2.0),
-        "phone_label_offset_x": number("phone_label_offset_x", 0.0, -1.5, 1.5),
-        "phone_label_offset_y": number("phone_label_offset_y", 0.0, -1.5, 1.5),
+        # Relinking an independently resized phone/ruler/label back into the
+        # shared JD5 group can legitimately produce a wider relative scale and
+        # offset than the standalone controls. Keep these bounds identical to
+        # the editor so an exact preview cannot jump after a continuous edit.
+        "phone_label_scale": number("phone_label_scale", 1.0, 0.125, 4.0),
+        "phone_label_offset_x": number("phone_label_offset_x", 0.0, -8.0, 8.0),
+        "phone_label_offset_y": number("phone_label_offset_y", 0.0, -8.0, 8.0),
         "phone_label_linked": value.get("phone_label_linked") is not False,
         "phone_alignment": "center" if value.get("phone_alignment") == "center" else "bottom",
         "product_show_ruler": value.get("product_show_ruler") is not False,
@@ -5907,9 +6388,9 @@ def _normalize_adjustment(value: dict[str, Any] | None) -> dict[str, Any]:
         "width_ruler_scale": number("width_ruler_scale", 1.0, 0.5, 2.0),
         "width_ruler_offset_x": number("width_ruler_offset_x", 0.0, -1.5, 1.5),
         "width_ruler_offset_y": number("width_ruler_offset_y", 0.0, -1.5, 1.5),
-        "phone_ruler_scale": number("phone_ruler_scale", 1.0, 0.5, 2.0),
-        "phone_ruler_offset_x": number("phone_ruler_offset_x", 0.0, -1.5, 1.5),
-        "phone_ruler_offset_y": number("phone_ruler_offset_y", 0.0, -1.5, 1.5),
+        "phone_ruler_scale": number("phone_ruler_scale", 1.0, 0.125, 4.0),
+        "phone_ruler_offset_x": number("phone_ruler_offset_x", 0.0, -8.0, 8.0),
+        "phone_ruler_offset_y": number("phone_ruler_offset_y", 0.0, -8.0, 8.0),
     }
 
 
@@ -5961,22 +6442,42 @@ def _organizer_layer_cache_path(
     image_id: int,
     modified_ns: int,
     crop_key: tuple[int, int, int, int],
+    render_version: int | None = None,
 ) -> Path:
     source_path = asset_original(image_id)
     crop_token = "-".join(str(value) for value in crop_key)
-    return source_path.parent / "render-cache" / f"organizer-layer-{image_id}-{modified_ns}-{crop_token}.png"
+    version = (
+        ORGANIZER_LAYER_RENDER_VERSION
+        if render_version is None
+        else int(render_version)
+    )
+    return (
+        source_path.parent
+        / "render-cache"
+        / f"organizer-layer-v{version}-{image_id}-{modified_ns}-{crop_token}.png"
+    )
 
 
 @lru_cache(maxsize=16)
-def _cached_product_cutout(
+def _cached_product_cutout_versioned(
+    render_version: int,
     image_id: int,
     modified_ns: int,
     crop_key: tuple[int, int, int, int],
 ) -> Image.Image:
-    cache_path = _organizer_layer_cache_path(image_id, modified_ns, crop_key)
+    cache_path = _organizer_layer_cache_path(
+        image_id,
+        modified_ns,
+        crop_key,
+        render_version,
+    )
     if cache_path.is_file():
         with Image.open(cache_path) as cached:
-            return cached.convert("RGBA").copy()
+            return cached.convert("RGBA")
+
+    session_id = cache_path.parent.parent.name
+    if _valid_session_id(session_id):
+        _session_write_checkpoint(session_id)
 
     crop_x, crop_y, crop_width, crop_height = (value / 1_000_000 for value in crop_key)
     source = _load_image(image_id)
@@ -5987,14 +6488,39 @@ def _cached_product_cutout(
         "crop_height": crop_height,
     })
     cutout = _product_cutout(cropped)
+    if _valid_session_id(session_id):
+        _session_write_checkpoint(session_id)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = cache_path.with_name(f".{cache_path.stem}-{uuid.uuid4().hex[:8]}.png")
     try:
         cutout.save(temporary, format="PNG", compress_level=1)
+        if _valid_session_id(session_id):
+            _session_write_checkpoint(session_id)
         os.replace(temporary, cache_path)
+        if _valid_session_id(session_id):
+            _session_write_checkpoint(session_id)
     finally:
         temporary.unlink(missing_ok=True)
     return cutout
+
+
+def _cached_product_cutout(
+    image_id: int,
+    modified_ns: int,
+    crop_key: tuple[int, int, int, int],
+) -> Image.Image:
+    """Load the current-version cutout while keeping version in the LRU key."""
+    return _cached_product_cutout_versioned(
+        ORGANIZER_LAYER_RENDER_VERSION,
+        image_id,
+        modified_ns,
+        crop_key,
+    )
+
+
+# Existing request cleanup and tests intentionally use these cache helpers.
+_cached_product_cutout.cache_clear = _cached_product_cutout_versioned.cache_clear  # type: ignore[attr-defined]
+_cached_product_cutout.cache_info = _cached_product_cutout_versioned.cache_info  # type: ignore[attr-defined]
 
 
 def _clamp_layer_origin(position: int, layer_size: int, minimum: int, maximum: int) -> int:
@@ -6456,7 +6982,30 @@ def _paste_info_product(
         - round(INFO_PRODUCT_HANDLE_LIFT_Y * handle_lift * box_height)
         + round(automatic_layout["drop_y"] * box_height)
     )
-    canvas.paste(rendered.convert("RGB"), (x, y), rendered.getchannel("A"))
+    # The editor clips only the product to its 4% safe area. Dimension rulers
+    # are separate layers and may intentionally extend beyond that area (the
+    # diagonal thickness ruler commonly does), while the physical canvas still
+    # clips everything at its own edge. Mirror that layer separation here.
+    safe_left = round(canvas.width * 0.04)
+    safe_top = round(canvas.height * 0.04)
+    safe_right = round(canvas.width * 0.96)
+    safe_bottom = round(canvas.height * 0.96)
+    visible_left = max(safe_left, x)
+    visible_top = max(safe_top, y)
+    visible_right = min(safe_right, x + rendered.width)
+    visible_bottom = min(safe_bottom, y + rendered.height)
+    if visible_right > visible_left and visible_bottom > visible_top:
+        visible = rendered.crop((
+            visible_left - x,
+            visible_top - y,
+            visible_right - x,
+            visible_bottom - y,
+        ))
+        canvas.paste(
+            visible.convert("RGB"),
+            (visible_left, visible_top),
+            visible.getchannel("A"),
+        )
     return (
         x + body_left * scale,
         y + body_top * scale,
@@ -6754,17 +7303,26 @@ def _catalog_product_page(
     )
 
 
-def _dimension_value_mm(value: str | None) -> float | None:
-    normalized = str(value or "").strip().lower().replace("，", ".")
+def _dimension_decimal_mm(value: str | None) -> Decimal | None:
+    """Parse one positive, finite decimal dimension without accepting junk."""
+    normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    match = re.search(r"\d+(?:\.\d+)?", normalized)
-    if not match:
+    match = re.fullmatch(r"(?:\d+(?:\.\d+)?|\.\d+)", normalized)
+    if match is None:
         return None
-    number = float(match.group(0))
-    if "cm" in normalized:
-        number *= 10
+    try:
+        number = Decimal(match.group(0))
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or number <= 0:
+        return None
     return number
+
+
+def _dimension_value_mm(value: str | None) -> float | None:
+    number = _dimension_decimal_mm(value)
+    return float(number) if number is not None else None
 
 
 def _jd_size_dimensions_ready(product_info: dict[str, str]) -> bool:
@@ -6775,14 +7333,21 @@ def _jd_size_dimensions_ready(product_info: dict[str, str]) -> bool:
 
 
 def _vip_info_ready(product_info: dict[str, str]) -> bool:
-    return _jd_size_dimensions_ready(product_info)
+    return (
+        _jd_size_dimensions_ready(product_info)
+        and _dimension_value_mm(
+            product_info.get("product_thickness")
+            or product_info.get("product_width")
+        ) is not None
+    )
 
 
 def _dimension_mm(value: str) -> str:
-    number = _dimension_value_mm(value)
+    number = _dimension_decimal_mm(value)
     if number is None:
         return value or "--mm"
-    rendered = str(int(round(number))) if abs(number - round(number)) < 0.01 else f"{number:.1f}".rstrip("0").rstrip(".")
+    rounded = number.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    rendered = format(rounded, "f").rstrip("0").rstrip(".")
     return f"{rendered}mm"
 
 
@@ -7414,8 +7979,15 @@ def _jd_size_product_layout(
     }
 
 
+def _round_half_up_int(value: float | int | Decimal) -> int:
+    """Match JavaScript Math.round for the non-negative canvas metrics."""
+    return int(
+        Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
 def _jd_measure_font(size: tuple[int, int]) -> ImageFont.ImageFont:
-    return _font(max(14, round(min(size) * 0.022)))
+    return _font(max(14, _round_half_up_int(min(size) * 0.022)))
 
 
 @lru_cache(maxsize=24)
@@ -7435,15 +8007,20 @@ def _jd_phone_label_font(
     phone_height: int,
     label_scale: float = 1.0,
 ) -> ImageFont.ImageFont:
-    regular_size = max(12, round(min(size) * 0.017))
-    adaptive_size = max(10, min(regular_size, round(phone_height * 0.085)))
-    return _jd_phone_medium_font(max(8, round(adaptive_size * label_scale)))
+    regular_size = max(12, _round_half_up_int(min(size) * 0.017))
+    adaptive_size = max(
+        10,
+        min(regular_size, _round_half_up_int(phone_height * 0.085)),
+    )
+    return _jd_phone_medium_font(
+        max(8, _round_half_up_int(adaptive_size * label_scale))
+    )
 
 
 def _jd_phone_label_gap(size: tuple[int, int], phone_height: int) -> int:
     reference_height = min(size) * 0.22
     phone_scale = max(0.65, min(1.5, phone_height / reference_height))
-    return max(6, round(min(size) * 0.015 * phone_scale))
+    return max(6, _round_half_up_int(min(size) * 0.015 * phone_scale))
 
 
 def _draw_jd_dimension_bar(
@@ -7457,8 +8034,8 @@ def _draw_jd_dimension_bar(
 ) -> None:
     draw = ImageDraw.Draw(canvas)
     color = JD_MEASURE_COLOR
-    stroke = max(2, round(min(canvas.size) / 400))
-    cap = max(8, round(min(canvas.size) * 0.014))
+    stroke = max(2, _round_half_up_int(min(canvas.size) / 400))
+    cap = max(8, _round_half_up_int(min(canvas.size) * 0.014))
     font = _jd_measure_font(canvas.size)
     draw.line((start, end), fill=color, width=stroke)
     if vertical:
@@ -7508,16 +8085,16 @@ def _draw_jd_phone_reference(
     height = round(height)
     reference = _jd_phone_reference_layer()
     if reference is not None:
-        phone_height = max(90, height)
-        phone_width = max(42, round(phone_height * reference.width / reference.height))
+        phone_height = max(1, height)
+        phone_width = max(1, round(phone_height * reference.width / reference.height))
         left = round(center_x - phone_width / 2)
         rendered = reference.resize((phone_width, phone_height), Image.Resampling.LANCZOS)
         canvas.paste(rendered, (left, top), rendered)
         return left, top, left + phone_width, top + phone_height
 
     draw = ImageDraw.Draw(canvas)
-    phone_height = max(90, height)
-    phone_width = max(42, round(phone_height * 0.48))
+    phone_height = max(1, height)
+    phone_width = max(1, round(phone_height * 0.48))
     overlap = max(12, round(phone_height * 0.13))
     pair_width = phone_width * 2 - overlap
     left = round(center_x - pair_width / 2)
@@ -7666,17 +8243,28 @@ def _jd_comparison_product_layout(
 
 
 def _jd_size_comparison_page(
-    source: Image.Image,
+    source: Image.Image | None,
     size: tuple[int, int],
     product_info: dict[str, str],
     adjustment: dict[str, Any] | None,
     logo_color: str = "black",
+    *,
+    prepared_cutout: Image.Image | None = None,
 ) -> Image.Image:
     canvas = Image.new("RGB", size, "#f3f3f3")
     _draw_jd_elle_logo(canvas, size, logo_color)
     width, height = size
     normalized = _normalize_adjustment(adjustment)
-    cutout = _product_cutout(_crop_source(source, adjustment))
+    if prepared_cutout is not None:
+        cutout = (
+            prepared_cutout
+            if prepared_cutout.mode == "RGBA"
+            else prepared_cutout.convert("RGBA")
+        )
+    elif source is not None:
+        cutout = _product_cutout(_crop_source(source, adjustment))
+    else:
+        raise ValueError("商品编辑层不存在")
     body_bbox = _jd_product_body_bbox(cutout)
     layout, base_layout = _jd_comparison_product_layout(
         cutout,
@@ -7700,8 +8288,8 @@ def _jd_size_comparison_page(
     phone_height = max(1, round(base_phone_height * normalized["phone_scale"]))
     reference = _jd_phone_reference_layer()
     reference_ratio = reference.width / reference.height if reference is not None else 0.83
-    base_phone_width = max(42, round(base_phone_height * reference_ratio))
-    phone_width = max(42, round(phone_height * reference_ratio))
+    base_phone_width = max(1, round(base_phone_height * reference_ratio))
+    phone_width = max(1, round(phone_height * reference_ratio))
     phone_ruler_gap = max(22, round(width * 0.035))
     phone_label_clearance = max(40, round(width * 0.05))
     phone_right_allowance = phone_ruler_gap + phone_label_clearance
@@ -7875,8 +8463,26 @@ def _render_jd_slot_image(
     if not image_ids:
         return None
     size = (800, 800) if target_folder == "800" else (750, 1000)
-    source = _load_image(image_ids[0])
     adjustment = adjustments[0] if adjustments else None
+    if file_name == "5.jpg":
+        if not _jd_size_dimensions_ready(product_info):
+            return None
+        source_path = asset_original(image_ids[0])
+        prepared_cutout = _cached_product_cutout(
+            image_ids[0],
+            source_path.stat().st_mtime_ns,
+            _crop_cache_key(adjustment),
+        )
+        return _jd_size_comparison_page(
+            None,
+            size,
+            product_info,
+            adjustment,
+            logo_color,
+            prepared_cutout=prepared_cutout,
+        )
+
+    source = _load_image(image_ids[0])
     if file_name == "0-无logo.jpg":
         return _jd_model_page(source, size, adjustment, with_logo=False)
     if file_name == "1.jpg":
@@ -7897,10 +8503,6 @@ def _render_jd_slot_image(
         return canvas
     if file_name == "4.jpg":
         return _jd_interior_detail_page(source, size, adjustment, logo_color)
-    if file_name == "5.jpg":
-        if not _jd_size_dimensions_ready(product_info):
-            return None
-        return _jd_size_comparison_page(source, size, product_info, adjustment, logo_color)
     if file_name == "透明.png":
         return _normalized_product_page(
             source,
@@ -8134,6 +8736,7 @@ def _preview_cache_id(
 ) -> str:
     payload = {
         "version": PREVIEW_RENDER_VERSION,
+        "organizer_layer_version": ORGANIZER_LAYER_RENDER_VERSION,
         "platform": platform,
         "target_folder": target_folder,
         "file_name": file_name,
@@ -8154,10 +8757,12 @@ def _render_cached_slot_preview(
     platform: str,
     target_folder: str = "800",
 ) -> str | None:
+    _assert_session_active(session_id)
     preview_id = _preview_cache_id(file_name, slot, product_info, platform, target_folder)
     folder = _session_result_dir(session_id) / "previews" / preview_id
     output = folder / file_name
     if output.is_file():
+        _assert_session_active(session_id)
         os.utime(folder, None)
         return f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}"
 
@@ -8173,11 +8778,18 @@ def _render_cached_slot_preview(
     if image is None:
         return None
 
-    folder.mkdir(parents=True, exist_ok=True)
+    _assert_session_active(session_id)
     temporary = output.with_name(f".{output.stem}-{uuid.uuid4().hex[:8]}{output.suffix}")
     try:
+        folder.mkdir(parents=True, exist_ok=True)
+        _assert_session_active(session_id)
         _save_preview_image(image, file_name, temporary)
+        _assert_session_active(session_id)
         os.replace(temporary, output)
+        _assert_session_active(session_id)
+    except Exception:
+        _remove_session_artifacts_if_inactive(session_id)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
     return f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}"
@@ -8320,9 +8932,9 @@ def _render_slot_preview(
     if platform == "jd" and target_folder not in {"800", "750"}:
         raise ValueError("京东预览目录必须是 800 或 750")
     if platform == "jd" and file_name == "5.jpg" and not _jd_size_dimensions_ready(product_info):
-        raise ValueError("请先填写商品长和高，再生成尺寸与手机对比图")
+        raise ValueError("请先填写有效的商品长和高，再生成尺寸与手机对比图")
     if platform == "vip" and file_name == "401.jpg" and not _vip_info_ready(product_info):
-        raise ValueError("请先填写商品长和高，再生成产品信息图")
+        raise ValueError("请先填写有效的商品长、高和厚，再生成产品信息图")
     preview_url = _render_cached_slot_preview(
         session_id,
         file_name,
@@ -8404,21 +9016,26 @@ def _export_package(
     product_info: dict[str, str],
     platform: str = "vip",
 ) -> dict[str, Any]:
+    _assert_session_active(session_id)
     slot_definitions = _platform_slot_definitions(platform)
     slot_map = _slot_map(slots, platform)
     _validate_slot_map(session_id, slot_map, platform)
     if platform == "jd" and not _jd_size_dimensions_ready(product_info):
-        raise ValueError("请先填写商品长和高，再下载京东套图")
+        raise ValueError("请先填写有效的商品长和高，再下载京东套图")
+    if platform == "vip" and not _vip_info_ready(product_info):
+        raise ValueError("请先填写有效的商品长、高和厚，再下载唯品会套图")
     export_id = uuid.uuid4().hex[:12]
     session_result_dir = _session_result_dir(session_id)
     folder = session_result_dir / export_id
     folder.mkdir(parents=True, exist_ok=True)
+    _session_write_checkpoint(session_id)
     missing: list[str] = []
 
     if platform == "jd":
         output_folders = {"800": folder / "800", "750": folder / "750"}
         for output_folder in output_folders.values():
             output_folder.mkdir(parents=True, exist_ok=True)
+            _session_write_checkpoint(session_id)
         for file_name, _, _, _ in slot_definitions:
             targets = ["800"] if file_name in {"0-无logo.jpg", "透明.png"} else ["800", "750"]
             slot = slot_map.get(file_name, {"image_ids": [], "adjustments": [], "logo_color": "black"})
@@ -8436,7 +9053,9 @@ def _export_package(
                 if image is None:
                     missing.append(f"{target}/{file_name}")
                     continue
+                _session_write_checkpoint(session_id)
                 _save_slot_image(image, file_name, output_folders[target] / file_name)
+                _session_write_checkpoint(session_id)
     else:
         for file_name, _, _, _ in slot_definitions:
             output = folder / file_name
@@ -8445,14 +9064,18 @@ def _export_package(
             if image is None:
                 missing.append(file_name)
                 continue
+            _session_write_checkpoint(session_id)
             _save_slot_image(image, file_name, output)
+            _session_write_checkpoint(session_id)
 
     platform_label = "京东" if platform == "jd" else "唯品会"
     zip_path = session_result_dir / f"{platform_label}套图_{export_id}.zip"
+    _session_write_checkpoint(session_id)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(folder.rglob("*")):
             if path.is_file():
                 archive.write(path, arcname=path.relative_to(folder).as_posix())
+    _session_write_checkpoint(session_id)
     preview_paths = [path for path in sorted(folder.rglob("*")) if path.suffix.lower() in {".jpg", ".png"}]
     previews = []
     for path in preview_paths:
@@ -8461,6 +9084,7 @@ def _export_package(
             previews.append(f"/api/vip-organizer/exports/{session_id}/{export_id}/files/{relative.parts[0]}/{relative.parts[1]}")
         else:
             previews.append(f"/api/vip-organizer/exports/{session_id}/{export_id}/files/{path.name}")
+    _session_write_checkpoint(session_id)
     return {
         "download_url": f"/api/vip-organizer/exports/{session_id}/{export_id}/download",
         "previews": previews,

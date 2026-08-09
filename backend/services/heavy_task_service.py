@@ -37,6 +37,36 @@ def _worker_environment() -> dict[str, str]:
     return environment
 
 
+def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    """Publish worker input only after the complete JSON document is durable.
+
+    The prewarmed worker polls for ``input.json``. Writing that file directly
+    creates a short window where the worker can observe an empty or partial
+    document. A completed temporary file followed by ``os.replace`` keeps the
+    publication atomic on the same filesystem.
+    """
+    serialized = json.dumps(payload, ensure_ascii=False)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _read_worker_result(output_path: Path) -> Any:
     try:
         response = json.loads(output_path.read_text(encoding="utf-8"))
@@ -169,10 +199,7 @@ def _consume_prewarmer(
     process: subprocess.Popen[str] = state["process"]
     input_path = directory / "input.json"
     output_path = directory / "output.json"
-    input_path.write_text(
-        json.dumps(payload, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    _write_json_atomically(input_path, payload)
     try:
         _, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -201,10 +228,7 @@ def _run_direct_worker(
         task_dir = Path(directory)
         input_path = task_dir / "input.json"
         output_path = task_dir / "output.json"
-        input_path.write_text(
-            json.dumps(payload, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        _write_json_atomically(input_path, payload)
         try:
             completed = subprocess.run(
                 [

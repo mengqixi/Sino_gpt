@@ -13,6 +13,8 @@ from backend.services import vip_organizer_service as service
 def test_jd_export_uses_separate_800_and_750_folders(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "_session_result_dir", lambda _session_id: tmp_path)
     monkeypatch.setattr(service, "_validate_slot_map", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_assert_session_active", lambda _session_id: None)
+    monkeypatch.setattr(service, "_session_write_checkpoint", lambda _session_id: None)
     monkeypatch.setattr(
         service,
         "_render_slot_image",
@@ -188,6 +190,8 @@ def test_jd_export_uses_the_logo_color_for_each_folder():
         TemporaryDirectory() as temporary_directory,
         patch.object(service, "_session_result_dir", return_value=Path(temporary_directory)),
         patch.object(service, "_validate_slot_map"),
+        patch.object(service, "_assert_session_active"),
+        patch.object(service, "_session_write_checkpoint"),
         patch.object(service, "_render_slot_image", side_effect=render_slot),
     ):
         service._export_package(
@@ -204,6 +208,8 @@ def test_jd_export_uses_the_adjustments_for_each_target_folder(tmp_path, monkeyp
     captured: dict[str, list[dict]] = {}
     monkeypatch.setattr(service, "_session_result_dir", lambda _session_id: tmp_path)
     monkeypatch.setattr(service, "_validate_slot_map", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_assert_session_active", lambda _session_id: None)
+    monkeypatch.setattr(service, "_session_write_checkpoint", lambda _session_id: None)
 
     def render_slot(
         file_name,
@@ -401,13 +407,32 @@ def test_jd_phone_comparison_waits_for_length_and_height():
     assert service._jd_size_dimensions_ready({"product_length": "200", "product_height": "140"})
 
 
-def test_vip_info_page_waits_for_length_and_height_and_formats_mm():
+def test_vip_info_page_waits_for_all_dimensions_and_formats_mm():
     assert not service._vip_info_ready({})
     assert not service._vip_info_ready({"product_length": "195"})
-    assert service._vip_info_ready({"product_length": "195", "product_height": "140"})
+    assert not service._vip_info_ready({"product_length": "195", "product_height": "140"})
+    assert service._vip_info_ready({
+        "product_length": "195",
+        "product_height": "140",
+        "product_thickness": "55",
+    })
+    assert service._vip_info_ready({
+        "product_length": "195",
+        "product_height": "140",
+        "product_width": "55",
+    })
     assert service._dimension_mm("195") == "195mm"
-    assert service._dimension_mm("19.5cm") == "195mm"
-    assert service._dimension_mm("163mm") == "163mm"
+    assert service._dimension_mm("195.55") == "195.6mm"
+    assert service._dimension_mm("195.25") == "195.3mm"
+    assert service._dimension_mm("2.55") == "2.6mm"
+    assert service._dimension_mm(".5") == "0.5mm"
+
+
+def test_dimension_parser_rejects_non_positive_or_mixed_values():
+    for value in (None, "", "0", "0.0", "-5", "+5", "1e2", "NaN", "inf", "195mm", "19.5cm", "195abc"):
+        assert service._dimension_value_mm(value) is None
+    assert service._dimension_value_mm(" 195.5 ") == 195.5
+    assert service._dimension_value_mm(".5") == 0.5
 
 
 def test_vip_info_measurement_excludes_sparse_handle():
@@ -422,6 +447,47 @@ def test_vip_info_measurement_excludes_sparse_handle():
     assert bottom >= 380
     assert left <= 70
     assert right >= 290
+
+
+def test_vip_info_product_is_clipped_to_editor_safe_area_only():
+    source = Image.new("RGBA", (100, 100), (210, 20, 20, 255))
+    canvas = Image.new("RGB", (750, 665), "white")
+    with (
+        patch.object(service, "_product_cutout", return_value=source),
+        patch.object(service, "_handle_visual_lift", return_value=0.0),
+        patch.object(service, "_jd_product_body_bbox", return_value=(0, 0, 100, 100)),
+        patch.object(service, "_info_product_auto_layout", return_value={
+            "scale": 1.0,
+            "shift_x": 0.0,
+            "drop_y": 0.0,
+            "edge_pressure": 0.0,
+        }),
+    ):
+        body = service._paste_info_product(
+            canvas,
+            source,
+            {"zoom": 4.0, "offset_x": -0.5},
+        )
+
+    assert body[0] < 30
+    assert canvas.getpixel((29, 300)) == (255, 255, 255)
+    assert canvas.getpixel((30, 300))[0] > canvas.getpixel((30, 300))[1]
+    assert canvas.getpixel((719, 300))[0] > canvas.getpixel((719, 300))[1]
+    assert canvas.getpixel((720, 300)) == (255, 255, 255)
+
+
+def test_vip_info_thickness_ruler_may_cross_safe_area_after_product_clip():
+    page = service._info_page(
+        {
+            "product_length": "195",
+            "product_height": "140",
+            "product_thickness": "55",
+        },
+        None,
+        {"width_ruler_offset_x": 0.3},
+    )
+    pixels = np.asarray(page)
+    assert np.any(pixels[470:570, 721:750] < 245)
 
 
 def test_vip_info_measurement_excludes_thick_tote_handles():
@@ -913,6 +979,16 @@ def test_jd_phone_renderer_accepts_fractional_position():
     assert all(isinstance(value, int) for value in box)
 
 
+def test_jd_phone_renderer_does_not_override_editor_scale_with_pixel_minimums():
+    canvas = Image.new("RGB", (800, 800), "white")
+    reference = service._jd_phone_reference_layer()
+    assert reference is not None
+    box = service._draw_jd_phone_reference(canvas, 600, 210, 40)
+    assert box[3] - box[1] == 40
+    assert box[2] - box[0] == round(40 * reference.width / reference.height)
+    assert box[2] - box[0] < 42
+
+
 def test_jd_phone_reference_keeps_the_phone_interior_opaque():
     reference = service._jd_phone_reference_layer()
     assert reference is not None
@@ -1153,6 +1229,11 @@ def test_jd_phone_label_font_shrinks_with_a_small_phone():
     assert getattr(small, "size", 0) < getattr(regular, "size", 0)
     assert getattr(tiny, "size", 0) == 10
     assert getattr(enlarged, "size", 0) > getattr(small, "size", 0)
+
+
+def test_jd_metric_rounding_matches_browser_half_up_at_point_five():
+    assert service._round_half_up_int(16.5) == 17
+    assert getattr(service._jd_measure_font((750, 1000)), "size", 0) == 17
     assert service._jd_phone_label_gap((800, 800), 120) < service._jd_phone_label_gap((800, 800), 220)
 
 
@@ -1207,14 +1288,20 @@ def test_independent_ruler_adjustments_are_normalized_and_transformed():
         "product_ruler_group_offset_x": 0.2,
         "length_ruler_scale": 9,
         "height_ruler_offset_x": -9,
-        "phone_ruler_offset_y": 0.25,
+        "phone_ruler_scale": 0.125,
+        "phone_ruler_offset_y": 8,
+        "phone_label_scale": 4,
+        "phone_label_offset_x": -8,
     })
 
     assert normalized["product_ruler_group_scale"] == 4.0
     assert normalized["product_ruler_group_offset_x"] == 0.2
     assert normalized["length_ruler_scale"] == 2.0
     assert normalized["height_ruler_offset_x"] == -1.5
-    assert normalized["phone_ruler_offset_y"] == 0.25
+    assert normalized["phone_ruler_scale"] == 0.125
+    assert normalized["phone_ruler_offset_y"] == 8
+    assert normalized["phone_label_scale"] == 4
+    assert normalized["phone_label_offset_x"] == -8
 
     start, end = service._transform_ruler_segment(
         (100, 200),
@@ -1400,6 +1487,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_phone_renderer_rounds_coordinates(self):
         test_jd_phone_renderer_accepts_fractional_position()
 
+    def test_phone_renderer_respects_small_editor_scale(self):
+        test_jd_phone_renderer_does_not_override_editor_scale_with_pixel_minimums()
+
     def test_phone_reference_keeps_interior_opaque(self):
         test_jd_phone_reference_keeps_the_phone_interior_opaque()
 
@@ -1421,6 +1511,9 @@ class JdOrganizerGeometryTests(unittest.TestCase):
     def test_vertical_dimension_text_uses_shared_color(self):
         test_jd_vertical_dimension_text_uses_the_shared_measure_color()
 
+    def test_jd_metric_rounding_matches_browser(self):
+        test_jd_metric_rounding_matches_browser_half_up_at_point_five()
+
     def test_jd_object_only_modes_keep_rulers_visible(self):
         test_jd_size_rulers_stay_visible_when_adjusting_objects_only()
 
@@ -1440,10 +1533,19 @@ class JdOrganizerGeometryTests(unittest.TestCase):
         test_jd_phone_comparison_waits_for_length_and_height()
 
     def test_vip_info_dimension_gate_and_units(self):
-        test_vip_info_page_waits_for_length_and_height_and_formats_mm()
+        test_vip_info_page_waits_for_all_dimensions_and_formats_mm()
+
+    def test_dimension_parser_is_strict(self):
+        test_dimension_parser_rejects_non_positive_or_mixed_values()
 
     def test_vip_info_excludes_handle(self):
         test_vip_info_measurement_excludes_sparse_handle()
+
+    def test_vip_info_product_uses_safe_clip(self):
+        test_vip_info_product_is_clipped_to_editor_safe_area_only()
+
+    def test_vip_info_thickness_ruler_can_leave_safe_area(self):
+        test_vip_info_thickness_ruler_may_cross_safe_area_after_product_clip()
 
     def test_vip_info_excludes_thick_handles(self):
         test_vip_info_measurement_excludes_thick_tote_handles()

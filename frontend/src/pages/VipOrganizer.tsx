@@ -124,7 +124,15 @@ type PreviewFolder = "800" | "750";
 const JD_SINGLE_FOLDER_FILES = new Set(["0-无logo.jpg", "透明.png"]);
 const JD_MEASURE_COLOR = "#707070";
 const JD_PHONE_SCALE_MAX = 4;
+const JD_DECORATION_SCALE_MIN = 0.125;
+const JD_DECORATION_SCALE_MAX = 4;
+const JD_DECORATION_OFFSET_MAX = 8;
 const ORGANIZER_CANVAS_FONT = '"OrganizerNotoSans"';
+// Keep persisted preview signatures aligned with backend PREVIEW_RENDER_VERSION
+// and ORGANIZER_LAYER_RENDER_VERSION. Bump this token whenever either renderer
+// changes so a refresh cannot revive an older exact preview from sessionStorage.
+const ORGANIZER_RENDER_STATE_VERSION = "33:1";
+const ORGANIZER_SESSION_SNAPSHOT_VERSION = 2;
 
 let organizerCanvasFontsReady: Promise<unknown> | null = null;
 
@@ -143,14 +151,22 @@ function jdMeasureFont(output: { width: number; height: number }) {
   return `400 ${Math.max(14, Math.round(Math.min(output.width, output.height) * 0.022))}px ${ORGANIZER_CANVAS_FONT}`;
 }
 
-function jdPhoneLabelFont(
+function jdPhoneLabelFontSize(
   output: { width: number; height: number },
   phoneHeight: number,
   labelScale = 1
 ) {
   const regularSize = Math.max(12, Math.round(Math.min(output.width, output.height) * 0.017));
   const adaptiveSize = Math.max(10, Math.min(regularSize, Math.round(phoneHeight * 0.085)));
-  const scaledSize = Math.max(8, Math.round(adaptiveSize * labelScale));
+  return Math.max(8, Math.round(adaptiveSize * labelScale));
+}
+
+function jdPhoneLabelFont(
+  output: { width: number; height: number },
+  phoneHeight: number,
+  labelScale = 1
+) {
+  const scaledSize = jdPhoneLabelFontSize(output, phoneHeight, labelScale);
   // Small text loses noticeably more coverage than the larger ruler labels
   // after browser/image antialiasing. Medium keeps the same #707070 ink while
   // matching their perceived darkness at the final rendered size.
@@ -255,6 +271,22 @@ function productThickness(productInfo: Record<string, string>) {
   return productInfo.product_thickness || productInfo.product_width || "";
 }
 
+function positiveDimensionValue(value: string | undefined) {
+  const normalized = String(value || "").trim();
+  if (!/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function dimensionMmLabel(value: string | undefined, fallback = "--mm") {
+  const parsed = positiveDimensionValue(value);
+  if (parsed === null) return fallback;
+  // Keep browser labels on the same positive-number rounding contract as the
+  // exact renderer: ties round away from zero (Decimal ROUND_HALF_UP).
+  const rounded = Math.floor((parsed + Number.EPSILON) * 10 + 0.5) / 10;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}mm`;
+}
+
 function vipInfoProductScale(handleLift = 0) {
   return VIP_INFO_PRODUCT_SCALE * (1 + VIP_INFO_HANDLE_SCALE * Math.max(0, Math.min(1, handleLift)));
 }
@@ -298,6 +330,19 @@ function targetScale(draft: ImageAdjustment, target: AdjustmentTarget) {
   if (target === "width_ruler") return draft.width_ruler_scale || 1;
   if (target === "phone_ruler") return draft.phone_ruler_scale || 1;
   return draft.zoom;
+}
+
+function targetScaleLimits(target: AdjustmentTarget) {
+  if (target === "product" || target === "phone") return { minimum: 0.5, maximum: JD_PHONE_SCALE_MAX };
+  if (target === "phone_ruler" || target === "phone_label") {
+    return { minimum: JD_DECORATION_SCALE_MIN, maximum: JD_DECORATION_SCALE_MAX };
+  }
+  return { minimum: 0.5, maximum: 2 };
+}
+
+function targetOffsetLimit(target: AdjustmentTarget) {
+  if (target === "phone_ruler" || target === "phone_label") return JD_DECORATION_OFFSET_MAX;
+  return 1.5;
 }
 
 function targetOffset(draft: ImageAdjustment, target: AdjustmentTarget) {
@@ -375,9 +420,12 @@ function mergeAnalyzedSlots(current: Slot[], incoming: Slot[]) {
     const previous = currentByName.get(nextSlot.file_name);
     if (!previous) return nextSlot;
 
-    const forceAssignedSource = nextSlot.file_name === "401.jpg" || nextSlot.file_name === "5.jpg";
-    const preserveManualSources = isManuallyConfirmedSlot(previous) && !forceAssignedSource;
+    // A designer-selected source is authoritative, including JD 5.jpg. An
+    // automatic re-analysis must not silently replace that image.
+    const preserveManualSources = isManuallyConfirmedSlot(previous);
     const imageIds = preserveManualSources ? previous.image_ids : nextSlot.image_ids;
+    const sourceUnchanged = imageIds.length === previous.image_ids.length
+      && imageIds.every((imageId, index) => previous.image_ids[index] === imageId);
     const adjustments = imageIds.map((imageId, index) => {
       if (previous.image_ids[index] === imageId && previous.adjustments?.[index]) {
         return previous.adjustments[index];
@@ -389,7 +437,9 @@ function mergeAnalyzedSlots(current: Slot[], incoming: Slot[]) {
       ...nextSlot,
       image_ids: imageIds,
       adjustments,
-      folder_adjustments: previous.folder_adjustments,
+      // Folder adjustments are tied to the source image. Reusing them after an
+      // automatic source change applies the old crop/position to a new photo.
+      folder_adjustments: sourceUnchanged ? previous.folder_adjustments : undefined,
       folder_logo_colors: previous.folder_logo_colors,
       logo_color: previous.logo_color || nextSlot.logo_color,
       confidence: preserveManualSources ? previous.confidence : nextSlot.confidence,
@@ -439,6 +489,35 @@ function slotCanvasSize(size: string, platform?: OrganizerPlatform, targetFolder
   }
   const match = size.match(/(\d+)\s*[×x]\s*(\d+)/i);
   return match ? { width: Number(match[1]), height: Number(match[2]) } : { width: 800, height: 800 };
+}
+
+function adjustmentForSyncedFolder(
+  adjustment: ImageAdjustment,
+  targetAdjustment: ImageAdjustment | undefined,
+  slot: Slot,
+  platform: OrganizerPlatform,
+  sourceFolder: PreviewFolder,
+  targetFolder: PreviewFolder
+) {
+  if (platform !== "jd" || sourceFolder === targetFolder) return { ...adjustment };
+  if (slot.file_name !== "5.jpg") return { ...adjustment };
+
+  // JD 800 and 750 use independent comparison-layout algorithms. Their
+  // product bodies are not related by a simple canvas-width/height ratio, so
+  // copying or scaling an absolute ruler baseline makes the target folder
+  // jump. Linked rulers rebuild from the target folder's own rendered body;
+  // detached rulers retain only a baseline that was already saved for that
+  // target folder.
+  const detachedTarget = adjustment.product_show_ruler === false
+    ? targetAdjustment
+    : undefined;
+  return {
+    ...adjustment,
+    product_ruler_base_left: detachedTarget?.product_ruler_base_left,
+    product_ruler_base_top: detachedTarget?.product_ruler_base_top,
+    product_ruler_base_right: detachedTarget?.product_ruler_base_right,
+    product_ruler_base_bottom: detachedTarget?.product_ruler_base_bottom
+  };
 }
 
 function slotUsesOrganizerLayer(slot: Slot, platform: OrganizerPlatform) {
@@ -695,7 +774,7 @@ const livePreparedProductCache = new Map<string, HTMLCanvasElement>();
 const livePreviewLightBorderCache = new Map<string, boolean>();
 let liveHandleLiftCache = new WeakMap<HTMLCanvasElement, number>();
 type PixelBounds = { left: number; top: number; right: number; bottom: number };
-type LiveProductLayer = { canvas: HTMLCanvasElement; body: PixelBounds };
+type LiveProductLayer = { canvas: HTMLCanvasElement; body: PixelBounds; handleLift?: number };
 const liveJdProductLayerCache = new Map<string, LiveProductLayer>();
 
 function clearLivePreviewCaches() {
@@ -1318,7 +1397,11 @@ function liveJdProductLayer(url: string, image: HTMLImageElement, draft: ImageAd
     canvas.width,
     canvas.height
   );
-  const layer = { canvas, body: liveInfoMeasurementBounds(canvas) };
+  const layer = {
+    canvas,
+    body: liveInfoMeasurementBounds(canvas),
+    handleLift: liveHandleVisualLift(canvas)
+  };
   liveJdProductLayerCache.set(key, layer);
   return layer;
 }
@@ -1339,6 +1422,33 @@ function organizerLayerBounds(bounds: OrganizerLayerInfo["measurement_bbox"] | u
   if (!bounds) return null;
   const [left, top, right, bottom] = bounds;
   return right > left && bottom > top ? { left, top, right, bottom } : null;
+}
+
+function preparedOrganizerProductLayer(
+  info: OrganizerLayerInfo,
+  image: HTMLImageElement
+): LiveProductLayer {
+  const canvas = preparedProductCutout(info.url, image);
+  return {
+    canvas,
+    handleLift: info.handle_lift,
+    body: organizerLayerBounds(info.product_body_bbox)
+      || organizerLayerBounds(info.measurement_bbox)
+      || { left: 0, top: 0, right: canvas.width, bottom: canvas.height }
+  };
+}
+
+function organizerProductGeometryLayer(info: OrganizerLayerInfo): LiveProductLayer {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, info.width);
+  canvas.height = Math.max(1, info.height);
+  return {
+    canvas,
+    handleLift: info.handle_lift,
+    body: organizerLayerBounds(info.product_body_bbox)
+      || organizerLayerBounds(info.measurement_bbox)
+      || { left: 0, top: 0, right: canvas.width, bottom: canvas.height }
+  };
 }
 
 function positionedInfoProductBody(
@@ -1425,9 +1535,9 @@ function jdProductGeometry(
 ) {
   const bodyWidth = Math.max(1, layer.body.right - layer.body.left);
   const bodyHeight = Math.max(1, layer.body.bottom - layer.body.top);
-  const lengthMm = Number.parseFloat(productInfo.product_length || "") || 200;
-  const providedHeight = Number.parseFloat(productInfo.product_height || "");
-  const heightMm = Number.isFinite(providedHeight) && providedHeight > 0
+  const lengthMm = positiveDimensionValue(productInfo.product_length) || 200;
+  const providedHeight = positiveDimensionValue(productInfo.product_height);
+  const heightMm = providedHeight !== null
     ? providedHeight
     : Math.max(60, lengthMm * bodyHeight / bodyWidth);
   const profile = jdProductShapeProfile(bodyWidth, bodyHeight, lengthMm / Math.max(1, heightMm));
@@ -1494,7 +1604,7 @@ function jdProductGeometry(
       && x + width > logo.left - horizontalGap;
     if (overlapsLogoColumns) {
       const isTallHandleBag = bodyWidth / Math.max(1, bodyHeight) <= 1.15
-        && liveHandleVisualLift(layer.canvas) >= 0.55;
+        && (layer.handleLift ?? liveHandleVisualLift(layer.canvas)) >= 0.55;
       const clearance = output.width === 800 && output.height === 800
         ? isTallHandleBag ? 97 : output.height * 0.09
         : output.height * (isTallHandleBag ? 0.07 : 0.04);
@@ -1664,11 +1774,12 @@ function drawCanvasRuler(
   vertical = false,
   labelOnRight = false
 ) {
-  const cap = Math.max(7, output.width * 0.011);
+  const shortestSide = Math.min(output.width, output.height);
+  const cap = Math.max(8, Math.round(shortestSide * 0.014));
   context.save();
   context.strokeStyle = JD_MEASURE_COLOR;
   context.fillStyle = JD_MEASURE_COLOR;
-  context.lineWidth = Math.max(1, output.width * 0.002);
+  context.lineWidth = Math.max(2, Math.round(shortestSide / 400));
   context.font = jdMeasureFont(output);
   context.textAlign = "center";
   context.beginPath();
@@ -1687,13 +1798,28 @@ function drawCanvasRuler(
   }
   context.stroke();
   if (vertical) {
+    const textMetrics = context.measureText(label);
+    const textHeight = Math.max(
+      1,
+      textMetrics.actualBoundingBoxAscent + textMetrics.actualBoundingBoxDescent
+    );
+    const textX = labelOnRight
+      ? start.x + cap + 9
+      : start.x - cap - textHeight - 16;
+    const textTop = (start.y + end.y) / 2 - 30;
     context.save();
-    context.translate(start.x + (labelOnRight ? cap + 14 : -cap - 14), (start.y + end.y) / 2);
+    // Pillow pastes its 90° text layer at (textX, midpoint - 30). Draw the
+    // browser text into that same rotated bounding box so live/exact previews
+    // keep identical cap, label-side and baseline geometry.
+    context.translate(textX, textTop + textMetrics.width);
     context.rotate(-Math.PI / 2);
+    context.textAlign = "left";
+    context.textBaseline = "top";
     context.fillText(label, 0, 0);
     context.restore();
   } else {
-    context.fillText(label, (start.x + end.x) / 2, start.y + cap + 19);
+    context.textBaseline = "top";
+    context.fillText(label, (start.x + end.x) / 2, start.y + cap + 7);
   }
   context.restore();
 }
@@ -1706,9 +1832,10 @@ function drawJdComparisonPreview(
   phoneReference: HTMLImageElement | null,
   logoReference: HTMLImageElement | null,
   draft: ImageAdjustment,
-  productInfo: Record<string, string>
+  productInfo: Record<string, string>,
+  preparedLayer?: LiveProductLayer
 ) {
-  const layer = liveJdProductLayer(sourceUrl, image, draft);
+  const layer = preparedLayer || liveJdProductLayer(sourceUrl, image, draft);
   const { geometry, baseGeometry } = jdComparisonProductGeometry(output, layer, draft, productInfo);
   context.fillStyle = "#f3f3f3";
   context.fillRect(0, 0, output.width, output.height);
@@ -1720,10 +1847,8 @@ function drawJdComparisonPreview(
   context.drawImage(layer.canvas, geometry.x, geometry.y, geometry.width, geometry.height);
 
   const rulerGap = Math.max(28, output.width * 0.045);
-  const lengthValue = Number.parseFloat(productInfo.product_length || "");
-  const heightValue = Number.parseFloat(productInfo.product_height || "");
-  const lengthLabel = Number.isFinite(lengthValue) ? `${Math.round(lengthValue)}mm` : "200mm";
-  const heightLabel = Number.isFinite(heightValue) ? `${Math.round(heightValue)}mm` : `${Math.round(geometry.heightMm)}mm`;
+  const lengthLabel = dimensionMmLabel(productInfo.product_length, "200mm");
+  const heightLabel = dimensionMmLabel(productInfo.product_height, `${Math.round(geometry.heightMm)}mm`);
   const productRulerBody = storedProductRulerBase(draft) || geometry.body;
   const horizontalY = Math.min(output.height - 70, productRulerBody.bottom + rulerGap);
   const verticalX = Math.max(30, productRulerBody.left - rulerGap);
@@ -1907,7 +2032,21 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
         context.fillRect(0, output.height * 0.18, output.width, output.height * 0.82);
       }
       if (platform === "jd" && slot.file_name === "5.jpg") {
-        drawJdComparisonPreview(context, output, image, sourceUrl, phoneReference, logoReference, draft, productInfo);
+        if (!layerInfo || !preparedProduct?.complete || !preparedProduct.naturalWidth) {
+          drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
+          return;
+        }
+        drawJdComparisonPreview(
+          context,
+          output,
+          image,
+          sourceUrl,
+          phoneReference,
+          logoReference,
+          draft,
+          productInfo,
+          preparedOrganizerProductLayer(layerInfo, preparedProduct)
+        );
         drawAdjustmentGuide(context, output, slot, platform, sourceIndex, targetFolder);
         return;
       }
@@ -2043,10 +2182,12 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       const automaticBaseX = drawX - draft.offset_x * areaWidth;
       const automaticBaseY = drawY - draft.offset_y * areaHeight;
       const editorArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
-      const safeLeft = editorArea.x * output.width;
-      const safeTop = editorArea.y * output.height;
-      const safeRight = (editorArea.x + editorArea.width) * output.width;
-      const safeBottom = (editorArea.y + editorArea.height) * output.height;
+      // Match Pillow's integer safe-area edges so the live and exact layers
+      // do not differ by a one-pixel fringe when a product touches a border.
+      const safeLeft = Math.round(editorArea.x * output.width);
+      const safeTop = Math.round(editorArea.y * output.height);
+      const safeRight = Math.round((editorArea.x + editorArea.width) * output.width);
+      const safeBottom = Math.round((editorArea.y + editorArea.height) * output.height);
       // Keep automatic placement constrained, but do not re-clamp a layer
       // after the designer explicitly moves, crops or zooms it. Re-clamping
       // made dragging asymmetric and caused the zoom anchor to jump from one
@@ -2144,10 +2285,9 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
           draft.height_ruler_offset_y || 0,
           output
         );
-        const lengthValue = Number.parseFloat(productInfo.product_length || "");
-        const thicknessValue = Number.parseFloat(productThickness(productInfo));
-        const heightValue = Number.parseFloat(productInfo.product_height || "");
-        const dimensionLabel = (value: number) => Number.isFinite(value) ? `${Math.round(value)}mm` : "--mm";
+        const lengthLabel = dimensionMmLabel(productInfo.product_length);
+        const thicknessLabel = dimensionMmLabel(productThickness(productInfo));
+        const heightLabel = dimensionMmLabel(productInfo.product_height);
         context.save();
         context.strokeStyle = lineColor;
         context.fillStyle = "#555";
@@ -2172,18 +2312,18 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
           context.lineTo(end.x * scaleX, end.y * scaleY);
         });
         context.stroke();
-        context.fillText(dimensionLabel(lengthValue), (lengthRuler.start.x + lengthRuler.end.x) / 2, lengthRuler.start.y + 36 * scaleY);
+        context.fillText(lengthLabel, (lengthRuler.start.x + lengthRuler.end.x) / 2, lengthRuler.start.y + 36 * scaleY);
         context.font = `400 ${Math.max(12, Math.round(18 * Math.min(scaleX, scaleY)))}px ${ORGANIZER_CANVAS_FONT}`;
         context.save();
         context.translate(heightRuler.start.x - 31 * scaleX, (heightRuler.start.y + heightRuler.end.y) / 2 - 7 * scaleY);
         context.rotate(-Math.PI / 2);
-        context.fillText(dimensionLabel(heightValue), 0, 0);
+        context.fillText(heightLabel, 0, 0);
         context.restore();
         context.save();
         context.translate(widthRuler.text.x * scaleX, widthRuler.text.y * scaleY);
         context.rotate(-26 * Math.PI / 180);
         context.textBaseline = "middle";
-        context.fillText(dimensionLabel(thicknessValue), 0, 0);
+        context.fillText(thicknessLabel, 0, 0);
         context.restore();
         context.restore();
       }
@@ -2250,6 +2390,7 @@ function slotPreviewSignature(
     product_height: productInfo.product_height || ""
   };
   return JSON.stringify({
+    renderVersion: ORGANIZER_RENDER_STATE_VERSION,
     platform,
     targetFolder,
     slot,
@@ -2260,17 +2401,22 @@ function slotPreviewSignature(
 }
 
 function jdComparisonDimensionsReady(productInfo: Record<string, string>) {
-  const length = Number.parseFloat(productInfo.product_length || "");
-  const height = Number.parseFloat(productInfo.product_height || "");
-  return Number.isFinite(length) && length > 0 && Number.isFinite(height) && height > 0;
+  return positiveDimensionValue(productInfo.product_length) !== null
+    && positiveDimensionValue(productInfo.product_height) !== null;
 }
 
-function UploadSection({ title, hint, items, multiple = true, disabled = false, onUpload, onDelete, onPreview }: {
+function vipInfoDimensionsReady(productInfo: Record<string, string>) {
+  return jdComparisonDimensionsReady(productInfo)
+    && positiveDimensionValue(productThickness(productInfo)) !== null;
+}
+
+function UploadSection({ title, hint, items, multiple = true, disabled = false, deleteDisabled = false, onUpload, onDelete, onPreview }: {
   title: string;
   hint: string;
   items: UploadItem[];
   multiple?: boolean;
   disabled?: boolean;
+  deleteDisabled?: boolean;
   onUpload: (files: FileList | File[] | null, skipped?: number) => void;
   onDelete: (item: UploadItem) => void;
   onPreview: (url: string) => void;
@@ -2328,7 +2474,7 @@ function UploadSection({ title, hint, items, multiple = true, disabled = false, 
           <button
             className="organizer-thumb-delete"
             type="button"
-            disabled={disabled}
+            disabled={disabled || deleteDisabled}
             onClick={() => onDelete(item)}
             aria-label={`删除 ${item.file_name}`}
             title={`删除 ${item.file_name}`}
@@ -2382,18 +2528,11 @@ function SlotAdjustmentEditor({
 }) {
   const isInfoPage = platform === "vip" && slot.file_name === "401.jpg";
   const storedInitial = normalizeAdjustment(slot.adjustments?.[sourceIndex]);
-  const initial = isInfoPage && storedInitial.product_show_ruler !== false ? {
-    ...storedInitial,
-    product_ruler_base_left: undefined,
-    product_ruler_base_top: undefined,
-    product_ruler_base_right: undefined,
-    product_ruler_base_bottom: undefined,
-    product_ruler_group_scale: 1,
-    product_ruler_group_offset_x: 0,
-    product_ruler_group_offset_y: 0
-  } : storedInitial;
-  // Always rebuild 401 so its handle-aware product scale and ruler geometry
-  // match the live canvas and the final export.
+  // A saved 401 ruler baseline can intentionally differ from the product body
+  // after the product was moved independently. Preserve it when reopening the
+  // editor; clearing it here made the rulers snap back to the product.
+  const initial = storedInitial;
+  // Regenerate the exact 401 preview while keeping its saved adjustment state.
   const usableInitialPreview = isInfoPage ? "" : (initialPreview || "");
   const supportsLogoColor = platform === "jd" && /^[1-5]\.jpg$/.test(slot.file_name);
   const [draft, setDraft] = useState<ImageAdjustment>(initial);
@@ -2408,6 +2547,7 @@ function SlotAdjustmentEditor({
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [cropMode, setCropMode] = useState(false);
   const isPhoneComparison = platform === "jd" && slot.file_name === "5.jpg";
+  const requiresPreparedGeometry = isInfoPage || isPhoneComparison;
   const supportsJdFolderSync = platform === "jd" && previewFoldersForSlot(slot, platform).length > 1;
   const [syncJdFolders, setSyncJdFolders] = useState(false);
   const isPhoneObjectEditor = isPhoneComparison && initialMoveTarget === "phone";
@@ -2428,13 +2568,14 @@ function SlotAdjustmentEditor({
   const logoColorRef = useRef<LogoColor>(slot.logo_color === "white" ? "white" : "black");
   const renderedPreviewRef = useRef(usableInitialPreview);
   const draftVersionRef = useRef(0);
-  const syncedVersionRef = useRef(initialPreview ? 0 : -1);
+  const syncedVersionRef = useRef(usableInitialPreview ? 0 : -1);
   const previewRequestRef = useRef(0);
   const previewAbortRef = useRef<AbortController | null>(null);
   const previewTimerRef = useRef<number | null>(null);
   const moveTargetRef = useRef<AdjustmentTarget>("product");
   const linkedProductRulersRef = useRef(false);
   const defaultPhoneLinkAppliedRef = useRef(false);
+  const editorGeometryReady = !requiresPreparedGeometry || Boolean(editorLayerInfo);
 
   const activeMoveTarget: AdjustmentTarget = isInfoPage
     ? (infoMoveTarget === "product_rulers" ? "product" : infoMoveTarget)
@@ -2467,6 +2608,7 @@ function SlotAdjustmentEditor({
     current: ImageAdjustment,
     linked: boolean
   ): ImageAdjustment {
+    if (!editorLayerInfo) return current;
     const currentlyLinked = current.phone_show_ruler !== false;
     if (currentlyLinked === linked) return current;
     const productImage = livePreviewImage(sourceUrl);
@@ -2476,7 +2618,7 @@ function SlotAdjustmentEditor({
     }
 
     const output = slotCanvasSize(slot.size, platform, targetFolder);
-    const layer = liveJdProductLayer(sourceUrl, productImage, current);
+    const layer = organizerProductGeometryLayer(editorLayerInfo);
     const { geometry, baseGeometry } = jdComparisonProductGeometry(
       output,
       layer,
@@ -2524,9 +2666,18 @@ function SlotAdjustmentEditor({
     return {
       ...current,
       phone_show_ruler: linked,
-      phone_ruler_scale: desiredLength / nextBaseLength,
-      phone_ruler_offset_x: (desiredCenter.x - nextBaseCenter.x) / (output.width * 0.18),
-      phone_ruler_offset_y: (desiredCenter.y - nextBaseCenter.y) / (output.height * 0.18)
+      phone_ruler_scale: Math.max(
+        JD_DECORATION_SCALE_MIN,
+        Math.min(JD_DECORATION_SCALE_MAX, desiredLength / nextBaseLength)
+      ),
+      phone_ruler_offset_x: Math.max(
+        -JD_DECORATION_OFFSET_MAX,
+        Math.min(JD_DECORATION_OFFSET_MAX, (desiredCenter.x - nextBaseCenter.x) / (output.width * 0.18))
+      ),
+      phone_ruler_offset_y: Math.max(
+        -JD_DECORATION_OFFSET_MAX,
+        Math.min(JD_DECORATION_OFFSET_MAX, (desiredCenter.y - nextBaseCenter.y) / (output.height * 0.18))
+      )
     };
   }
 
@@ -2534,6 +2685,7 @@ function SlotAdjustmentEditor({
     current: ImageAdjustment,
     linked: boolean
   ): ImageAdjustment {
+    if (!editorLayerInfo) return current;
     const currentlyLinked = current.phone_label_linked !== false;
     if (currentlyLinked === linked) return current;
     const productImage = livePreviewImage(sourceUrl);
@@ -2543,7 +2695,7 @@ function SlotAdjustmentEditor({
     }
 
     const output = slotCanvasSize(slot.size, platform, targetFolder);
-    const layer = liveJdProductLayer(sourceUrl, productImage, current);
+    const layer = organizerProductGeometryLayer(editorLayerInfo);
     const { geometry, baseGeometry } = jdComparisonProductGeometry(
       output,
       layer,
@@ -2567,13 +2719,29 @@ function SlotAdjustmentEditor({
     const desiredY = previousBox.top + previousBox.height
       + jdPhoneLabelGap(output, previousBox.height)
       + (current.phone_label_offset_y || 0) * output.height * 0.18;
+    const desiredFontSize = jdPhoneLabelFontSize(
+      output,
+      previousBox.height,
+      current.phone_label_scale || 1
+    );
+    const nextBaseFontSize = jdPhoneLabelFontSize(output, nextBox.height, 1);
     const nextBaseX = nextBox.left + nextBox.width / 2;
     const nextBaseY = nextBox.top + nextBox.height + jdPhoneLabelGap(output, nextBox.height);
     return {
       ...current,
       phone_label_linked: linked,
-      phone_label_offset_x: (desiredX - nextBaseX) / (output.width * 0.18),
-      phone_label_offset_y: (desiredY - nextBaseY) / (output.height * 0.18)
+      phone_label_scale: Math.max(
+        JD_DECORATION_SCALE_MIN,
+        Math.min(JD_DECORATION_SCALE_MAX, desiredFontSize / Math.max(1, nextBaseFontSize))
+      ),
+      phone_label_offset_x: Math.max(
+        -JD_DECORATION_OFFSET_MAX,
+        Math.min(JD_DECORATION_OFFSET_MAX, (desiredX - nextBaseX) / (output.width * 0.18))
+      ),
+      phone_label_offset_y: Math.max(
+        -JD_DECORATION_OFFSET_MAX,
+        Math.min(JD_DECORATION_OFFSET_MAX, (desiredY - nextBaseY) / (output.height * 0.18))
+      )
     };
   }
 
@@ -2583,6 +2751,11 @@ function SlotAdjustmentEditor({
     const phoneReference = livePreviewImage("/organizer-assets/iphone_reference.png");
     const applyDefaultPhoneLink = () => {
       if (defaultPhoneLinkAppliedRef.current) return;
+      // JD 5 uses the prepared organizer layer for its exact geometry. Do not
+      // establish the initial "全部" link against the browser cutout before
+      // that layer arrives, otherwise the first exact frame can move the
+      // ruler/label by a few pixels.
+      if (!editorLayerInfo) return;
       if (!productImage.complete || !productImage.naturalWidth) return;
       if (!phoneReference.complete || !phoneReference.naturalWidth) return;
       defaultPhoneLinkAppliedRef.current = true;
@@ -2598,7 +2771,7 @@ function SlotAdjustmentEditor({
       productImage.removeEventListener("load", applyDefaultPhoneLink);
       phoneReference.removeEventListener("load", applyDefaultPhoneLink);
     };
-  }, [isPhoneObjectEditor, sourceUrl]);
+  }, [editorLayerInfo, isPhoneObjectEditor, sourceUrl]);
 
   function productRulerBodyForDraft(nextDraft: ImageAdjustment): PixelBounds | null {
     if (!isInfoPage && !isPhoneComparison) return null;
@@ -2613,14 +2786,11 @@ function SlotAdjustmentEditor({
           editorLayerInfo.handle_lift
         );
       }
-      const sourceImage = sourceImageRef.current;
-      return sourceImage?.naturalWidth
-        ? liveInfoProductBody(sourceUrl, sourceImage, nextDraft)
-        : null;
+      return null;
     }
-    if (!sourceImageRef.current?.naturalWidth) return null;
+    if (!editorLayerInfo) return null;
     const output = slotCanvasSize(slot.size, platform, targetFolder);
-    const layer = liveJdProductLayer(sourceUrl, sourceImageRef.current, nextDraft);
+    const layer = organizerProductGeometryLayer(editorLayerInfo);
     if (isPhoneComparison) {
       const { geometry } = jdComparisonProductGeometry(output, layer, nextDraft, productInfo);
       return geometry.body;
@@ -2729,6 +2899,7 @@ function SlotAdjustmentEditor({
     syncProductRulerBody = linkedProductRulersRef.current,
     requestExactPreview = true
   ) {
+    if (!editorGeometryReady) return;
     const preparedDraft = syncProductRulerBody
       ? withSyncedProductRulerBody(nextDraft)
       : nextDraft;
@@ -2744,6 +2915,7 @@ function SlotAdjustmentEditor({
   }
 
   function setProductRulerLinkMode(linked: boolean) {
+    if (!editorGeometryReady) return;
     const previous = draftRef.current;
     const current = withInfoRulerBaseline(previous);
     if (current === previous && (current.product_show_ruler !== false) === linked) return;
@@ -2767,6 +2939,7 @@ function SlotAdjustmentEditor({
   }
 
   function changePhoneAlignment(nextAlignment: "center" | "bottom") {
+    if (!editorGeometryReady) return;
     if (draftRef.current.phone_alignment === nextAlignment) return;
     cancelStalePreview();
     const nextDraft = { ...draftRef.current, phone_alignment: nextAlignment };
@@ -2843,16 +3016,20 @@ function SlotAdjustmentEditor({
     if (!stage) return;
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
+      if (!editorGeometryReady) return;
       const delta = event.deltaY < 0 ? 0.02 : -0.02;
       const current = draftRef.current;
       const target = moveTargetRef.current;
-      const maximum = target === "product" ? 4 : target === "phone" ? JD_PHONE_SCALE_MAX : 2;
-      const nextScale = Math.max(0.5, Math.min(maximum, Math.round((targetScale(current, target) + delta) * 100) / 100));
+      const limits = targetScaleLimits(target);
+      const nextScale = Math.max(
+        limits.minimum,
+        Math.min(limits.maximum, Math.round((targetScale(current, target) + delta) * 100) / 100)
+      );
       applyDraft(updateTargetScale(current, target, nextScale));
     };
     stage.addEventListener("wheel", handleWheel, { passive: false });
     return () => stage.removeEventListener("wheel", handleWheel);
-  }, [isPhoneComparison]);
+  }, [editorGeometryReady, isPhoneComparison]);
 
   function displayedImageRect() {
     const stage = sourceStageRef.current;
@@ -2901,22 +3078,26 @@ function SlotAdjustmentEditor({
   }
 
   function cropAdjustment(selection: CropSelection, imageRect: CropSelection) {
+    const current = linkedProductRulersRef.current
+      ? draftRef.current
+      : withInfoRulerBaseline(draftRef.current);
     const nextDraft: ImageAdjustment = {
-      ...draftRef.current,
+      ...current,
       crop_x: (selection.left - imageRect.left) / imageRect.width,
       crop_y: (selection.top - imageRect.top) / imageRect.height,
       crop_width: selection.width / imageRect.width,
       crop_height: selection.height / imageRect.height,
       zoom: 1,
       offset_x: 0,
-      offset_y: 0,
-      product_ruler_base_left: undefined,
-      product_ruler_base_top: undefined,
-      product_ruler_base_right: undefined,
-      product_ruler_base_bottom: undefined
+      offset_y: 0
     };
     return linkedProductRulersRef.current ? {
       ...nextDraft,
+      product_ruler_base_left: undefined,
+      product_ruler_base_top: undefined,
+      product_ruler_base_right: undefined,
+      product_ruler_base_bottom: undefined,
+      product_ruler_gap_scale: 1,
       product_ruler_group_scale: 1,
       product_ruler_group_offset_x: 0,
       product_ruler_group_offset_y: 0
@@ -2928,7 +3109,9 @@ function SlotAdjustmentEditor({
     const imageRect = displayedImageRect();
     cropStartRef.current = null;
     if (!selection || !imageRect || selection.width < 8 || selection.height < 8) return;
-    applyDraft(cropAdjustment(selection, imageRect));
+    // Linked rulers rebuild from the prepared post-crop product body; detached
+    // rulers keep their saved baseline exactly where the designer left it.
+    applyDraft(cropAdjustment(selection, imageRect), false);
     setCropMode(false);
     cropSelectionRef.current = null;
     setCropSelection(null);
@@ -2959,14 +3142,17 @@ function SlotAdjustmentEditor({
       const selection = fitCropSelectionToTemplate(previousSelection, imageRect, cropAspectRatio());
       cropSelectionRef.current = selection;
       setCropSelection(selection);
-      applyDraft(cropAdjustment(selection, imageRect));
+      applyDraft(cropAdjustment(selection, imageRect), false);
     });
   }
 
   function changeZoom(delta: number) {
     const current = draftRef.current;
-    const maximum = activeMoveTarget === "product" ? 4 : activeMoveTarget === "phone" ? JD_PHONE_SCALE_MAX : 2;
-    const nextScale = Math.max(0.5, Math.min(maximum, Math.round((targetScale(current, activeMoveTarget) + delta) * 100) / 100));
+    const limits = targetScaleLimits(activeMoveTarget);
+    const nextScale = Math.max(
+      limits.minimum,
+      Math.min(limits.maximum, Math.round((targetScale(current, activeMoveTarget) + delta) * 100) / 100)
+    );
     applyDraft(updateTargetScale(current, activeMoveTarget, nextScale));
   }
 
@@ -2983,7 +3169,10 @@ function SlotAdjustmentEditor({
         crop_x: DEFAULT_ADJUSTMENT.crop_x,
         crop_y: DEFAULT_ADJUSTMENT.crop_y,
         crop_width: DEFAULT_ADJUSTMENT.crop_width,
-        crop_height: DEFAULT_ADJUSTMENT.crop_height,
+        crop_height: DEFAULT_ADJUSTMENT.crop_height
+    });
+    const clearProductRulerBaseline = (current: ImageAdjustment) => ({
+        ...current,
         product_ruler_base_left: undefined,
         product_ruler_base_top: undefined,
         product_ruler_base_right: undefined,
@@ -3010,12 +3199,12 @@ function SlotAdjustmentEditor({
     if (isInfoPage) {
       if (infoMoveTarget === "product_rulers") {
         next = resetProductRulers({
-          ...resetProduct(next),
+          ...clearProductRulerBaseline(resetProduct(next)),
           product_show_ruler: true
         });
       } else if (infoMoveTarget === "product") {
         next = {
-          ...resetProduct(next),
+          ...resetProduct(withInfoRulerBaseline(next)),
           product_show_ruler: false
         };
       } else {
@@ -3025,11 +3214,14 @@ function SlotAdjustmentEditor({
       applyDraft(next, false);
     } else if (isPhoneComparison) {
       if (activeMoveTarget === "product") {
+        const productState = linkedProductRulersRef.current ? next : withInfoRulerBaseline(next);
         next = {
-          ...resetProduct(next),
+          ...resetProduct(productState),
           product_show_ruler: next.product_show_ruler
         };
-        if (linkedProductRulersRef.current) next = resetProductRulers(next);
+        if (linkedProductRulersRef.current) {
+          next = resetProductRulers(clearProductRulerBaseline(next));
+        }
       } else if (activeMoveTarget === "phone") {
         const phoneRulerLinked = next.phone_show_ruler !== false;
         const phoneLabelLinked = next.phone_label_linked !== false;
@@ -3078,12 +3270,17 @@ function SlotAdjustmentEditor({
   }
 
   function finishMove() {
+    if (!editorGeometryReady) return;
     flushPendingMove(false);
     moveStartRef.current = null;
     scheduleExactPreview(draftRef.current, draftVersionRef.current);
   }
 
   async function saveAdjustment() {
+    if (!editorGeometryReady) {
+      setError("正在读取商品精确几何，请稍后再保存");
+      return;
+    }
     flushPendingMove();
     const currentDraft = draftRef.current;
     let previewUrl = renderedPreviewRef.current;
@@ -3132,7 +3329,7 @@ function SlotAdjustmentEditor({
               />
               <span>同步 800/750</span>
             </label>}
-            <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
+            <button type="button" className="primary" disabled={busy || !editorGeometryReady} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="不保存并退出" title="不保存并退出"><X size={20} /></button>
         </div>}
@@ -3178,8 +3375,9 @@ function SlotAdjustmentEditor({
             </div>
             <div
               ref={resultStageRef}
-              className={`slot-result-stage${busy ? " is-loading" : ""}`}
+              className={`slot-result-stage${busy || !editorGeometryReady ? " is-loading" : ""}`}
               onPointerDown={(event) => {
+                if (!editorGeometryReady) return;
                 cancelStalePreview();
                 setHoldExactPreview(false);
                 setPreviewSynced(false);
@@ -3208,12 +3406,13 @@ function SlotAdjustmentEditor({
                 const canvasDeltaY = (event.clientY - start.y) * output.height / Math.max(1, bounds.height) * dragSensitivity;
                 const rawOffsetX = start.offsetX + canvasDeltaX / basis.x;
                 const rawOffsetY = start.offsetY + canvasDeltaY / basis.y;
-                const nextOffsetX = Math.max(-1.5, Math.min(1.5,
+                const offsetLimit = targetOffsetLimit(start.target);
+                const nextOffsetX = Math.max(-offsetLimit, Math.min(offsetLimit,
                   slot.kind === "model"
                     ? modelDragOffsetWithBoundaryResistance(start.offsetX, rawOffsetX - start.offsetX)
                     : rawOffsetX
                 ));
-                const nextOffsetY = Math.max(-1.5, Math.min(1.5,
+                const nextOffsetY = Math.max(-offsetLimit, Math.min(offsetLimit,
                   slot.kind === "model"
                     ? modelDragOffsetWithBoundaryResistance(start.offsetY, rawOffsetY - start.offsetY)
                     : rawOffsetY
@@ -3269,7 +3468,17 @@ function SlotAdjustmentEditor({
         </div>
 
         <div className="slot-adjustment-controls">
-          {(isPhoneComparison || isInfoPage) && <div className="slot-phone-controls" role="group" aria-label={isInfoPage ? "产品信息图调整" : "手机对比调整"}>
+          {(isPhoneComparison || isInfoPage) && <div
+            className="slot-phone-controls"
+            role="group"
+            aria-disabled={!editorGeometryReady}
+            aria-label={isInfoPage ? "产品信息图调整" : "手机对比调整"}
+            onClickCapture={(event) => {
+              if (editorGeometryReady) return;
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+          >
             <span>调整对象</span>
             {isPhoneObjectEditor ? <>
               <button type="button" className={moveTarget === "phone" && draft.phone_show_ruler !== false && draft.phone_label_linked !== false ? "active-tool" : ""} onClick={() => {
@@ -3363,20 +3572,20 @@ function SlotAdjustmentEditor({
               }}>高标线</button>
             </>}
           </div>}
-          {activeMoveTarget === "product" && <button type="button" className={cropMode ? "active-tool" : ""} onClick={toggleCropMode}><Crop size={18} />裁剪</button>}
-          <button type="button" onClick={() => changeZoom(-0.05)}><ZoomOut size={18} />缩小</button>
+          {activeMoveTarget === "product" && <button type="button" disabled={!editorGeometryReady} className={cropMode ? "active-tool" : ""} onClick={toggleCropMode}><Crop size={18} />裁剪</button>}
+          <button type="button" disabled={!editorGeometryReady} onClick={() => changeZoom(-0.05)}><ZoomOut size={18} />缩小</button>
           <span className="slot-zoom-value">{Math.round(targetScale(draft, activeMoveTarget) * 100)}%</span>
-          <button type="button" onClick={() => changeZoom(0.05)}><ZoomIn size={18} />放大</button>
+          <button type="button" disabled={!editorGeometryReady} onClick={() => changeZoom(0.05)}><ZoomIn size={18} />放大</button>
           {supportsLogoColor && <div className="slot-logo-color" role="group" aria-label="左上角 Logo 颜色">
             <span>Logo</span>
-            <button type="button" className={logoColor === "black" ? "active-tool" : ""} onClick={() => changeLogoColor("black")}>
+            <button type="button" disabled={!editorGeometryReady} className={logoColor === "black" ? "active-tool" : ""} onClick={() => changeLogoColor("black")}>
               <i className="logo-color-swatch black" />黑色
             </button>
-            <button type="button" className={logoColor === "white" ? "active-tool" : ""} onClick={() => changeLogoColor("white")}>
+            <button type="button" disabled={!editorGeometryReady} className={logoColor === "white" ? "active-tool" : ""} onClick={() => changeLogoColor("white")}>
               <i className="logo-color-swatch white" />白色
             </button>
           </div>}
-          <button type="button" onClick={reset}><RotateCcw size={18} />恢复自动</button>
+          <button type="button" disabled={!editorGeometryReady} onClick={reset}><RotateCcw size={18} />恢复自动</button>
           <span className="slot-drag-hint"><Move size={16} />位置 {
             Math.round(targetOffset(draft, activeMoveTarget).x * 100)
           } / {
@@ -3395,7 +3604,7 @@ function SlotAdjustmentEditor({
               />
               <span>同步 800/750</span>
             </label>}
-            <button type="button" className="primary" disabled={busy} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : "保存并退出"}</button>
+            <button type="button" className="primary" disabled={busy || !editorGeometryReady} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : !editorGeometryReady ? "正在读取精确几何" : "保存并退出"}</button>
           </div>
         </div>
         {error && <div className="alert warning">{error}</div>}
@@ -3559,10 +3768,13 @@ function ZoomableImagePreview({ url, onClose }: { url: string; onClose: () => vo
 
 export default function VipOrganizer({ active, initialProductFile, onInitialProductFileConsumed }: VipOrganizerProps) {
   const sessionStorageKey = "vip-organizer-session-id";
+  const sessionSnapshotStorageKey = "vip-organizer-session-snapshot-v1";
   const [sessionId, setSessionId] = useState("");
   const sessionIdRef = useRef("");
   const sessionPromiseRef = useRef<Promise<{ session_id: string }> | null>(null);
   const pendingUploadsRef = useRef(0);
+  const uploadingKindsRef = useRef<Set<"product" | "model" | "tag">>(new Set());
+  const completedUploadKindsRef = useRef<Set<"product" | "model" | "tag">>(new Set());
   const [products, setProducts] = useState<UploadItem[]>([]);
   const [models, setModels] = useState<UploadItem[]>([]);
   const [tags, setTags] = useState<UploadItem[]>([]);
@@ -3580,6 +3792,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   const [analysisConfigs, setAnalysisConfigs] = useState<any[]>([]);
   const [analysisConfigId, setAnalysisConfigId] = useState<number | "">("");
   const [busy, setBusy] = useState(false);
+  const [uploadingKinds, setUploadingKinds] = useState<Set<"product" | "model" | "tag">>(() => new Set());
+  const uploadsBusy = uploadingKinds.size > 0;
+  const uiBusy = busy || uploadsBusy;
   const [message, setMessage] = useState("");
   const [slotPreviews, setSlotPreviews] = useState<Record<string, string>>({});
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -3594,13 +3809,21 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   } | null>(null);
   const previewRequestRef = useRef(0);
   const previewAbortRef = useRef<AbortController | null>(null);
+  const analyzeGenerationRef = useRef(0);
+  const analyzeAbortRef = useRef<AbortController | null>(null);
   const slotPreviewSignaturesRef = useRef<Record<string, string>>({});
   const platformWorkspaceRef = useRef<Partial<Record<OrganizerPlatform, {
     slots: Slot[];
     previews: Record<string, string>;
     signatures: Record<string, string>;
   }>>>({});
+  // Keep source choices independently from disposable preview caches. A JD
+  // preview invalidation (for example after dimensions change) must not erase
+  // a designer-confirmed 5.jpg source before the background rebuild finishes.
+  const platformSlotHistoryRef = useRef<Partial<Record<OrganizerPlatform, Slot[]>>>({});
   const jdBackgroundPreparedRef = useRef(false);
+  const jdBackgroundGenerationRef = useRef(0);
+  const jdDimensionSignatureRef = useRef("");
   const reanalyzeTimerRef = useRef<number | null>(null);
   const assetRolesRef = useRef<Record<number, string>>({});
   const assetTagsRef = useRef<Record<number, string[]>>({});
@@ -3617,6 +3840,15 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   });
 
   const allAssets = useMemo(() => [...(assets.product || []), ...(assets.model || []), ...(assets.tag || [])], [assets]);
+  const jdBackgroundInputSignature = useMemo(() => JSON.stringify({
+    products: products.map((item) => item.image_id),
+    models: models.map((item) => item.image_id),
+    tags: tags.map((item) => item.image_id),
+    roles: assetRoles,
+    assetTags,
+    dimensions: [info.product_length.trim(), info.product_height.trim()]
+  }), [products, models, tags, assetRoles, assetTags, info.product_length, info.product_height]);
+  const hasOrganizerSlots = slots.length > 0;
 
   useEffect(() => {
     if (active) void api.prewarmHeavyTask("organizer").catch(() => undefined);
@@ -3625,7 +3857,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   useEffect(() => {
     if (!active) return;
     const pasteTagScreenshot = (event: globalThis.ClipboardEvent) => {
-      if (busy || !event.clipboardData) return;
+      if (busy || uploadsBusy || !event.clipboardData) return;
       const images = Array.from(event.clipboardData.items).flatMap((item, index) => {
         if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
         const blob = item.getAsFile();
@@ -3639,7 +3871,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     };
     window.addEventListener("paste", pasteTagScreenshot);
     return () => window.removeEventListener("paste", pasteTagScreenshot);
-  }, [active, busy]);
+  }, [active, busy, uploadsBusy]);
 
   useEffect(() => {
     if (!initialProductFile) return;
@@ -3659,6 +3891,176 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     return { ...info, dimensions: dimensions ? `${dimensions} mm` : "" };
   }
 
+  function invalidatePlatformWorkspaces() {
+    // Rendered workspaces are disposable; platformSlotHistoryRef intentionally
+    // survives so designer-confirmed source choices remain authoritative.
+    platformWorkspaceRef.current = {};
+    jdBackgroundGenerationRef.current += 1;
+    jdBackgroundPreparedRef.current = false;
+  }
+
+  function saveSessionSnapshot() {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) return;
+    const snapshot = {
+      version: ORGANIZER_SESSION_SNAPSHOT_VERSION,
+      render_version: ORGANIZER_RENDER_STATE_VERSION,
+      session_id: currentSessionId,
+      products: productsRef.current,
+      models: modelsRef.current,
+      tags: tagsRef.current,
+      slots: slotsRef.current,
+      platform,
+      assets,
+      asset_roles: assetRolesRef.current,
+      asset_tags: assetTagsRef.current,
+      manual_asset_ids: Array.from(manualAssetIds),
+      api_role_notes: apiRoleNotes,
+      slot_previews: slotPreviews,
+      slot_preview_signatures: slotPreviewSignaturesRef.current,
+      platform_workspaces: platformWorkspaceRef.current,
+      platform_slot_history: platformSlotHistoryRef.current,
+      info
+    };
+    try {
+      window.sessionStorage.setItem(sessionSnapshotStorageKey, JSON.stringify(snapshot, (_key, value) => {
+        if (typeof File !== "undefined" && value instanceof File) return undefined;
+        if (typeof Blob !== "undefined" && value instanceof Blob) return undefined;
+        if (typeof value === "string" && (/^data:image\//i.test(value) || value.startsWith("blob:"))) return undefined;
+        return value;
+      }));
+    } catch {
+      // The ID remains resumable even if the browser refuses a large snapshot.
+    }
+  }
+
+  function restoreSessionSnapshot(
+    nextSessionId: string,
+    resumedAssets: Record<string, UploadItem[]>
+  ) {
+    clearLivePreviewCaches();
+    sessionIdRef.current = nextSessionId;
+    window.sessionStorage.setItem(sessionStorageKey, nextSessionId);
+    let snapshot: any = null;
+    try {
+      const raw = window.sessionStorage.getItem(sessionSnapshotStorageKey);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (
+        parsed?.version === ORGANIZER_SESSION_SNAPSHOT_VERSION
+        && parsed.render_version === ORGANIZER_RENDER_STATE_VERSION
+        && parsed.session_id === nextSessionId
+      ) snapshot = parsed;
+    } catch {
+      snapshot = null;
+    }
+
+    setSessionId(nextSessionId);
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    analyzeGenerationRef.current += 1;
+    setAdjustmentEditor(null);
+    const snapshotMatchesServerAssets = snapshot && (["product", "model", "tag"] as const).every((kind) => {
+      const snapshotItems = Array.isArray(snapshot[kind]) ? snapshot[kind] : [];
+      const serverItems = Array.isArray(resumedAssets[kind]) ? resumedAssets[kind] : [];
+      const snapshotIds = snapshotItems
+        .map((item: any) => Number(item?.image_id))
+        .filter((imageId: number) => Number.isInteger(imageId))
+        .sort((left: number, right: number) => left - right);
+      const serverIds = serverItems
+        .map((item) => Number(item.image_id))
+        .filter((imageId) => Number.isInteger(imageId))
+        .sort((left, right) => left - right);
+      return snapshotIds.length === serverIds.length
+        && snapshotIds.every((imageId: number, index: number) => imageId === serverIds[index]);
+    });
+    if (snapshotMatchesServerAssets) {
+      const restoredProducts = Array.isArray(snapshot.products) ? snapshot.products : [];
+      const restoredModels = Array.isArray(snapshot.models) ? snapshot.models : [];
+      const restoredTags = Array.isArray(snapshot.tags) ? snapshot.tags : [];
+      const restoredSlots = Array.isArray(snapshot.slots) ? snapshot.slots : [];
+      const restoredRoles = snapshot.asset_roles || {};
+      const restoredTagsByAsset = snapshot.asset_tags || {};
+      productsRef.current = restoredProducts;
+      modelsRef.current = restoredModels;
+      tagsRef.current = restoredTags;
+      slotsRef.current = restoredSlots;
+      assetRolesRef.current = restoredRoles;
+      assetTagsRef.current = restoredTagsByAsset;
+      setProducts(restoredProducts);
+      setModels(restoredModels);
+      setTags(restoredTags);
+      setSlots(restoredSlots);
+      setPlatform(snapshot.platform === "jd" ? "jd" : "vip");
+      setAssets(snapshot.assets || { product: [], model: [], tag: [] });
+      setAssetRoles(restoredRoles);
+      setAssetTags(restoredTagsByAsset);
+      setManualAssetIds(new Set(Array.isArray(snapshot.manual_asset_ids) ? snapshot.manual_asset_ids : []));
+      setApiRoleNotes(snapshot.api_role_notes || {});
+      setSlotPreviews(snapshot.slot_previews || {});
+      slotPreviewSignaturesRef.current = snapshot.slot_preview_signatures || {};
+      platformWorkspaceRef.current = snapshot.platform_workspaces || {};
+      platformSlotHistoryRef.current = snapshot.platform_slot_history || {};
+      if (snapshot.info && typeof snapshot.info === "object") setInfo(snapshot.info);
+      jdBackgroundPreparedRef.current = Boolean(platformWorkspaceRef.current.jd);
+      jdBackgroundGenerationRef.current += 1;
+      return;
+    }
+
+    // Upload/delete can complete immediately before a browser crash, leaving
+    // sessionStorage one write behind the server. Never restore slots,
+    // adjustments or preview URLs against a different authoritative asset
+    // set; preserve only the text fields and rebuild from the server rows.
+    if (snapshot?.info && typeof snapshot.info === "object") setInfo(snapshot.info);
+
+    const restoredProducts = resumedAssets.product || [];
+    const restoredModels = resumedAssets.model || [];
+    const restoredTags = resumedAssets.tag || [];
+    productsRef.current = restoredProducts;
+    modelsRef.current = restoredModels;
+    tagsRef.current = restoredTags;
+    slotsRef.current = [];
+    setProducts(restoredProducts);
+    setModels(restoredModels);
+    setTags(restoredTags);
+    setSlots([]);
+    setAssets(Object.fromEntries(Object.entries(resumedAssets).map(([kind, rows]) => [
+      kind,
+      rows.map((item) => ({ ...item, id: item.image_id }))
+    ])));
+    setAssetRoles({});
+    setAssetTags({});
+    setManualAssetIds(new Set());
+    assetRolesRef.current = {};
+    assetTagsRef.current = {};
+    setApiRoleNotes({});
+    setSlotPreviews({});
+    slotPreviewSignaturesRef.current = {};
+    platformWorkspaceRef.current = {};
+    platformSlotHistoryRef.current = {};
+    jdBackgroundPreparedRef.current = false;
+    jdBackgroundGenerationRef.current += 1;
+    if (restoredProducts.length) {
+      void analyze(undefined, "vip", undefined, {
+        products: restoredProducts,
+        models: restoredModels,
+        tags: restoredTags
+      }, undefined, true, true);
+    }
+  }
+
+  useEffect(() => {
+    const signature = JSON.stringify([info.product_length.trim(), info.product_height.trim()]);
+    if (!jdDimensionSignatureRef.current) {
+      jdDimensionSignatureRef.current = signature;
+      return;
+    }
+    if (jdDimensionSignatureRef.current === signature) return;
+    jdDimensionSignatureRef.current = signature;
+    jdBackgroundGenerationRef.current += 1;
+    jdBackgroundPreparedRef.current = false;
+    delete platformWorkspaceRef.current.jd;
+  }, [info.product_length, info.product_height]);
+
   useEffect(() => {
     if (platformSwitching || platformRegenerating) return;
     if (!sessionId || !slots.length) {
@@ -3668,10 +4070,11 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     }
     const productInfo = organizerProductInfo();
     const jdSizeReady = jdComparisonDimensionsReady(productInfo);
+    const vipInfoReady = vipInfoDimensionsReady(productInfo);
     const previewTargets = slots.flatMap((slot) => {
       if (!slot.image_ids[0] || (slot.file_name === "606.jpg" && slot.image_ids.length < 4)) return [];
       if (platform === "jd" && slot.file_name === "5.jpg" && !jdSizeReady) return [];
-      if (platform === "vip" && slot.file_name === "401.jpg" && !jdSizeReady) return [];
+      if (platform === "vip" && slot.file_name === "401.jpg" && !vipInfoReady) return [];
       return previewFoldersForSlot(slot, platform).map((targetFolder) => ({
         slot,
         targetFolder,
@@ -3809,15 +4212,33 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       platform !== "vip"
       || platformSwitching
       || platformRegenerating
-      || previewBusy
       || !sessionId
-      || !slots.length
-      || !Object.keys(slotPreviews).length
+      || !hasOrganizerSlots
       || !productsRef.current.length
       || jdBackgroundPreparedRef.current
       || platformWorkspaceRef.current.jd
     ) return;
     jdBackgroundPreparedRef.current = true;
+    const generation = ++jdBackgroundGenerationRef.current;
+    const sessionAtStart = sessionId;
+    const backgroundInputSignature = () => JSON.stringify({
+      products: productsRef.current.map((item) => item.image_id),
+      models: modelsRef.current.map((item) => item.image_id),
+      tags: tagsRef.current.map((item) => item.image_id),
+      roles: assetRolesRef.current,
+      assetTags: assetTagsRef.current,
+      dimensions: (() => {
+        try {
+          return JSON.parse(jdDimensionSignatureRef.current || '["",""]');
+        } catch {
+          return ["", ""];
+        }
+      })()
+    });
+    const inputsAtStart = jdBackgroundInputSignature;
+    const isCurrentGeneration = () => generation === jdBackgroundGenerationRef.current
+      && sessionIdRef.current === sessionAtStart
+      && backgroundInputSignature() === inputsAtStart;
     const timer = window.setTimeout(async () => {
       try {
         const productInfo = organizerProductInfo();
@@ -3830,7 +4251,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           asset_tags: assetTagsRef.current,
           platform: "jd"
         });
-        const backgroundSlots = result.slots.filter((slot: Slot) => (
+        if (!isCurrentGeneration()) return;
+        const mergedBackgroundSlots = mergeAnalyzedSlots(
+          platformSlotHistoryRef.current.jd || [],
+          result.slots as Slot[]
+        );
+        const backgroundSlots = mergedBackgroundSlots.filter((slot: Slot) => (
           slot.file_name !== "5.jpg" || jdComparisonDimensionsReady(productInfo)
         ));
         const folderResults = await Promise.allSettled((["800", "750"] as PreviewFolder[]).map(async (targetFolder) => {
@@ -3850,6 +4276,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         const entries = folderResults
           .filter((item): item is PromiseFulfilledResult<(readonly [string, string])[]> => item.status === "fulfilled")
           .flatMap((item) => item.value);
+        if (!isCurrentGeneration()) return;
         const signatures = Object.fromEntries(backgroundSlots.flatMap((slot: Slot) =>
           previewFoldersForSlot(slot, "jd").map((targetFolder) => [
             slotPreviewKey("jd", slot.file_name, targetFolder),
@@ -3862,16 +4289,49 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           ])
         ));
         platformWorkspaceRef.current.jd = {
-          slots: result.slots,
+          slots: mergedBackgroundSlots,
           previews: Object.fromEntries(entries),
           signatures
         };
+        platformSlotHistoryRef.current.jd = mergedBackgroundSlots;
+        saveSessionSnapshot();
       } catch {
-        jdBackgroundPreparedRef.current = false;
+        if (isCurrentGeneration()) jdBackgroundPreparedRef.current = false;
       }
     }, 450);
-    return () => window.clearTimeout(timer);
-  }, [platform, platformSwitching, platformRegenerating, previewBusy, sessionId, slots, slotPreviews, info]);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    platform,
+    platformSwitching,
+    platformRegenerating,
+    sessionId,
+    hasOrganizerSlots,
+    jdBackgroundInputSignature
+  ]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    saveSessionSnapshot();
+    const persistBeforePageHide = () => saveSessionSnapshot();
+    window.addEventListener("pagehide", persistBeforePageHide);
+    return () => window.removeEventListener("pagehide", persistBeforePageHide);
+  }, [
+    sessionId,
+    products,
+    models,
+    tags,
+    slots,
+    platform,
+    assets,
+    assetRoles,
+    assetTags,
+    manualAssetIds,
+    apiRoleNotes,
+    slotPreviews,
+    info
+  ]);
 
   useEffect(() => {
     api.getApiConfigs("text_analysis")
@@ -3887,11 +4347,29 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   useEffect(() => {
     let active = true;
     const previousSessionId = window.sessionStorage.getItem(sessionStorageKey) || undefined;
-    const initialSession = api.startVipOrganizerSession(previousSessionId);
+    let resumed = false;
+    const initialSession = previousSessionId
+      ? api.resumeVipOrganizerSession(previousSessionId)
+        .then((session) => {
+          resumed = true;
+          return session;
+        })
+        .catch(() => {
+          window.sessionStorage.removeItem(sessionStorageKey);
+          window.sessionStorage.removeItem(sessionSnapshotStorageKey);
+          return api.startVipOrganizerSession();
+        })
+      : api.startVipOrganizerSession();
     sessionPromiseRef.current = initialSession;
     initialSession.then(
       (session) => {
-        if (active) applyNewSession(session.session_id);
+        if (!active) return;
+        if (resumed) {
+          const resumedAssets = (session as { assets?: Record<string, UploadItem[]> }).assets;
+          restoreSessionSnapshot(session.session_id, resumedAssets || { product: [], model: [], tag: [] });
+        } else {
+          applyNewSession(session.session_id);
+        }
       },
       (error: any) => {
         if (active) setMessage(error.message);
@@ -3904,30 +4382,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     return () => { active = false; };
   }, []);
 
-  useEffect(() => {
-    const cleanupCurrentSession = () => {
-      const currentSessionId = sessionIdRef.current;
-      if (!currentSessionId) return;
-      const body = JSON.stringify({ session_id: currentSessionId });
-      const sent = navigator.sendBeacon(
-        "/api/vip-organizer/session/cleanup",
-        new Blob([body], { type: "application/json" })
-      );
-      if (!sent) {
-        fetch("/api/vip-organizer/session/cleanup", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-          keepalive: true
-        }).catch(() => undefined);
-      }
-    };
-    window.addEventListener("pagehide", cleanupCurrentSession);
-    return () => window.removeEventListener("pagehide", cleanupCurrentSession);
-  }, []);
-
   function applyNewSession(nextSessionId: string) {
     clearLivePreviewCaches();
+    window.sessionStorage.removeItem(sessionSnapshotStorageKey);
     sessionIdRef.current = nextSessionId;
     window.sessionStorage.setItem(sessionStorageKey, nextSessionId);
     setSessionId(nextSessionId);
@@ -3948,8 +4405,13 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     setApiRoleNotes({});
     setSlotPreviews({});
     slotPreviewSignaturesRef.current = {};
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    analyzeGenerationRef.current += 1;
     platformWorkspaceRef.current = {};
+    platformSlotHistoryRef.current = {};
     jdBackgroundPreparedRef.current = false;
+    jdBackgroundGenerationRef.current += 1;
     if (reanalyzeTimerRef.current !== null) {
       window.clearTimeout(reanalyzeTimerRef.current);
       reanalyzeTimerRef.current = null;
@@ -3990,12 +4452,17 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       if (preSkipped) setMessage(`已跳过 ${preSkipped} 个不支持或未导入的文件`);
       return;
     }
+    if (busy || uploadingKindsRef.current.has(kind)) return;
+    uploadingKindsRef.current = new Set(uploadingKindsRef.current).add(kind);
+    setUploadingKinds(new Set(uploadingKindsRef.current));
     pendingUploadsRef.current += 1;
-    setBusy(true);
-    setMessage(`正在一次性上传 ${fileItems.length} 张原图，请勿关闭页面……`);
+    setMessage(pendingUploadsRef.current > 1
+      ? `正在同时上传商品图和模特图，请勿关闭页面……`
+      : `正在一次性上传 ${fileItems.length} 张原图，请勿关闭页面……`);
     try {
       const currentSession = await ensureSession();
       const uploaded = await api.uploadVipOrganizerAssets(currentSession, kind, fileItems);
+      invalidatePlatformWorkspaces();
       if (kind === "product") {
         productsRef.current = [...productsRef.current, ...uploaded];
         setProducts(productsRef.current);
@@ -4011,19 +4478,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       const skipped = preSkipped + fileItems.length - uploaded.length;
       const canAutoAnalyze = productsRef.current.length > 0 && modelsRef.current.length > 0;
       if (canAutoAnalyze) {
-        setMessage(kind === "tag" ? "吊牌已上传，正在增量刷新吊牌相关输出……" : "商品图和模特图已到齐，正在自动整理初稿……");
-        await analyze(
-          undefined,
-          platform,
-          undefined,
-          {
-            products: productsRef.current,
-            models: modelsRef.current,
-            tags: tagsRef.current
-          },
-          kind === "tag" && slots.length > 0 ? "tag" : undefined,
-          false
-        );
+        completedUploadKindsRef.current.add(kind);
+        setMessage(pendingUploadsRef.current > 1
+          ? "当前区域已上传，正在等待另一上传区域完成……"
+          : "图片已上传，正在准备自动整理……");
       } else {
         setMessage(skipped ? `已上传 ${uploaded.length} 张图片，自动跳过 ${skipped} 个不支持、损坏或未导入的文件` : `已上传 ${uploaded.length} 张图片`);
       }
@@ -4031,7 +4489,32 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       setMessage(error.message);
     } finally {
       pendingUploadsRef.current -= 1;
-      if (pendingUploadsRef.current === 0) setBusy(false);
+      uploadingKindsRef.current = new Set(uploadingKindsRef.current);
+      uploadingKindsRef.current.delete(kind);
+      setUploadingKinds(new Set(uploadingKindsRef.current));
+      if (pendingUploadsRef.current === 0) {
+        const completedKinds = new Set(completedUploadKindsRef.current);
+        completedUploadKindsRef.current.clear();
+        if (completedKinds.size && productsRef.current.length > 0 && modelsRef.current.length > 0) {
+          const tagOnlyRefresh = completedKinds.size === 1
+            && completedKinds.has("tag")
+            && slotsRef.current.length > 0;
+          setMessage(tagOnlyRefresh
+            ? "吊牌已上传，正在增量刷新吊牌相关输出……"
+            : "商品图和模特图已到齐，正在自动整理初稿……");
+          await analyze(
+            undefined,
+            platform,
+            undefined,
+            {
+              products: productsRef.current,
+              models: modelsRef.current,
+              tags: tagsRef.current
+            },
+            tagOnlyRefresh ? "tag" : undefined
+          );
+        }
+      }
     }
   }
 
@@ -4098,6 +4581,13 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         };
       });
       slotsRef.current = nextSlotState;
+      platformSlotHistoryRef.current = Object.fromEntries(
+        Object.entries(platformSlotHistoryRef.current).map(([savedPlatform, savedSlots]) => [
+          savedPlatform,
+          (savedSlots || []).filter((slot) => !slot.image_ids.includes(item.image_id))
+        ])
+      ) as Partial<Record<OrganizerPlatform, Slot[]>>;
+      platformSlotHistoryRef.current[platform] = nextSlotState;
       setSlots(nextSlotState);
       setAdjustmentEditor((current) => {
         if (!current) return current;
@@ -4115,6 +4605,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       slotPreviewSignaturesRef.current = {};
       platformWorkspaceRef.current = {};
       jdBackgroundPreparedRef.current = false;
+      jdBackgroundGenerationRef.current += 1;
 
       if (!nextProducts.length) {
         slotsRef.current = [];
@@ -4152,6 +4643,11 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     const modelItems = collections?.models || modelsRef.current;
     const tagItems = collections?.tags || tagsRef.current;
     if (!productItems.length) return setMessage("请先上传商品原图");
+    invalidatePlatformWorkspaces();
+    const generation = ++analyzeGenerationRef.current;
+    analyzeAbortRef.current?.abort();
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
     if (manageBusy) setBusy(true);
     setMessage("");
     try {
@@ -4164,21 +4660,25 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         asset_roles: rolesOverride || assetRolesRef.current,
         asset_tags: tagsOverride || assetTagsRef.current,
         platform: platformOverride
-      });
+      }, controller.signal);
+      if (controller.signal.aborted || generation !== analyzeGenerationRef.current) return;
       const currentSlots = slotsRef.current;
+      const previousPlatformSlots = platformOverride === platform
+        ? currentSlots
+        : platformSlotHistoryRef.current[platformOverride] || [];
       let nextSlots: Slot[];
-      if (replaceSlots) {
+      if (replaceSlots && platformOverride === platform) {
         nextSlots = result.slots as Slot[];
       } else {
-        const merged = mergeAnalyzedSlots(currentSlots, result.slots as Slot[]);
+        const merged = mergeAnalyzedSlots(previousPlatformSlots, result.slots as Slot[]);
         if (incrementalKind !== "tag") {
           nextSlots = merged;
         } else {
           const mergedByName = new Map(merged.map((slot) => [slot.file_name, slot]));
-          nextSlots = currentSlots.map((slot) => slot.kind === "tag" ? mergedByName.get(slot.file_name) || slot : slot);
+          nextSlots = previousPlatformSlots.map((slot) => slot.kind === "tag" ? mergedByName.get(slot.file_name) || slot : slot);
         }
       }
-      const previousByName = new Map(currentSlots.map((slot) => [slot.file_name, slotPreviewSignature(slot, organizerProductInfo(), platformOverride)]));
+      const previousByName = new Map(previousPlatformSlots.map((slot) => [slot.file_name, slotPreviewSignature(slot, organizerProductInfo(), platformOverride)]));
       const changedNames = nextSlots
         .filter((slot) => previousByName.get(slot.file_name) !== slotPreviewSignature(slot, organizerProductInfo(), platformOverride))
         .map((slot) => slot.file_name);
@@ -4196,18 +4696,24 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         }
       }
       slotsRef.current = nextSlots;
+      platformSlotHistoryRef.current[platformOverride] = nextSlots;
       setSlots(nextSlots);
-      if (platformOverride === "vip" && incrementalKind !== "tag" && collections) {
+      if (platformOverride === "vip") {
         delete platformWorkspaceRef.current.jd;
         jdBackgroundPreparedRef.current = false;
+        jdBackgroundGenerationRef.current += 1;
       }
       setAssets(result.assets);
       setAdjustmentEditor(null);
       setMessage(incrementalKind === "tag" ? "吊牌相关输出已增量更新，其他预览保持不变" : "已生成自动整理初稿；黄色或红色可信度项目需要重点确认");
     } catch (error: any) {
-      setMessage(error.message);
+      if (error?.name === "AbortError") return;
+      if (generation === analyzeGenerationRef.current) setMessage(error.message);
     } finally {
-      if (manageBusy) setBusy(false);
+      if (generation === analyzeGenerationRef.current) {
+        if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
+        if (manageBusy) setBusy(false);
+      }
     }
   }
 
@@ -4225,6 +4731,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   async function analyzeWithApi() {
     if (!products.length) return setMessage("请先上传商品原图");
     if (!analysisConfigId) return setMessage("请先在 API 设置中新增并启用图文分析 API");
+    const generation = ++analyzeGenerationRef.current;
+    analyzeAbortRef.current?.abort();
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
     setBusy(true);
     setMessage("正在用所选图文分析 API 分析全部商品图，本次只调用一次……");
     try {
@@ -4232,7 +4742,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         session_id: sessionId,
         product_image_ids: products.map((item) => item.image_id),
         api_config_id: analysisConfigId
-      });
+      }, controller.signal);
+      if (controller.signal.aborted || generation !== analyzeGenerationRef.current) return;
+      invalidatePlatformWorkspaces();
       const nextRoles = apiResult.asset_roles as Record<number, string>;
       const nextTags = (apiResult.asset_tags || {}) as Record<number, string[]>;
       assetRolesRef.current = nextRoles;
@@ -4257,7 +4769,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         asset_roles: nextRoles,
         asset_tags: nextTags,
         platform
-      });
+      }, controller.signal);
+      if (controller.signal.aborted || generation !== analyzeGenerationRef.current) return;
       const nextSlots = mergeAnalyzedSlots(slotsRef.current, result.slots as Slot[]);
       const changedNames = nextSlots
         .filter((slot) => {
@@ -4272,18 +4785,24 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         });
       });
       slotsRef.current = nextSlots;
+      platformSlotHistoryRef.current[platform] = nextSlots;
       setSlots(nextSlots);
       setAssets(result.assets);
       setAdjustmentEditor(null);
       setMessage("API 已完成一次素材分类，并按固定标签重新整理；请检查低可信度位置");
     } catch (error: any) {
-      setMessage(error.message);
+      if (error?.name === "AbortError") return;
+      if (generation === analyzeGenerationRef.current) setMessage(error.message);
     } finally {
-      setBusy(false);
+      if (generation === analyzeGenerationRef.current) {
+        if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
+        setBusy(false);
+      }
     }
   }
 
   function updateAssetRole(imageId: number, role: string) {
+    invalidatePlatformWorkspaces();
     const next = { ...assetRolesRef.current };
     if (role === "auto") delete next[imageId];
     else next[imageId] = role;
@@ -4310,6 +4829,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   }
 
   function toggleAssetTag(asset: any, tag: string) {
+    invalidatePlatformWorkspaces();
     const selected = assetTagsRef.current[asset.id] ?? asset.suggested_tags ?? [];
     const nextTags = selected.includes(tag) ? selected.filter((item: string) => item !== tag) : [...selected, tag];
     const next = { ...assetTagsRef.current, [asset.id]: nextTags };
@@ -4321,6 +4841,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   }
 
   function resetAssetTags(imageId: number) {
+    invalidatePlatformWorkspaces();
     const next = { ...assetTagsRef.current };
     delete next[imageId];
     assetTagsRef.current = next;
@@ -4344,7 +4865,6 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   function updateSlot(fileName: string, index: number, value: number) {
     const linkedNames = platform === "jd" ? ["0-无logo.jpg", "1.jpg"] : ["1.jpg", "50.jpg"];
     const affectedNames = linkedNames.includes(fileName) ? linkedNames : [fileName];
-    const fallbackPreview = selectedAsset(value)?.preview_url || "";
     previewAbortRef.current?.abort();
     previewRequestRef.current += 1;
     setSlotPreviews((current) => {
@@ -4352,13 +4872,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       affectedNames.forEach((affectedFileName) => {
         const preview800 = slotPreviewKey(platform, affectedFileName, "800");
         const preview750 = slotPreviewKey(platform, affectedFileName, "750");
-        if (fallbackPreview) {
-          next[preview800] = fallbackPreview;
-          next[preview750] = fallbackPreview;
-        } else {
-          delete next[preview800];
-          delete next[preview750];
-        }
+        // A source thumbnail is not a rendered template. Keeping it under the
+        // exact-preview key made the editor mark an old/raw frame as synced.
+        delete next[preview800];
+        delete next[preview750];
       });
       return next;
     });
@@ -4387,6 +4904,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         };
       });
       slotsRef.current = nextSlots;
+      platformSlotHistoryRef.current[platform] = nextSlots;
       return nextSlots;
     });
   }
@@ -4426,25 +4944,48 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       : [targetFolder];
     const baseAdjustments = (currentSlot.adjustments || [])
       .map((item) => normalizeAdjustment(item));
-    const folderAdjustments = { ...(currentSlot.folder_adjustments || {}) };
+    const previousFolderAdjustments = currentSlot.folder_adjustments || {};
+    const folderAdjustments = { ...previousFolderAdjustments };
     const baseLogoColor: LogoColor = currentSlot.logo_color === "white" ? "white" : "black";
     const folderLogoColors = { ...(currentSlot.folder_logo_colors || {}) };
     if (platform === "jd") {
       previewFoldersForSlot(currentSlot, platform).forEach((folder) => {
         if (!folderAdjustments[folder]) {
-          folderAdjustments[folder] = baseAdjustments.map((item) => ({ ...item }));
+          folderAdjustments[folder] = baseAdjustments.map((item, index) => normalizeAdjustment(
+            adjustmentForSyncedFolder(
+              item,
+              previousFolderAdjustments[folder]?.[index],
+              currentSlot,
+              platform,
+              "800",
+              folder
+            )
+          ));
         }
         if (!folderLogoColors[folder]) folderLogoColors[folder] = baseLogoColor;
       });
     }
     foldersToUpdate.forEach((folder) => {
-      folderAdjustments[folder] = normalizedAdjustments.map((item) => ({ ...item }));
+      folderAdjustments[folder] = normalizedAdjustments.map((item, index) => normalizeAdjustment(
+        adjustmentForSyncedFolder(
+          item,
+          previousFolderAdjustments[folder]?.[index]
+            || (folder === "800" ? currentSlot.adjustments?.[index] : undefined),
+          currentSlot,
+          platform,
+          targetFolder,
+          folder
+        )
+      ));
       folderLogoColors[folder] = logoColor;
     });
+    const syncedBaseAdjustments = syncJdFolders && platform === "jd"
+      ? folderAdjustments["800"] || normalizedAdjustments
+      : normalizedAdjustments;
     const updatedSlot: Slot = {
       ...currentSlot,
       adjustments: targetFolder === "800" || syncJdFolders
-        ? normalizedAdjustments
+        ? syncedBaseAdjustments
         : currentSlot.adjustments,
       folder_adjustments: platform === "jd" ? folderAdjustments : currentSlot.folder_adjustments,
       folder_logo_colors: platform === "jd" ? folderLogoColors : currentSlot.folder_logo_colors,
@@ -4455,6 +4996,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     setSlots((current) => {
       const nextSlots = current.map((slot) => slot.file_name === fileName ? updatedSlot : slot);
       slotsRef.current = nextSlots;
+      platformSlotHistoryRef.current[platform] = nextSlots;
       return nextSlots;
     });
     if (previewUrl) {
@@ -4495,6 +5037,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       setMessage("请先填写商品长和高，再下载京东套图");
       return;
     }
+    if (platform === "vip" && slots.some((slot) => slot.file_name === "401.jpg") && !vipInfoDimensionsReady(productInfo)) {
+      setMessage("请填写有效的商品长、高、厚，再下载唯品会套图");
+      return;
+    }
     setBusy(true);
     setMessage("");
     try {
@@ -4521,6 +5067,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
 
   async function changePlatform(nextPlatform: OrganizerPlatform) {
     if (nextPlatform === platform) return;
+    jdBackgroundGenerationRef.current += 1;
+    jdBackgroundPreparedRef.current = false;
     if (reanalyzeTimerRef.current !== null) {
       window.clearTimeout(reanalyzeTimerRef.current);
       reanalyzeTimerRef.current = null;
@@ -4533,10 +5081,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       previews: slotPreviews,
       signatures: { ...slotPreviewSignaturesRef.current }
     };
+    platformSlotHistoryRef.current[platform] = slotsRef.current;
     setAdjustmentEditor(null);
     const cached = platformWorkspaceRef.current[nextPlatform];
     if (cached) {
       slotsRef.current = cached.slots;
+      platformSlotHistoryRef.current[nextPlatform] = cached.slots;
       setSlots(cached.slots);
       setSlotPreviews({ ...cached.previews });
       slotPreviewSignaturesRef.current = { ...cached.signatures };
@@ -4571,6 +5121,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     }
     previewAbortRef.current?.abort();
     previewRequestRef.current += 1;
+    jdBackgroundGenerationRef.current += 1;
+    jdBackgroundPreparedRef.current = false;
     setPlatformRegenerating(true);
     setAdjustmentEditor(null);
     setSlotPreviews({});
@@ -4605,6 +5157,18 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     : undefined;
   const activeEditorPrimaryAsset = activeEditorSlot?.file_name === "606.jpg"
     ? selectedAsset(activeEditorSlot.image_ids[0])
+    : undefined;
+  const activeEditorPreviewKey = activeEditorSlot && adjustmentEditor
+    ? slotPreviewKey(platform, activeEditorSlot.file_name, adjustmentEditor.targetFolder)
+    : "";
+  const activeEditorInitialPreview = activeEditorSlot && adjustmentEditor && activeEditorPreviewKey
+    && slotPreviewSignaturesRef.current[activeEditorPreviewKey] === slotPreviewSignature(
+      activeEditorSlot,
+      organizerProductInfo(),
+      platform,
+      adjustmentEditor.targetFolder
+    )
+    ? slotPreviews[activeEditorPreviewKey]
     : undefined;
   const previewGroups = useMemo(() => {
     if (platform !== "jd") {
@@ -4644,16 +5208,16 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
             <p>上传商品原图和模特图，吊牌图可按需补充</p>
           </div>
           <div className="button-row organizer-step-actions">
-            {sessionId && <button disabled={busy} onClick={startNewSession}><RefreshCw size={18} />开始新一轮</button>}
-            <button className="primary" disabled={busy || !products.length} onClick={() => analyze()}>
-              {busy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}自动整理初稿
+            {sessionId && <button disabled={uiBusy} onClick={startNewSession}><RefreshCw size={18} />开始新一轮</button>}
+            <button className="primary" disabled={uiBusy || !products.length} onClick={() => analyze()}>
+              {uiBusy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}自动整理初稿
             </button>
           </div>
         </div>
         <div className="organizer-upload-columns">
-          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
-          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
-          <UploadSection title="吊牌图" hint="可选 · 支持 Ctrl+V" items={tags} multiple={false} disabled={busy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
+          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy || uploadingKinds.has("product")} deleteDisabled={uiBusy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
+          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy || uploadingKinds.has("model")} deleteDisabled={uiBusy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
+          <UploadSection title="吊牌图" hint="可选 · 支持 Ctrl+V" items={tags} multiple={false} disabled={uiBusy} deleteDisabled={uiBusy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
         </div>
       </section>
 
@@ -4672,9 +5236,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                   {analysisConfigs.map((item) => <option value={item.id} key={item.id}>{item.config_name}{item.is_default ? "（默认）" : ""}</option>)}
                 </select>
               </label>
-              <button disabled={busy || !analysisConfigId} onClick={analyzeWithApi}><RefreshCw size={18} />API 分析</button>
-              <button className="primary" disabled={busy} onClick={() => analyze()}>
-                {busy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}按标签重新整理
+              <button disabled={uiBusy || !analysisConfigId} onClick={analyzeWithApi}><RefreshCw size={18} />API 分析</button>
+              <button className="primary" disabled={uiBusy} onClick={() => analyze()}>
+                {uiBusy ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}按标签重新整理
               </button>
             </div>
           </div>
@@ -4728,9 +5292,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           </div>
           <div className="organizer-info-grid">
             <label>商品名称<input value={info.product_name} onChange={(event) => setInfo({ ...info, product_name: event.target.value })} /></label>
-            <label>长（mm）<input inputMode="decimal" placeholder="例如：200" value={info.product_length} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
-            <label>高（mm）<input inputMode="decimal" placeholder="例如：140" value={info.product_height} onChange={(event) => setInfo({ ...info, product_height: event.target.value })} /></label>
-            <label>厚（mm）<input inputMode="decimal" placeholder="例如：80" value={info.product_thickness} onChange={(event) => setInfo({ ...info, product_thickness: event.target.value })} /></label>
+            <label>长（mm）<input inputMode="decimal" placeholder="例如：200" value={info.product_length} aria-invalid={Boolean(info.product_length.trim()) && positiveDimensionValue(info.product_length) === null} onChange={(event) => setInfo({ ...info, product_length: event.target.value })} /></label>
+            <label>高（mm）<input inputMode="decimal" placeholder="例如：140" value={info.product_height} aria-invalid={Boolean(info.product_height.trim()) && positiveDimensionValue(info.product_height) === null} onChange={(event) => setInfo({ ...info, product_height: event.target.value })} /></label>
+            <label>厚（mm）<input inputMode="decimal" placeholder="例如：80" value={info.product_thickness} aria-invalid={Boolean(info.product_thickness.trim()) && positiveDimensionValue(info.product_thickness) === null} onChange={(event) => setInfo({ ...info, product_thickness: event.target.value })} /></label>
             <label>主要材质<input value={info.main_material} onChange={(event) => setInfo({ ...info, main_material: event.target.value })} /></label>
             <label>里料材质<input value={info.lining_material} onChange={(event) => setInfo({ ...info, lining_material: event.target.value })} /></label>
             <label>包型背法<input placeholder="例如：单肩/斜挎" value={info.wearing_method} onChange={(event) => setInfo({ ...info, wearing_method: event.target.value })} /></label>
@@ -4750,7 +5314,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                     role="tab"
                     aria-selected={item.id === platform}
                     className={item.id === platform ? "active" : ""}
-                    disabled={busy || platformSwitching || platformRegenerating}
+                    disabled={uiBusy || platformSwitching || platformRegenerating}
                     onClick={() => changePlatform(item.id)}
                   >
                     <span>{item.label}</span>
@@ -4760,7 +5324,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
               <button
                 type="button"
                 className="organizer-platform-refresh"
-                disabled={busy || platformSwitching || platformRegenerating || !products.length}
+                disabled={uiBusy || platformSwitching || platformRegenerating || !products.length}
                 title="清空当前平台的手动选图和调整，按最新标签重新自动生成"
                 onClick={() => void regenerateCurrentPlatform()}
               >
@@ -4788,9 +5352,12 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                   const isLockedInfoFront = platform === "vip" && slot.file_name === "401.jpg";
                   const editableSource = !isLockedInfoFront && slot.kind !== "generated";
                   const previewKey = slotPreviewKey(platform, slot.file_name, group.folder);
-                  const dimensionsReady = jdComparisonDimensionsReady(organizerProductInfo());
-                  const outputReady = !((platform === "jd" && slot.file_name === "5.jpg")
-                    || (platform === "vip" && slot.file_name === "401.jpg")) || dimensionsReady;
+                  const currentProductInfo = organizerProductInfo();
+                  const outputReady = platform === "jd" && slot.file_name === "5.jpg"
+                    ? jdComparisonDimensionsReady(currentProductInfo)
+                    : platform === "vip" && slot.file_name === "401.jpg"
+                      ? vipInfoDimensionsReady(currentProductInfo)
+                      : true;
                   const renderedPreview = outputReady ? slotPreviews[previewKey] : undefined;
                   const outputSize = slotCanvasSize(slot.size, platform, group.folder);
                   return <article className={`organizer-slot${slot.file_name === "606.jpg" ? " is-composite" : ""}`} key={previewKey}>
@@ -4800,7 +5367,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                     >
                       {renderedPreview
                         ? <>
-                          <button className="organizer-slot-edit-preview" type="button" onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} onError={() => {
+                          <button className="organizer-slot-edit-preview" type="button" disabled={uiBusy} onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)} aria-label={`调整 ${slot.file_name} 最终成品`}><img src={renderedPreview} alt={`${slot.file_name} 最终成品`} onError={() => {
                               setSlotPreviews((current) => {
                                 const next = { ...current };
                                 delete next[previewKey];
@@ -4819,7 +5386,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                             <Eye size={18} />
                           </button>
                         </>
-                        : <div className="generated-placeholder"><FileImage size={30} /><span>{!outputReady ? "请先填写商品长和高" : previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
+                        : <div className="generated-placeholder"><FileImage size={30} /><span>{!outputReady
+                          ? platform === "vip" && slot.file_name === "401.jpg" ? "请填写有效的商品长、高、厚" : "请填写有效的商品长和高"
+                          : previewBusy ? "正在套用模板" : "缺少素材"}</span></div>}
                     </div>
                     <div className="organizer-slot-body">
                       <div className="organizer-slot-title">
@@ -4830,19 +5399,19 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                         <button
                           type="button"
                           className="organizer-adjust-output"
-                          disabled={!slot.image_ids[0] || !outputReady}
+                          disabled={uiBusy || !slot.image_ids[0] || !outputReady}
                           onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder, "product")}
                         ><Crop size={16} />调整商品图</button>
                         <button
                           type="button"
                           className="organizer-adjust-output"
-                          disabled={!slot.image_ids[0] || !outputReady}
+                          disabled={uiBusy || !slot.image_ids[0] || !outputReady}
                           onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder, "phone")}
                         ><Smartphone size={16} />调整手机</button>
                       </div> : count === 1 && <button
                         type="button"
                         className="organizer-adjust-output"
-                        disabled={!slot.image_ids[0] || !outputReady}
+                        disabled={uiBusy || !slot.image_ids[0] || !outputReady}
                         onClick={() => openAdjustmentEditor(slot.file_name, 0, group.folder)}
                       ><Crop size={16} />调整成品</button>}
                       {isLockedInfoFront && <label>来源图片
@@ -4859,12 +5428,13 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                             <select
                               className={currentAsset && isManualAsset(currentAsset.id) ? "is-manual-source" : ""}
                               value={slot.image_ids[index] || ""}
+                              disabled={uiBusy}
                               onChange={(event) => updateSlot(slot.file_name, index, Number(event.target.value))}
                             >
                               <option value="">请选择</option>
                               {optionsFor(slot).map((asset: any) => <option className={isManualAsset(asset.id) ? "manual-option" : ""} value={asset.id} key={asset.id}>{assetOptionLabel(asset, slot.kind)}</option>)}
                             </select>
-                            {count > 1 && <button type="button" disabled={!slot.image_ids[index]} onClick={() => openAdjustmentEditor(slot.file_name, index, group.folder)} title={`调整来源 ${index + 1}`}>
+                            {count > 1 && <button type="button" disabled={uiBusy || !slot.image_ids[index]} onClick={() => openAdjustmentEditor(slot.file_name, index, group.folder)} title={`调整来源 ${index + 1}`}>
                                 <Crop size={16} />调整
                               </button>}
                           </span>
@@ -4880,7 +5450,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
             </section>)}
           </div>
           <div className="organizer-export-bar">
-            <button className="primary" disabled={busy || previewBusy} onClick={exportZip}>{busy ? <LoaderCircle className="spin" size={18} /> : <Download size={18} />}下载 ZIP</button>
+            <button className="primary" disabled={uiBusy || previewBusy} onClick={exportZip}>{uiBusy ? <LoaderCircle className="spin" size={18} /> : <Download size={18} />}下载 ZIP</button>
           </div>
         </section>
       </>}
@@ -4897,7 +5467,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
         compositePrimaryUrl={activeEditorPrimaryAsset?.original_url || activeEditorPrimaryAsset?.preview_url}
         compositePrimaryImageId={activeEditorPrimaryAsset?.id}
         displaySourceUrl={adjustmentEditor.targetObject === "phone" ? "/organizer-assets/iphone_reference.png" : undefined}
-        initialPreview={slotPreviews[slotPreviewKey(platform, activeEditorSlot.file_name, adjustmentEditor.targetFolder)]}
+        initialPreview={activeEditorInitialPreview}
         productInfo={organizerProductInfo()}
         platform={platform}
         targetFolder={adjustmentEditor.targetFolder}
