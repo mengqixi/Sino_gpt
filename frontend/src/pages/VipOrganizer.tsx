@@ -122,6 +122,7 @@ const ORGANIZER_PLATFORMS = [
 type OrganizerPlatform = "vip" | "jd";
 type PreviewFolder = "800" | "750";
 const JD_SINGLE_FOLDER_FILES = new Set(["0-无logo.jpg", "透明.png"]);
+const JD_SLOT_FILES = ["0-无logo.jpg", "1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg", "透明.png"];
 const JD_MEASURE_COLOR = "#707070";
 const JD_PHONE_SCALE_MAX = 4;
 const JD_DECORATION_SCALE_MIN = 0.125;
@@ -131,7 +132,7 @@ const ORGANIZER_CANVAS_FONT = '"OrganizerNotoSans"';
 // Keep persisted preview signatures aligned with backend PREVIEW_RENDER_VERSION
 // and ORGANIZER_LAYER_RENDER_VERSION. Bump this token whenever either renderer
 // changes so a refresh cannot revive an older exact preview from sessionStorage.
-const ORGANIZER_RENDER_STATE_VERSION = "33:1";
+const ORGANIZER_RENDER_STATE_VERSION = "34:1";
 const ORGANIZER_SESSION_SNAPSHOT_VERSION = 2;
 
 let organizerCanvasFontsReady: Promise<unknown> | null = null;
@@ -526,6 +527,12 @@ function slotUsesOrganizerLayer(slot: Slot, platform: OrganizerPlatform) {
     : ["2.jpg", "3.jpg", "15.jpg", "30.png", "401.jpg", "604.jpg", "605.jpg", "606.jpg"].includes(slot.file_name);
 }
 
+function slotUsesAutoHandleLayout(slot: Slot, platform: OrganizerPlatform) {
+  return platform === "jd"
+    ? ["2.jpg", "透明.png"].includes(slot.file_name)
+    : ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name);
+}
+
 function slotPreviewLayout(slot: Slot, platform: OrganizerPlatform, sourceIndex: number, targetFolder: PreviewFolder) {
   if (platform === "jd") {
     if (["0-无logo.jpg", "1.jpg"].includes(slot.file_name)) {
@@ -641,6 +648,27 @@ function clampLayerOrigin(position: number, layerSize: number, minimum: number, 
   return layerSize <= available
     ? Math.max(minimum, Math.min(position, maximum - layerSize))
     : Math.max(maximum - layerSize, Math.min(position, minimum));
+}
+
+function autoHandleBaselineOrigin(
+  platform: OrganizerPlatform,
+  fileName: string,
+  output: { width: number; height: number },
+  position: { x: number; y: number },
+  size: { width: number; height: number },
+  clip: { left: number; top: number; right: number; bottom: number }
+) {
+  const x = clampLayerOrigin(position.x, size.width, clip.left, clip.right);
+  let y = clampLayerOrigin(position.y, size.height, clip.top, clip.bottom);
+  if (platform === "jd" && fileName === "2.jpg") {
+    const minimumTop = output.width === 800 && output.height === 800 ? 162 : 175;
+    const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
+    const latestY = maximumBottom - size.height;
+    y = latestY >= minimumTop
+      ? Math.max(minimumTop, Math.min(y, latestY))
+      : Math.max(y, minimumTop);
+  }
+  return { x, y };
 }
 
 function adjustmentOffsetBasis(
@@ -796,6 +824,46 @@ function livePreviewImage(url: string) {
   image.src = url;
   livePreviewImageCache.set(url, image);
   return image;
+}
+
+function waitForLivePreviewImage(image: HTMLImageElement, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      image.removeEventListener("load", loaded);
+      image.removeEventListener("error", failed);
+      signal.removeEventListener("abort", aborted);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const decoded = () => {
+      void image.decode().catch(() => undefined).then(() => {
+        if (signal.aborted) aborted();
+        else if (image.naturalWidth > 0) finish();
+        else finish(new Error("精确商品图层加载失败"));
+      });
+    };
+    const loaded = () => decoded();
+    const failed = () => finish(new Error("精确商品图层加载失败"));
+    const aborted = () => finish(new DOMException("Prepared layer request aborted", "AbortError"));
+    signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) {
+      aborted();
+      return;
+    }
+    if (image.complete) {
+      if (image.naturalWidth > 0) decoded();
+      else failed();
+      return;
+    }
+    image.addEventListener("load", loaded, { once: true });
+    image.addEventListener("error", failed, { once: true });
+  });
 }
 
 function preloadExactPreview(url: string, signal: AbortSignal) {
@@ -1963,8 +2031,14 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       crop_y: draft.crop_y,
       crop_width: draft.crop_width,
       crop_height: draft.crop_height
-    }, controller.signal).then((info) => {
+    }, controller.signal).then(async (info) => {
+      if (controller.signal.aborted) return;
       setLayerInfo(info);
+      // Keep the editor locked until the exact prepared layer itself has
+      // decoded. Publishing geometry as soon as the JSON arrived allowed a
+      // zoom click to race the browser cutout -> prepared-cutout switch.
+      await waitForLivePreviewImage(livePreviewImage(info.url), controller.signal);
+      if (controller.signal.aborted) return;
       onLayerInfoChange?.(info);
     }).catch((requestError: any) => {
       if (requestError?.name !== "AbortError") {
@@ -2134,8 +2208,7 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       const infoProductLiftY = platform === "vip" && slot.file_name === "401.jpg"
         ? vipInfoProductLiftY(infoHandleLift)
         : 0;
-      const autoHandleLayout = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
-        || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
+      const autoHandleLayout = slotUsesAutoHandleLayout(slot, platform);
       const automaticHandleLift = autoHandleLayout && productLayer && !hasManualCrop
         ? layerInfo?.handle_lift ?? liveHandleVisualLift(productLayer)
         : 0;
@@ -2165,13 +2238,10 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       const multiAngleRowShift = multiAngleHandleLift >= 0.55
         ? (sourceIndex < 2 ? 1 : -1) * Math.round(13 * multiAngleHandleLift * output.height / 750)
         : 0;
-      const tallHandleDropAware = (platform === "vip" && ["2.jpg", "3.jpg", "30.png"].includes(slot.file_name))
-        || (platform === "jd" && ["2.jpg", "透明.png"].includes(slot.file_name));
+      const tallHandleDropAware = autoHandleLayout;
       const productAutoLift = autoHandleLayout ? 0.03 : 0;
       const tallHandleDropRatio = platform === "vip" && slot.file_name === "2.jpg" ? 0.14 : 0.12;
-      let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
-        + bodyCenterOffsetY
-        + multiAngleRowShift
+      const automaticVerticalShift = multiAngleRowShift
         - infoProductLiftY * areaHeight
         + infoAutomaticLayout.dropY * areaHeight
         + (usesAutomaticDetailCutout && !automaticInteriorDetail ? (vipDetailOffset + 0.02) * areaHeight : 0)
@@ -2179,8 +2249,9 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
         + (tallHandleDropAware && productLayer && !hasManualCrop
           ? tallHandleDropRatio * automaticHandleLift * areaHeight
           : 0);
-      const automaticBaseX = drawX - draft.offset_x * areaWidth;
-      const automaticBaseY = drawY - draft.offset_y * areaHeight;
+      let drawY = areaY + (areaHeight - drawHeight) / 2 + draft.offset_y * areaHeight
+        + bodyCenterOffsetY
+        + automaticVerticalShift;
       const editorArea = slotEditorSafeAreaLayout(slot, platform, sourceIndex, targetFolder);
       // Match Pillow's integer safe-area edges so the live and exact layers
       // do not differ by a one-pixel fringe when a product touches a border.
@@ -2188,41 +2259,43 @@ function LiveSlotPreview({ sourceUrl, sourceImageId, compositePrimaryUrl, compos
       const safeTop = Math.round(editorArea.y * output.height);
       const safeRight = Math.round((editorArea.x + editorArea.width) * output.width);
       const safeBottom = Math.round((editorArea.y + editorArea.height) * output.height);
+      const usesStableAutoHandleAnchor = autoHandleLayout && Boolean(productLayer && productBody) && !hasManualCrop;
+      if (usesStableAutoHandleAnchor && productLayer && productBody) {
+        const baseProductScale = fitScale * automaticDetailScale * infoProductScale;
+        const baseDrawWidth = drawSourceWidth * baseProductScale;
+        const baseDrawHeight = drawSourceHeight * baseProductScale;
+        const bodyCenterX = (productBody.left + productBody.right) / 2;
+        const bodyCenterY = (productBody.top + productBody.bottom) / 2;
+        const baseline = autoHandleBaselineOrigin(
+          platform,
+          slot.file_name,
+          output,
+          {
+            x: areaX + (areaWidth - baseDrawWidth) / 2
+              + (productLayer.width / 2 - bodyCenterX) * baseProductScale
+              + infoAutomaticLayout.shiftX,
+            y: areaY + (areaHeight - baseDrawHeight) / 2
+              + (productLayer.height / 2 - bodyCenterY) * baseProductScale
+              + automaticVerticalShift
+          },
+          { width: baseDrawWidth, height: baseDrawHeight },
+          { left: safeLeft, top: safeTop, right: safeRight, bottom: safeBottom }
+        );
+        const bodyAnchorX = baseline.x + bodyCenterX * baseProductScale;
+        const bodyAnchorY = baseline.y + productBody.bottom * baseProductScale;
+        drawX = bodyAnchorX - bodyCenterX * productScale + draft.offset_x * areaWidth;
+        drawY = bodyAnchorY - productBody.bottom * productScale + draft.offset_y * areaHeight;
+      }
       // Keep automatic placement constrained, but do not re-clamp a layer
       // after the designer explicitly moves, crops or zooms it. Re-clamping
       // made dragging asymmetric and caused the zoom anchor to jump from one
       // edge to the other. This applies equally to VIP and JD manual edits.
       const allowFreeMovement = hasManualLayout;
-      const jdProductManualAnchor = platform === "jd"
-        && slot.file_name === "2.jpg"
-        && hasManualLayout
-        && !hasManualCrop;
-      if (jdProductManualAnchor) {
-        const anchoredX = clampLayerOrigin(automaticBaseX, drawWidth, safeLeft, safeRight);
-        let anchoredY = clampLayerOrigin(automaticBaseY, drawHeight, safeTop, safeBottom);
-        const minimumTop = output.width === 800 && output.height === 800
-          ? 162
-          : 175;
-        const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
-        anchoredY = drawHeight <= maximumBottom - minimumTop
-          ? Math.max(minimumTop, Math.min(anchoredY, maximumBottom - drawHeight))
-          : Math.max(anchoredY, minimumTop);
-        drawX += anchoredX - automaticBaseX;
-        drawY += anchoredY - automaticBaseY;
-      }
-      if (!allowFreeMovement) {
+      if (!allowFreeMovement && !usesStableAutoHandleAnchor) {
         drawX = clampLayerOrigin(drawX, drawWidth, safeLeft, safeRight);
       }
-      if (!allowFreeMovement) {
+      if (!allowFreeMovement && !usesStableAutoHandleAnchor) {
         drawY = clampLayerOrigin(drawY, drawHeight, safeTop, safeBottom);
-      }
-      if (platform === "jd" && slot.file_name === "2.jpg" && !hasManualLayout) {
-        const baseSafeTop = output.width === 800 && output.height === 800 ? 162 : 175;
-        const minimumTop = baseSafeTop;
-        const maximumBottom = output.width === 800 && output.height === 800 ? 740 : 930;
-        drawY = drawHeight <= maximumBottom - minimumTop
-          ? Math.max(minimumTop, Math.min(drawY, maximumBottom - drawHeight))
-          : Math.max(drawY, minimumTop);
       }
 
       context.fillStyle = "#fff";
@@ -2547,7 +2620,9 @@ function SlotAdjustmentEditor({
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [cropMode, setCropMode] = useState(false);
   const isPhoneComparison = platform === "jd" && slot.file_name === "5.jpg";
-  const requiresPreparedGeometry = isInfoPage || isPhoneComparison;
+  const requiresPreparedGeometry = isInfoPage
+    || isPhoneComparison
+    || slotUsesAutoHandleLayout(slot, platform);
   const supportsJdFolderSync = platform === "jd" && previewFoldersForSlot(slot, platform).length > 1;
   const [syncJdFolders, setSyncJdFolders] = useState(false);
   const isPhoneObjectEditor = isPhoneComparison && initialMoveTarget === "phone";
@@ -3823,6 +3898,9 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
   const platformSlotHistoryRef = useRef<Partial<Record<OrganizerPlatform, Slot[]>>>({});
   const jdBackgroundPreparedRef = useRef(false);
   const jdBackgroundGenerationRef = useRef(0);
+  const jdBackgroundRetryCountRef = useRef(0);
+  const jdBackgroundRetryTimerRef = useRef<number | null>(null);
+  const [jdBackgroundRetryVersion, setJdBackgroundRetryVersion] = useState(0);
   const jdDimensionSignatureRef = useRef("");
   const reanalyzeTimerRef = useRef<number | null>(null);
   const assetRolesRef = useRef<Record<number, string>>({});
@@ -3897,6 +3975,11 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     platformWorkspaceRef.current = {};
     jdBackgroundGenerationRef.current += 1;
     jdBackgroundPreparedRef.current = false;
+    jdBackgroundRetryCountRef.current = 0;
+    if (jdBackgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(jdBackgroundRetryTimerRef.current);
+      jdBackgroundRetryTimerRef.current = null;
+    }
   }
 
   function saveSessionSnapshot() {
@@ -4001,7 +4084,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       platformWorkspaceRef.current = snapshot.platform_workspaces || {};
       platformSlotHistoryRef.current = snapshot.platform_slot_history || {};
       if (snapshot.info && typeof snapshot.info === "object") setInfo(snapshot.info);
-      jdBackgroundPreparedRef.current = Boolean(platformWorkspaceRef.current.jd);
+      // Revalidate every cached JD (folder, file) pair after restoration. A
+      // workspace can exist even when a previous background pass was partial.
+      jdBackgroundPreparedRef.current = false;
+      jdBackgroundRetryCountRef.current = 0;
       jdBackgroundGenerationRef.current += 1;
       return;
     }
@@ -4034,10 +4120,16 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     assetTagsRef.current = {};
     setApiRoleNotes({});
     setSlotPreviews({});
+    setPreviewBusy(false);
     slotPreviewSignaturesRef.current = {};
     platformWorkspaceRef.current = {};
     platformSlotHistoryRef.current = {};
     jdBackgroundPreparedRef.current = false;
+    jdBackgroundRetryCountRef.current = 0;
+    if (jdBackgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(jdBackgroundRetryTimerRef.current);
+      jdBackgroundRetryTimerRef.current = null;
+    }
     jdBackgroundGenerationRef.current += 1;
     if (restoredProducts.length) {
       void analyze(undefined, "vip", undefined, {
@@ -4058,13 +4150,33 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     jdDimensionSignatureRef.current = signature;
     jdBackgroundGenerationRef.current += 1;
     jdBackgroundPreparedRef.current = false;
-    delete platformWorkspaceRef.current.jd;
+    jdBackgroundRetryCountRef.current = 0;
+    if (jdBackgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(jdBackgroundRetryTimerRef.current);
+      jdBackgroundRetryTimerRef.current = null;
+    }
+    const jdWorkspace = platformWorkspaceRef.current.jd;
+    if (jdWorkspace) {
+      const previews = { ...jdWorkspace.previews };
+      const signatures = { ...jdWorkspace.signatures };
+      (["800", "750"] as PreviewFolder[]).forEach((targetFolder) => {
+        const key = slotPreviewKey("jd", "5.jpg", targetFolder);
+        delete previews[key];
+        delete signatures[key];
+      });
+      platformWorkspaceRef.current.jd = {
+        ...jdWorkspace,
+        previews,
+        signatures
+      };
+    }
   }, [info.product_length, info.product_height]);
 
   useEffect(() => {
     if (platformSwitching || platformRegenerating) return;
     if (!sessionId || !slots.length) {
       previewAbortRef.current?.abort();
+      setPreviewBusy(false);
       setSlotPreviews({});
       return;
     }
@@ -4105,12 +4217,68 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       setPreviewBusy(true);
       let partialPreviewFailure = false;
       try {
-        if (changedTargets.length > 5) {
+        if (platform === "vip" && changedTargets.length > 5) {
+          const firstScreenNames = new Set(["1.jpg", "2.jpg", "3.jpg", "4.jpg", "15.jpg"]);
+          const firstScreenTargets = changedTargets.filter((target) => firstScreenNames.has(target.slot.file_name));
+          const remainingTargets = changedTargets.filter((target) => !firstScreenNames.has(target.slot.file_name));
+          const batches = [firstScreenTargets, remainingTargets].filter((batch) => batch.length > 0);
+
+          for (const batch of batches) {
+            if (requestId !== previewRequestRef.current || controller.signal.aborted) return;
+            try {
+              const targetFolder = batch[0].targetFolder;
+              const batchSlots = batch.map((target) => target.slot);
+              const result = await api.previewVipOrganizer({
+                session_id: sessionId,
+                slots: slotsForPreviewFolder(batchSlots, platform, targetFolder),
+                preview_file_names: batch.map((target) => target.slot.file_name),
+                product_info: productInfo,
+                platform,
+                target_folder: targetFolder
+              }, controller.signal);
+              if (requestId !== previewRequestRef.current || controller.signal.aborted) return;
+              const expectedKeys = new Set(batch.map((target) => target.key));
+              const successfulEntries = Object.entries(result.previews || {}).flatMap(([fileName, previewUrl]) => {
+                const key = slotPreviewKey(platform, fileName, targetFolder);
+                return typeof previewUrl === "string" && expectedKeys.has(key)
+                  ? [[key, previewUrl] as const]
+                  : [];
+              });
+              const successfulKeys = new Set(successfulEntries.map(([key]) => key));
+              const previewEntries = Object.fromEntries(successfulEntries);
+              setSlotPreviews((current) => ({ ...current, ...previewEntries }));
+              const workspace = platformWorkspaceRef.current[platform];
+              platformWorkspaceRef.current[platform] = {
+                slots,
+                previews: { ...(workspace?.previews || {}), ...previewEntries },
+                signatures: {
+                  ...(workspace?.signatures || {}),
+                  ...Object.fromEntries([...successfulKeys].filter((key) => signatures[key]).map((key) => [key, signatures[key]]))
+                }
+              };
+              slotPreviewSignaturesRef.current = {
+                ...slotPreviewSignaturesRef.current,
+                ...Object.fromEntries([...successfulKeys].filter((key) => signatures[key]).map((key) => [key, signatures[key]]))
+              };
+              const failedCount = batch.length - successfulEntries.length;
+              if (failedCount) {
+                partialPreviewFailure = true;
+                setMessage(`${failedCount} 个预览暂未生成，其他预览已更新`);
+              }
+            } catch (error: any) {
+              if (error?.name === "AbortError") return;
+              partialPreviewFailure = true;
+              setMessage(`${batch.length} 个预览暂未生成，正在继续更新其他预览`);
+            }
+          }
+        } else if (changedTargets.length > 5) {
           const folders = [...new Set(changedTargets.map((target) => target.targetFolder))];
           const groupedResults = await Promise.allSettled(folders.map(async (targetFolder) => {
+            const folderTargets = changedTargets.filter((target) => target.targetFolder === targetFolder);
             const result = await api.previewVipOrganizer({
               session_id: sessionId,
-              slots: slotsForPreviewFolder(slots, platform, targetFolder),
+              slots: slotsForPreviewFolder(folderTargets.map((target) => target.slot), platform, targetFolder),
+              preview_file_names: folderTargets.map((target) => target.slot.file_name),
               product_info: productInfo,
               platform,
               target_folder: targetFolder
@@ -4207,16 +4375,51 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     };
   }, [sessionId, slots, info, platform, platformSwitching, platformRegenerating, previewRetryVersion]);
 
+  const vipForegroundPreviewsSynced = (() => {
+    if (platform !== "vip" || !slots.length) return false;
+    const productInfo = organizerProductInfo();
+    const vipInfoReady = vipInfoDimensionsReady(productInfo);
+    const vipInfoStarted = [
+      productInfo.product_length,
+      productInfo.product_height,
+      productInfo.product_thickness
+    ].some((value) => value.trim().length > 0);
+    // Once the designer starts entering dimensions, keep the single image
+    // worker reserved for VIP 401 until all three values are valid and its
+    // foreground preview has finished. Otherwise JD 5 can begin during the
+    // short pause between the height and thickness fields and block 401.
+    if (vipInfoStarted && !vipInfoReady) return false;
+    const targets = slots.flatMap((slot) => {
+      if (!slot.image_ids[0] || (slot.file_name === "606.jpg" && slot.image_ids.length < 4)) return [];
+      if (slot.file_name === "401.jpg" && !vipInfoReady) return [];
+      return previewFoldersForSlot(slot, "vip").map((targetFolder) => ({
+        slot,
+        targetFolder,
+        key: slotPreviewKey("vip", slot.file_name, targetFolder)
+      }));
+    });
+    return targets.length > 0 && targets.every((target) => (
+      Boolean(slotPreviews[target.key])
+      && slotPreviewSignaturesRef.current[target.key] === slotPreviewSignature(
+        slotForPreviewFolder(target.slot, "vip", target.targetFolder),
+        productInfo,
+        "vip",
+        target.targetFolder
+      )
+    ));
+  })();
+
   useEffect(() => {
     if (
       platform !== "vip"
       || platformSwitching
       || platformRegenerating
+      || previewBusy
+      || !vipForegroundPreviewsSynced
       || !sessionId
       || !hasOrganizerSlots
       || !productsRef.current.length
       || jdBackgroundPreparedRef.current
-      || platformWorkspaceRef.current.jd
     ) return;
     jdBackgroundPreparedRef.current = true;
     const generation = ++jdBackgroundGenerationRef.current;
@@ -4239,68 +4442,119 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     const isCurrentGeneration = () => generation === jdBackgroundGenerationRef.current
       && sessionIdRef.current === sessionAtStart
       && backgroundInputSignature() === inputsAtStart;
+    const scheduleRetry = () => {
+      if (!isCurrentGeneration() || jdBackgroundRetryCountRef.current >= 2) return;
+      const retryNumber = jdBackgroundRetryCountRef.current + 1;
+      jdBackgroundRetryCountRef.current = retryNumber;
+      jdBackgroundPreparedRef.current = false;
+      const retryDelay = retryNumber === 1 ? 1200 : 2400;
+      jdBackgroundRetryTimerRef.current = window.setTimeout(() => {
+        jdBackgroundRetryTimerRef.current = null;
+        if (!isCurrentGeneration()) return;
+        setJdBackgroundRetryVersion((current) => current + 1);
+      }, retryDelay);
+    };
+    let backgroundTaskStarted = false;
+    let backgroundTaskFinished = false;
     const timer = window.setTimeout(async () => {
+      backgroundTaskStarted = true;
       try {
         const productInfo = organizerProductInfo();
-        const result = await api.analyzeVipOrganizer({
-          session_id: sessionId,
-          product_image_ids: productsRef.current.map((item) => item.image_id),
-          model_image_ids: modelsRef.current.map((item) => item.image_id),
-          tag_image_ids: tagsRef.current.map((item) => item.image_id),
-          asset_roles: assetRolesRef.current,
-          asset_tags: assetTagsRef.current,
-          platform: "jd"
-        });
-        if (!isCurrentGeneration()) return;
-        const mergedBackgroundSlots = mergeAnalyzedSlots(
-          platformSlotHistoryRef.current.jd || [],
-          result.slots as Slot[]
-        );
-        const backgroundSlots = mergedBackgroundSlots.filter((slot: Slot) => (
-          slot.file_name !== "5.jpg" || jdComparisonDimensionsReady(productInfo)
-        ));
-        const folderResults = await Promise.allSettled((["800", "750"] as PreviewFolder[]).map(async (targetFolder) => {
-          const previews = await api.previewVipOrganizer({
+        const existingWorkspace = platformWorkspaceRef.current.jd;
+        const workspaceSlotsComplete = Boolean(existingWorkspace?.slots.length)
+          && JD_SLOT_FILES.every((fileName) => existingWorkspace?.slots.some((slot) => slot.file_name === fileName));
+        let mergedBackgroundSlots: Slot[];
+        if (workspaceSlotsComplete) {
+          mergedBackgroundSlots = existingWorkspace?.slots || [];
+        } else {
+          const result = await api.analyzeVipOrganizer({
             session_id: sessionId,
-            slots: backgroundSlots,
-            product_info: productInfo,
-            platform: "jd",
-            target_folder: targetFolder
+            product_image_ids: productsRef.current.map((item) => item.image_id),
+            model_image_ids: modelsRef.current.map((item) => item.image_id),
+            tag_image_ids: tagsRef.current.map((item) => item.image_id),
+            asset_roles: assetRolesRef.current,
+            asset_tags: assetTagsRef.current,
+            platform: "jd"
           });
-          return Object.entries(previews.previews || {}).flatMap(([fileName, previewUrl]) => (
-            typeof previewUrl === "string"
-              ? [[slotPreviewKey("jd", fileName, targetFolder), previewUrl] as const]
-              : []
-          ));
-        }));
-        const entries = folderResults
-          .filter((item): item is PromiseFulfilledResult<(readonly [string, string])[]> => item.status === "fulfilled")
-          .flatMap((item) => item.value);
-        if (!isCurrentGeneration()) return;
-        const signatures = Object.fromEntries(backgroundSlots.flatMap((slot: Slot) =>
-          previewFoldersForSlot(slot, "jd").map((targetFolder) => [
-            slotPreviewKey("jd", slot.file_name, targetFolder),
-            slotPreviewSignature(
-              slotForPreviewFolder(slot, "jd", targetFolder),
-              productInfo,
-              "jd",
-              targetFolder
-            )
-          ])
+          if (!isCurrentGeneration()) return;
+          mergedBackgroundSlots = mergeAnalyzedSlots(
+            platformSlotHistoryRef.current.jd || [],
+            result.slots as Slot[]
+          );
+        }
+        const renderableTargets = mergedBackgroundSlots.flatMap((slot) => {
+          if (!slot.image_ids[0]) return [];
+          if (slot.file_name === "5.jpg" && !jdComparisonDimensionsReady(productInfo)) return [];
+          return previewFoldersForSlot(slot, "jd").map((targetFolder) => {
+            const folderSlot = slotForPreviewFolder(slot, "jd", targetFolder);
+            return {
+              slot,
+              targetFolder,
+              key: slotPreviewKey("jd", slot.file_name, targetFolder),
+              signature: slotPreviewSignature(folderSlot, productInfo, "jd", targetFolder)
+            };
+          });
+        });
+        const missingTargets = renderableTargets.filter((target) => (
+          !existingWorkspace?.previews[target.key]
+          || existingWorkspace.signatures[target.key] !== target.signature
         ));
+        const entries: (readonly [string, string])[] = [];
+        for (const targetFolder of ["800", "750"] as PreviewFolder[]) {
+          if (!isCurrentGeneration()) return;
+          const folderTargets = missingTargets.filter((target) => target.targetFolder === targetFolder);
+          if (!folderTargets.length) continue;
+          try {
+            const expectedKeys = new Set(folderTargets.map((target) => target.key));
+            const result = await api.previewVipOrganizer({
+              session_id: sessionId,
+              slots: slotsForPreviewFolder(folderTargets.map((target) => target.slot), "jd", targetFolder),
+              preview_file_names: folderTargets.map((target) => target.slot.file_name),
+              product_info: productInfo,
+              platform: "jd",
+              target_folder: targetFolder
+            });
+            entries.push(...Object.entries(result.previews || {}).flatMap(([fileName, previewUrl]) => {
+              const key = slotPreviewKey("jd", fileName, targetFolder);
+              return typeof previewUrl === "string" && expectedKeys.has(key)
+                ? [[key, previewUrl] as const]
+                : [];
+            }));
+          } catch {
+            // The bounded retry below fills only targets still missing.
+          }
+        }
+        if (!isCurrentGeneration()) return;
+        const successfulKeys = new Set(entries.map(([key]) => key));
+        const signatures = Object.fromEntries(renderableTargets
+          .filter((target) => successfulKeys.has(target.key))
+          .map((target) => [target.key, target.signature]));
         platformWorkspaceRef.current.jd = {
           slots: mergedBackgroundSlots,
-          previews: Object.fromEntries(entries),
-          signatures
+          previews: { ...(existingWorkspace?.previews || {}), ...Object.fromEntries(entries) },
+          signatures: { ...(existingWorkspace?.signatures || {}), ...signatures }
         };
         platformSlotHistoryRef.current.jd = mergedBackgroundSlots;
         saveSessionSnapshot();
+        const missingAfterRender = missingTargets.some((target) => !successfulKeys.has(target.key));
+        if (missingAfterRender) scheduleRetry();
+        else jdBackgroundRetryCountRef.current = 0;
       } catch {
-        if (isCurrentGeneration()) jdBackgroundPreparedRef.current = false;
+        scheduleRetry();
+      } finally {
+        backgroundTaskFinished = true;
       }
-    }, 450);
+    }, 800);
     return () => {
       window.clearTimeout(timer);
+      if (generation === jdBackgroundGenerationRef.current && !backgroundTaskFinished) {
+        if (backgroundTaskStarted) jdBackgroundGenerationRef.current += 1;
+        jdBackgroundPreparedRef.current = false;
+      }
+      if (jdBackgroundRetryTimerRef.current !== null) {
+        window.clearTimeout(jdBackgroundRetryTimerRef.current);
+        jdBackgroundRetryTimerRef.current = null;
+      }
     };
   }, [
     platform,
@@ -4308,7 +4562,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     platformRegenerating,
     sessionId,
     hasOrganizerSlots,
-    jdBackgroundInputSignature
+    jdBackgroundInputSignature,
+    jdBackgroundRetryVersion,
+    previewBusy,
+    vipForegroundPreviewsSynced
   ]);
 
   useEffect(() => {
@@ -4404,6 +4661,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     assetTagsRef.current = {};
     setApiRoleNotes({});
     setSlotPreviews({});
+    setPreviewBusy(false);
     slotPreviewSignaturesRef.current = {};
     analyzeAbortRef.current?.abort();
     analyzeAbortRef.current = null;
@@ -4411,6 +4669,11 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     platformWorkspaceRef.current = {};
     platformSlotHistoryRef.current = {};
     jdBackgroundPreparedRef.current = false;
+    jdBackgroundRetryCountRef.current = 0;
+    if (jdBackgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(jdBackgroundRetryTimerRef.current);
+      jdBackgroundRetryTimerRef.current = null;
+    }
     jdBackgroundGenerationRef.current += 1;
     if (reanalyzeTimerRef.current !== null) {
       window.clearTimeout(reanalyzeTimerRef.current);
@@ -4452,7 +4715,10 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
       if (preSkipped) setMessage(`已跳过 ${preSkipped} 个不支持或未导入的文件`);
       return;
     }
-    if (busy || uploadingKindsRef.current.has(kind)) return;
+    const tagUploadConflicts = kind === "tag"
+      ? uploadingKindsRef.current.size > 0
+      : uploadingKindsRef.current.has("tag");
+    if (busy || uploadingKindsRef.current.has(kind) || tagUploadConflicts) return;
     uploadingKindsRef.current = new Set(uploadingKindsRef.current).add(kind);
     setUploadingKinds(new Set(uploadingKindsRef.current));
     pendingUploadsRef.current += 1;
@@ -4600,11 +4866,17 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
 
       previewAbortRef.current?.abort();
       previewRequestRef.current += 1;
+      setPreviewBusy(false);
       clearLivePreviewCaches();
       setSlotPreviews({});
       slotPreviewSignaturesRef.current = {};
       platformWorkspaceRef.current = {};
       jdBackgroundPreparedRef.current = false;
+      jdBackgroundRetryCountRef.current = 0;
+      if (jdBackgroundRetryTimerRef.current !== null) {
+        window.clearTimeout(jdBackgroundRetryTimerRef.current);
+        jdBackgroundRetryTimerRef.current = null;
+      }
       jdBackgroundGenerationRef.current += 1;
 
       if (!nextProducts.length) {
@@ -4867,6 +5139,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     const affectedNames = linkedNames.includes(fileName) ? linkedNames : [fileName];
     previewAbortRef.current?.abort();
     previewRequestRef.current += 1;
+    setPreviewBusy(false);
     setSlotPreviews((current) => {
       const next = { ...current };
       affectedNames.forEach((affectedFileName) => {
@@ -5069,6 +5342,11 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     if (nextPlatform === platform) return;
     jdBackgroundGenerationRef.current += 1;
     jdBackgroundPreparedRef.current = false;
+    jdBackgroundRetryCountRef.current = 0;
+    if (jdBackgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(jdBackgroundRetryTimerRef.current);
+      jdBackgroundRetryTimerRef.current = null;
+    }
     if (reanalyzeTimerRef.current !== null) {
       window.clearTimeout(reanalyzeTimerRef.current);
       reanalyzeTimerRef.current = null;
@@ -5076,6 +5354,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     const scrollTop = window.scrollY;
     previewAbortRef.current?.abort();
     previewRequestRef.current += 1;
+    setPreviewBusy(false);
     platformWorkspaceRef.current[platform] = {
       slots: slotsRef.current,
       previews: slotPreviews,
@@ -5121,8 +5400,14 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
     }
     previewAbortRef.current?.abort();
     previewRequestRef.current += 1;
+    setPreviewBusy(false);
     jdBackgroundGenerationRef.current += 1;
     jdBackgroundPreparedRef.current = false;
+    jdBackgroundRetryCountRef.current = 0;
+    if (jdBackgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(jdBackgroundRetryTimerRef.current);
+      jdBackgroundRetryTimerRef.current = null;
+    }
     setPlatformRegenerating(true);
     setAdjustmentEditor(null);
     setSlotPreviews({});
@@ -5215,8 +5500,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
           </div>
         </div>
         <div className="organizer-upload-columns">
-          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy || uploadingKinds.has("product")} deleteDisabled={uiBusy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
-          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy || uploadingKinds.has("model")} deleteDisabled={uiBusy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
+          <UploadSection title="商品原图" hint="支持多选" items={products} disabled={busy || uploadingKinds.has("product") || uploadingKinds.has("tag")} deleteDisabled={uiBusy} onUpload={(files) => upload("product", files)} onDelete={(item) => void deleteUploadedAsset("product", item)} onPreview={setPreview} />
+          <UploadSection title="模特图" hint="支持多选" items={models} disabled={busy || uploadingKinds.has("model") || uploadingKinds.has("tag")} deleteDisabled={uiBusy} onUpload={(files) => upload("model", files)} onDelete={(item) => void deleteUploadedAsset("model", item)} onPreview={setPreview} />
           <UploadSection title="吊牌图" hint="可选 · 支持 Ctrl+V" items={tags} multiple={false} disabled={uiBusy} deleteDisabled={uiBusy} onUpload={(files) => upload("tag", files)} onDelete={(item) => void deleteUploadedAsset("tag", item)} onPreview={setPreview} />
         </div>
       </section>

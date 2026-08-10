@@ -51,7 +51,7 @@ CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 _FAST_SLOT_PREVIEW_LOCK = Lock()
-PREVIEW_RENDER_VERSION = 33
+PREVIEW_RENDER_VERSION = 34
 ORGANIZER_LAYER_RENDER_VERSION = 1
 MAX_PREVIEW_CACHE_ENTRIES = 48
 JD_PHONE_HEIGHT_MM = 163.0
@@ -135,6 +135,25 @@ def _platform_slot_definitions(platform: str) -> list[tuple[str, str, str, str]]
     if platform not in ORGANIZER_PLATFORMS:
         raise ValueError("不支持的输出平台")
     return JD_SLOT_DEFINITIONS if platform == "jd" else SLOT_DEFINITIONS
+
+
+def _preview_slot_definitions(
+    platform: str,
+    file_names: list[str] | None = None,
+) -> list[tuple[str, str, str, str]]:
+    """Select requested previews in canonical platform order."""
+    definitions = _platform_slot_definitions(platform)
+    if file_names is None:
+        return definitions
+    valid_names = {name for name, _, _, _ in definitions}
+    requested_names = set(file_names)
+    if not requested_names.issubset(valid_names):
+        raise ValueError("输出位置不存在")
+    return [
+        definition
+        for definition in definitions
+        if definition[0] in requested_names
+    ]
 
 
 def _analysis_config(config_id: int | None = None) -> dict[str, Any]:
@@ -6710,6 +6729,7 @@ def _paste_product(
     minimum_rendered_top: int | None = None,
     tall_handle_minimum_rendered_top: int | None = None,
     maximum_rendered_bottom: int | None = None,
+    stable_body_bottom_anchor: bool = False,
 ) -> None:
     image_id = source.info.get("_organizer_image_id")
     modified_ns = source.info.get("_organizer_modified_ns")
@@ -6740,25 +6760,105 @@ def _paste_product(
         box_width = max(1, right - left)
         box_height = max(1, bottom - top)
         handle_lift = _handle_visual_lift(cutout)
-        scale = min(box_width / cutout.width, box_height / cutout.height) * normalized["zoom"]
+        base_scale = min(box_width / cutout.width, box_height / cutout.height)
+        scale = base_scale * normalized["zoom"]
         body_left, body_top, body_right, body_bottom = _info_measurement_bbox(cutout)
         body_center_x = (body_left + body_right) / 2
         body_center_y = (body_top + body_bottom) / 2
         tall_handle_drop_y = tall_handle_drop_ratio * handle_lift if auto_tall_handle_drop else 0.0
-        automatic_layout_adjustment = {
-            **normalized,
-            "offset_x": (cutout.width / 2 - body_center_x) * scale / box_width,
-            "offset_y": (
+        if stable_body_bottom_anchor:
+            # JD 2 first establishes its normal 100% automatic placement,
+            # including the logo/safe-area constraints below.  Every manual
+            # zoom then keeps the visible bag-body centre and bottom on that
+            # immutable baseline.  Re-clamping the complete cutout at every
+            # zoom made the anchor switch once transparent padding reached a
+            # top/bottom constraint, so a bag could first grow upward and then
+            # grow downward.
+            base_offset_x = (
+                (cutout.width / 2 - body_center_x)
+                * base_scale
+                / box_width
+            )
+            base_offset_y = (
                 auto_offset_y
                 + tall_handle_drop_y
-                + (cutout.height / 2 - body_center_y) * scale / box_height
-            ),
-        }
-        layout_adjustment = {
-            **automatic_layout_adjustment,
-            "offset_x": automatic_layout_adjustment["offset_x"] + normalized["offset_x"],
-            "offset_y": automatic_layout_adjustment["offset_y"] + normalized["offset_y"],
-        }
+                + (cutout.height / 2 - body_center_y)
+                * base_scale
+                / box_height
+            )
+            base_rendered_width = max(1, int(round(cutout.width * base_scale)))
+            base_rendered_height = max(1, int(round(cutout.height * base_scale)))
+            clip_left, clip_top, clip_right, clip_bottom = (
+                clip_box or (0, 0, *canvas.size)
+            )
+            base_x = (
+                left
+                + (box_width - base_rendered_width) // 2
+                + int(round(base_offset_x * box_width))
+            )
+            base_y = (
+                top
+                + (box_height - base_rendered_height) // 2
+                + int(round(base_offset_y * box_height))
+            )
+            base_x = _clamp_layer_origin(
+                base_x,
+                base_rendered_width,
+                clip_left,
+                clip_right,
+            )
+            base_y = _clamp_layer_origin(
+                base_y,
+                base_rendered_height,
+                clip_top,
+                clip_bottom,
+            )
+            if automatic_minimum_top is not None:
+                base_y = max(automatic_minimum_top, base_y)
+            if maximum_rendered_bottom is not None:
+                latest_base_y = maximum_rendered_bottom - base_rendered_height
+                if (
+                    automatic_minimum_top is None
+                    or latest_base_y >= automatic_minimum_top
+                ):
+                    base_y = min(base_y, latest_base_y)
+
+            body_anchor_x = base_x + body_center_x * base_scale
+            body_anchor_y = base_y + body_bottom * base_scale
+            rendered_width = max(1, int(round(cutout.width * scale)))
+            rendered_height = max(1, int(round(cutout.height * scale)))
+            desired_x = int(round(
+                body_anchor_x
+                - body_center_x * scale
+                + normalized["offset_x"] * box_width
+            ))
+            desired_y = int(round(
+                body_anchor_y
+                - body_bottom * scale
+                + normalized["offset_y"] * box_height
+            ))
+            centered_x = left + (box_width - rendered_width) // 2
+            centered_y = top + (box_height - rendered_height) // 2
+            layout_adjustment = {
+                **normalized,
+                "offset_x": (desired_x - centered_x) / box_width,
+                "offset_y": (desired_y - centered_y) / box_height,
+            }
+        else:
+            automatic_layout_adjustment = {
+                **normalized,
+                "offset_x": (cutout.width / 2 - body_center_x) * scale / box_width,
+                "offset_y": (
+                    auto_offset_y
+                    + tall_handle_drop_y
+                    + (cutout.height / 2 - body_center_y) * scale / box_height
+                ),
+            }
+            layout_adjustment = {
+                **automatic_layout_adjustment,
+                "offset_x": automatic_layout_adjustment["offset_x"] + normalized["offset_x"],
+                "offset_y": automatic_layout_adjustment["offset_y"] + normalized["offset_y"],
+            }
     if has_manual_layout and automatic_layout_adjustment is not None:
         left, top, right, bottom = box
         box_width = max(1, right - left)
@@ -7262,6 +7362,7 @@ def _normalized_product_page(
         auto_tall_handle_drop=auto_tall_handle_drop,
         tall_handle_drop_ratio=tall_handle_drop_ratio,
         auto_offset_y=auto_offset_y,
+        stable_body_bottom_anchor=auto_handle_layout,
     )
     return canvas
 
@@ -7769,6 +7870,7 @@ def _jd_product_page(
                 if size == (800, 800)
                 else 930
             ),
+            stable_body_bottom_anchor=True,
         )
     _draw_jd_elle_logo(canvas, size, logo_color)
     return canvas
@@ -8758,13 +8860,20 @@ def _render_cached_slot_preview(
     target_folder: str = "800",
 ) -> str | None:
     _assert_session_active(session_id)
+    cached_url = _existing_cached_slot_preview(
+        session_id,
+        file_name,
+        slot,
+        product_info,
+        platform,
+        target_folder,
+    )
+    if cached_url is not None:
+        return cached_url
+
     preview_id = _preview_cache_id(file_name, slot, product_info, platform, target_folder)
     folder = _session_result_dir(session_id) / "previews" / preview_id
     output = folder / file_name
-    if output.is_file():
-        _assert_session_active(session_id)
-        os.utime(folder, None)
-        return f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}"
 
     image = _render_slot_image(
         file_name,
@@ -8795,16 +8904,60 @@ def _render_cached_slot_preview(
     return f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}"
 
 
+def _existing_cached_slot_preview(
+    session_id: str,
+    file_name: str,
+    slot: dict[str, Any],
+    product_info: dict[str, str],
+    platform: str,
+    target_folder: str = "800",
+) -> str | None:
+    """Return an exact preview cache hit without decoding any source image."""
+    _assert_session_active(session_id)
+    preview_id = _preview_cache_id(
+        file_name,
+        slot,
+        product_info,
+        platform,
+        target_folder,
+    )
+    folder = _session_result_dir(session_id) / "previews" / preview_id
+    output = folder / file_name
+    if not output.is_file():
+        return None
+    _assert_session_active(session_id)
+    try:
+        os.utime(folder, None)
+    except OSError:
+        # Cache pruning and session cleanup can remove the directory between
+        # the existence check above and this touch. Treat that race as a cache
+        # miss so the normal renderer can recreate the preview instead of
+        # turning an otherwise valid request into a 500 response.
+        return None
+    return f"/api/vip-organizer/previews/{session_id}/{preview_id}/{file_name}"
+
+
 def _prune_preview_cache(session_id: str) -> None:
     preview_root = _session_result_dir(session_id) / "previews"
     if not preview_root.is_dir():
         return
-    entries = sorted(
-        (path for path in preview_root.iterdir() if path.is_dir()),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
-    )
-    for stale in entries[MAX_PREVIEW_CACHE_ENTRIES:]:
+    try:
+        candidates = list(preview_root.iterdir())
+    except OSError:
+        return
+    entries: list[tuple[int, Path]] = []
+    for path in candidates:
+        try:
+            if not path.is_dir():
+                continue
+            entries.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            # Another preview request may be pruning the same session in a
+            # sibling API thread (or worker process). A disappearing cache
+            # directory is already pruned and must not fail this request.
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in entries[MAX_PREVIEW_CACHE_ENTRIES:]:
         shutil.rmtree(stale, ignore_errors=True)
 
 
@@ -8814,8 +8967,50 @@ def render_previews(
     product_info: dict[str, str],
     platform: str = "vip",
     target_folder: str = "800",
+    preview_file_names: list[str] | None = None,
 ) -> dict[str, Any]:
-    return run_heavy_task(
+    if platform == "jd" and target_folder not in {"800", "750"}:
+        raise ValueError("京东预览目录必须是 800 或 750")
+
+    slot_definitions = _preview_slot_definitions(platform, preview_file_names)
+    slot_map = _slot_map(slots, platform)
+    _validate_slot_map(session_id, slot_map, platform)
+    cached_previews: dict[str, str] = {}
+    uncached_file_names: list[str] = []
+    for file_name, _, _, _ in slot_definitions:
+        slot = slot_map.get(
+            file_name,
+            {"image_ids": [], "adjustments": [], "logo_color": "black"},
+        )
+        slot = {
+            **slot,
+            "adjustments": _slot_adjustments_for_folder(slot, target_folder),
+            "logo_color": _slot_logo_color_for_folder(slot, target_folder),
+        }
+        preview_url = _existing_cached_slot_preview(
+            session_id,
+            file_name,
+            slot,
+            product_info,
+            platform,
+            target_folder,
+        )
+        if preview_url is None:
+            uncached_file_names.append(file_name)
+        else:
+            cached_previews[file_name] = preview_url
+
+    if not uncached_file_names:
+        _prune_preview_cache(session_id)
+        return {
+            "previews": {
+                file_name: cached_previews[file_name]
+                for file_name, _, _, _ in slot_definitions
+            },
+            "missing": [],
+        }
+
+    rendered = run_heavy_task(
         "backend.services.organizer_render_worker",
         {
             "operation": "preview",
@@ -8824,9 +9019,26 @@ def render_previews(
             "product_info": product_info,
             "platform": platform,
             "target_folder": target_folder,
+            "file_names": uncached_file_names,
         },
         timeout=600,
     )
+    rendered_previews = rendered.get("previews", {})
+    combined_previews = {**cached_previews, **rendered_previews}
+    requested_names = set(uncached_file_names)
+    rendered_missing = set(rendered.get("missing", []))
+    return {
+        "previews": {
+            file_name: combined_previews[file_name]
+            for file_name, _, _, _ in slot_definitions
+            if file_name in combined_previews
+        },
+        "missing": [
+            file_name
+            for file_name, _, _, _ in slot_definitions
+            if file_name in requested_names and file_name in rendered_missing
+        ],
+    }
 
 
 def render_slot_preview(
@@ -8958,10 +9170,11 @@ def _render_previews(
     product_info: dict[str, str],
     platform: str = "vip",
     target_folder: str = "800",
+    file_names: list[str] | None = None,
 ) -> dict[str, Any]:
     if platform == "jd" and target_folder not in {"800", "750"}:
         raise ValueError("京东预览目录必须是 800 或 750")
-    slot_definitions = _platform_slot_definitions(platform)
+    slot_definitions = _preview_slot_definitions(platform, file_names)
     slot_map = _slot_map(slots, platform)
     _validate_slot_map(session_id, slot_map, platform)
     previews: dict[str, str] = {}

@@ -1,13 +1,16 @@
 import io
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from fastapi import UploadFile
 from PIL import Image, ImageDraw
 
 from backend import database
+from backend.routers import vip_organizer as organizer_router
 from backend.services import vip_organizer_service as service
 
 
@@ -508,6 +511,215 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
 
         self.assertNotEqual(first_url, refreshed_layer_url)
         renderer.assert_called_once()
+
+    def test_full_preview_cache_hit_does_not_start_heavy_worker(self):
+        session_id = service.start_session()["session_id"]
+        file_names = [name for name, _, _, _ in service.SLOT_DEFINITIONS]
+        cached_urls = {
+            name: f"/api/vip-organizer/previews/{session_id}/{index:012x}/{name}"
+            for index, name in enumerate(file_names, start=1)
+        }
+
+        with (
+            patch.object(
+                service,
+                "_existing_cached_slot_preview",
+                side_effect=lambda _session_id, file_name, *_args: cached_urls[file_name],
+            ),
+            patch.object(service, "run_heavy_task") as worker,
+        ):
+            result = service.render_previews(session_id, [], {}, "vip", "800")
+
+        worker.assert_not_called()
+        self.assertEqual(list(result["previews"]), file_names)
+        self.assertEqual(result["previews"], cached_urls)
+        self.assertEqual(result["missing"], [])
+
+    def test_cached_preview_disappearing_during_touch_is_a_cache_miss(self):
+        session_id = service.start_session()["session_id"]
+        file_name = service.SLOT_DEFINITIONS[0][0]
+        slot = {"image_ids": [], "adjustments": [], "logo_color": "black"}
+        preview_id = service._preview_cache_id(file_name, slot, {}, "vip", "800")
+        folder = service._session_result_dir(session_id) / "previews" / preview_id
+        folder.mkdir(parents=True)
+        (folder / file_name).write_bytes(b"cached")
+
+        with patch.object(service.os, "utime", side_effect=FileNotFoundError):
+            result = service._existing_cached_slot_preview(
+                session_id,
+                file_name,
+                slot,
+                {},
+                "vip",
+                "800",
+            )
+
+        self.assertIsNone(result)
+
+    def test_preview_cache_pruning_is_safe_when_requests_run_concurrently(self):
+        session_id = service.start_session()["session_id"]
+        preview_root = service._session_result_dir(session_id) / "previews"
+        preview_root.mkdir(parents=True, exist_ok=True)
+        for index in range(service.MAX_PREVIEW_CACHE_ENTRIES + 120):
+            folder = preview_root / f"{index:012x}"
+            folder.mkdir()
+            (folder / "preview.jpg").write_bytes(b"preview")
+
+        worker_count = 12
+        barrier = Barrier(worker_count)
+
+        def prune_once(_index: int) -> None:
+            barrier.wait()
+            service._prune_preview_cache(session_id)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(prune_once, range(worker_count)))
+
+        remaining = [path for path in preview_root.iterdir() if path.is_dir()]
+        self.assertLessEqual(len(remaining), service.MAX_PREVIEW_CACHE_ENTRIES)
+
+    def test_partial_preview_cache_only_sends_misses_to_heavy_worker(self):
+        session_id = service.start_session()["session_id"]
+        file_names = [name for name, _, _, _ in service.SLOT_DEFINITIONS]
+        cached_names = set(file_names[::2])
+        uncached_names = [name for name in file_names if name not in cached_names]
+        missing_name = uncached_names[-1]
+
+        def cached_preview(_session_id, file_name, *_args):
+            if file_name not in cached_names:
+                return None
+            return f"/cached/{file_name}"
+
+        def render_missing(_module, payload, **_kwargs):
+            self.assertEqual(payload["file_names"], uncached_names)
+            return {
+                "previews": {
+                    name: f"/rendered/{name}"
+                    for name in uncached_names
+                    if name != missing_name
+                },
+                "missing": [missing_name],
+            }
+
+        with (
+            patch.object(
+                service,
+                "_existing_cached_slot_preview",
+                side_effect=cached_preview,
+            ),
+            patch.object(
+                service,
+                "run_heavy_task",
+                side_effect=render_missing,
+            ) as worker,
+        ):
+            result = service.render_previews(session_id, [], {}, "vip", "800")
+
+        worker.assert_called_once()
+        self.assertEqual(
+            list(result["previews"]),
+            [name for name in file_names if name != missing_name],
+        )
+        self.assertEqual(result["missing"], [missing_name])
+
+    def test_requested_preview_batch_never_expands_linked_model_slot(self):
+        session_id = service.start_session()["session_id"]
+        requested_names = ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "15.jpg"]
+        missing_names = ["3.jpg", "15.jpg"]
+
+        def render_requested(_module, payload, **_kwargs):
+            self.assertEqual(payload["file_names"], requested_names)
+            self.assertNotIn("50.jpg", payload["file_names"])
+            return {
+                "previews": {
+                    name: f"/rendered/{name}"
+                    for name in requested_names
+                    if name not in missing_names
+                },
+                "missing": missing_names,
+            }
+
+        with (
+            patch.object(
+                service,
+                "_existing_cached_slot_preview",
+                return_value=None,
+            ) as cache_lookup,
+            patch.object(
+                service,
+                "run_heavy_task",
+                side_effect=render_requested,
+            ) as worker,
+        ):
+            result = service.render_previews(
+                session_id,
+                [{"file_name": "1.jpg", "image_ids": []}],
+                {},
+                "vip",
+                "800",
+                requested_names,
+            )
+
+        worker.assert_called_once()
+        self.assertEqual(cache_lookup.call_count, len(requested_names))
+        self.assertEqual(
+            list(result["previews"]),
+            [name for name in requested_names if name not in missing_names],
+        )
+        self.assertEqual(result["missing"], missing_names)
+        self.assertTrue(
+            set(result["previews"]).union(result["missing"]).issubset(requested_names)
+        )
+
+    def test_preview_router_forwards_requested_file_names(self):
+        requested_names = ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "15.jpg"]
+        payload = organizer_router.PreviewPayload(
+            session_id="a" * 32,
+            slots=[],
+            product_info={},
+            platform="vip",
+            target_folder="800",
+            preview_file_names=requested_names,
+        )
+
+        with patch.object(
+            organizer_router,
+            "render_previews",
+            return_value={"previews": {}, "missing": requested_names},
+        ) as renderer:
+            result = organizer_router.preview(payload)
+
+        renderer.assert_called_once_with(
+            payload.session_id,
+            payload.slots,
+            payload.product_info,
+            payload.platform,
+            payload.target_folder,
+            requested_names,
+        )
+        self.assertEqual(result["missing"], requested_names)
+
+    def test_partial_preview_renderer_only_visits_requested_file_names(self):
+        session_id = service.start_session()["session_id"]
+        requested = service.SLOT_DEFINITIONS[3][0]
+
+        with patch.object(
+            service,
+            "_render_cached_slot_preview",
+            return_value=None,
+        ) as renderer:
+            result = service._render_previews(
+                session_id,
+                [],
+                {},
+                "vip",
+                "800",
+                [requested],
+            )
+
+        renderer.assert_called_once()
+        self.assertEqual(renderer.call_args.args[1], requested)
+        self.assertEqual(result, {"previews": {}, "missing": [requested]})
 
 
 if __name__ == "__main__":

@@ -62,6 +62,17 @@ def _bright_pixel_bbox(image: Image.Image) -> tuple[int, int, int, int]:
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
+def _red_pixel_bbox(image: Image.Image) -> tuple[int, int, int, int]:
+    pixels = np.asarray(image.convert("RGB"))
+    mask = (
+        (pixels[:, :, 0] > 150)
+        & (pixels[:, :, 1] < 100)
+        & (pixels[:, :, 2] < 100)
+    )
+    ys, xs = np.where(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
 def test_jd_logo_matches_example_geometry():
     canvas_800 = Image.new("RGB", (800, 800), "white")
     service._draw_jd_elle_logo(canvas_800, canvas_800.size)
@@ -322,6 +333,201 @@ def test_jd_product_first_manual_move_starts_from_automatic_position():
     assert moved_box[2] == automatic_box[2]
     assert -8 <= moved_box[1] - automatic_box[1] <= -4
     assert -8 <= moved_box[3] - automatic_box[3] <= -4
+
+
+def test_jd_product_zoom_keeps_body_bottom_anchor_for_both_folders_and_shapes():
+    wide = Image.new("RGBA", (500, 300), (0, 0, 0, 0))
+    ImageDraw.Draw(wide).rectangle(
+        (20, 40, 479, 279),
+        fill=(220, 20, 20, 255),
+    )
+    long_handle = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    long_handle_draw = ImageDraw.Draw(long_handle)
+    long_handle_draw.arc(
+        (70, 10, 230, 250),
+        180,
+        360,
+        fill=(20, 20, 20, 255),
+        width=12,
+    )
+    long_handle_draw.rounded_rectangle(
+        (45, 145, 255, 410),
+        radius=18,
+        fill=(220, 20, 20, 255),
+    )
+    cases = (
+        (
+            wide,
+            (20, 40, 480, 280),
+            0.0,
+            {
+                (800, 800): (124, 256, 676, 544),
+                (750, 1000): (122, 367, 628, 631),
+            },
+        ),
+        (
+            long_handle,
+            (45, 145, 256, 411),
+            1.0,
+            {
+                (800, 800): (261, 353, 538, 702),
+                (750, 1000): (189, 430, 560, 896),
+            },
+        ),
+    )
+    zooms = (0.77, 0.78, 0.79, 1.0, 1.05, 1.20)
+
+    for source, body_box, handle_lift, expected_defaults in cases:
+        for output_size in ((800, 800), (750, 1000)):
+            with (
+                patch.object(service, "_product_cutout", return_value=source),
+                patch.object(service, "_info_measurement_bbox", return_value=body_box),
+                patch.object(service, "_handle_visual_lift", return_value=handle_lift),
+                patch.object(service, "_draw_jd_elle_logo"),
+            ):
+                boxes = [
+                    _red_pixel_bbox(service._jd_product_page(
+                        source,
+                        output_size,
+                        None if zoom == 1.0 else {"zoom": zoom},
+                    ))
+                    for zoom in zooms
+                ]
+
+            default_box = boxes[zooms.index(1.0)]
+            assert all(
+                abs(actual - expected) <= 1
+                for actual, expected in zip(
+                    default_box,
+                    expected_defaults[output_size],
+                )
+            )
+            # The 77/78/79% steps exercise the former constraint boundary.
+            # The visible bag body must keep one horizontal centre and one
+            # bottom baseline while its size changes monotonically.
+            centers_x = [(box[0] + box[2]) / 2 for box in boxes]
+            bottoms = [box[3] for box in boxes]
+            tops = [box[1] for box in boxes]
+            widths = [box[2] - box[0] for box in boxes]
+            assert max(centers_x) - min(centers_x) <= 1
+            assert max(bottoms) - min(bottoms) <= 2
+            assert tops == sorted(tops, reverse=True)
+            assert widths == sorted(widths)
+
+
+def test_auto_handle_product_slots_keep_one_body_bottom_zoom_anchor():
+    wide = Image.new("RGBA", (500, 300), (0, 0, 0, 0))
+    ImageDraw.Draw(wide).rectangle(
+        (20, 40, 479, 279),
+        fill=(220, 20, 20, 255),
+    )
+    long_handle = Image.new("RGBA", (300, 430), (0, 0, 0, 0))
+    long_handle_draw = ImageDraw.Draw(long_handle)
+    long_handle_draw.arc(
+        (70, 10, 230, 250),
+        180,
+        360,
+        fill=(20, 20, 20, 255),
+        width=12,
+    )
+    long_handle_draw.rounded_rectangle(
+        (45, 145, 255, 410),
+        radius=18,
+        fill=(220, 20, 20, 255),
+    )
+    jd_transparent_name = service.JD_SLOT_DEFINITIONS[-1][0]
+    renderers = (
+        (
+            "vip-2",
+            lambda adjustment: service._render_slot_image(
+                "2.jpg", [1], {}, [adjustment] if adjustment else [],
+            ),
+        ),
+        (
+            "vip-3",
+            lambda adjustment: service._render_slot_image(
+                "3.jpg", [1], {}, [adjustment] if adjustment else [],
+            ),
+        ),
+        (
+            "vip-30",
+            lambda adjustment: service._render_slot_image(
+                "30.png", [1], {}, [adjustment] if adjustment else [],
+            ),
+        ),
+        (
+            "jd-transparent",
+            lambda adjustment: service._render_slot_image(
+                jd_transparent_name,
+                [1],
+                {},
+                [adjustment] if adjustment else [],
+                platform="jd",
+            ),
+        ),
+    )
+    cases = (
+        (
+            wide,
+            (20, 40, 480, 280),
+            0.0,
+            {
+                "vip-2": (142, 290, 658, 558),
+                "vip-3": (142, 290, 658, 558),
+                "vip-30": (140, 287, 660, 561),
+                "jd-transparent": (140, 287, 660, 561),
+            },
+        ),
+        (
+            long_handle,
+            (45, 145, 256, 411),
+            1.0,
+            {
+                "vip-2": (267, 332, 532, 666),
+                "vip-3": (267, 321, 532, 655),
+                "vip-30": (264, 318, 535, 658),
+                "jd-transparent": (264, 318, 535, 658),
+            },
+        ),
+    )
+    zooms = (0.77, 0.78, 0.79, 1.0, 1.05, 1.20)
+
+    for source, body_box, handle_lift, expected_defaults in cases:
+        with (
+            patch.object(service, "_load_image", return_value=source),
+            patch.object(service, "_product_cutout", return_value=source),
+            patch.object(service, "_info_measurement_bbox", return_value=body_box),
+            patch.object(service, "_handle_visual_lift", return_value=handle_lift),
+            patch.object(service, "_draw_jd_elle_logo"),
+        ):
+            for slot_name, render in renderers:
+                boxes = [
+                    _red_pixel_bbox(render(
+                        None if zoom == 1.0 else {"zoom": zoom},
+                    ))
+                    for zoom in zooms
+                ]
+
+                # Lock in the exact automatic layout that existed before the
+                # stable anchor was applied. Zooming must not alter 100%.
+                default_box = boxes[zooms.index(1.0)]
+                assert all(
+                    abs(actual - expected) <= 1
+                    for actual, expected in zip(
+                        default_box,
+                        expected_defaults[slot_name],
+                    )
+                )
+                centers_x = [(box[0] + box[2]) / 2 for box in boxes]
+                bottoms = [box[3] for box in boxes]
+                tops = [box[1] for box in boxes]
+                widths = [box[2] - box[0] for box in boxes]
+                # Resampling an odd-sized body can move either raster edge by
+                # one pixel even though the geometric centre is unchanged.
+                assert max(centers_x) - min(centers_x) <= 2
+                assert max(bottoms) - min(bottoms) <= 2
+                assert tops == sorted(tops, reverse=True)
+                assert widths == sorted(widths)
 
 
 def test_jd_long_handle_product_and_transparent_slots_are_lifted():
@@ -1450,6 +1656,12 @@ class JdOrganizerGeometryTests(unittest.TestCase):
 
     def test_jd_product_first_manual_move_is_continuous(self):
         test_jd_product_first_manual_move_starts_from_automatic_position()
+
+    def test_jd_product_zoom_keeps_body_bottom_anchor(self):
+        test_jd_product_zoom_keeps_body_bottom_anchor_for_both_folders_and_shapes()
+
+    def test_auto_handle_product_slots_keep_body_bottom_anchor(self):
+        test_auto_handle_product_slots_keep_one_body_bottom_zoom_anchor()
 
     def test_jd_long_handle_product_slots_are_lifted(self):
         test_jd_long_handle_product_and_transparent_slots_are_lifted()

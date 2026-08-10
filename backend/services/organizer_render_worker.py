@@ -16,6 +16,7 @@ def _handle(payload: dict[str, Any]) -> Any:
             payload["product_info"],
             payload["platform"],
             payload["target_folder"],
+            payload.get("file_names"),
         )
     if operation == "preview_slot":
         return service._render_slot_preview(

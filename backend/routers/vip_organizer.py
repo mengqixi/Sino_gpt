@@ -51,6 +51,10 @@ class ExportPayload(BaseModel):
     target_folder: str = "800"
 
 
+class PreviewPayload(ExportPayload):
+    preview_file_names: list[str] | None = None
+
+
 class SlotPreviewPayload(ExportPayload):
     file_name: str
 
@@ -287,7 +291,7 @@ def export(payload: ExportPayload):
 
 
 @router.post("/preview")
-def preview(payload: ExportPayload):
+def preview(payload: PreviewPayload):
     try:
         return render_previews(
             payload.session_id,
@@ -295,6 +299,7 @@ def preview(payload: ExportPayload):
             payload.product_info,
             payload.platform,
             payload.target_folder,
+            payload.preview_file_names,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
