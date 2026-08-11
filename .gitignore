@@ -15,3 +15,7 @@ frontend/*.tsbuildinfo
 output/
 photo/
 zengliang/
+/build/
+/dist/
+/desktop-release/
+/*.spec
