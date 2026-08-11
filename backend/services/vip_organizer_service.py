@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 from ..config import ALLOWED_IMAGE_EXTENSIONS, DATA_DIR
 from ..database import db_session, now_iso
 from .api_config_service import TEXT_API_TYPE, get_config, get_default_config, mask_api_key, require_config_type
-from .heavy_task_service import run_heavy_task
+from .heavy_task_service import HeavyTaskSuperseded, run_heavy_task
 from .json_path_service import json_path_get
 
 
@@ -1808,7 +1808,14 @@ def _load_image_file(image_id: int, file_path: str, modified_ns: int) -> Image.I
         image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
         loaded = image.copy()
     if max(original_size) > 2400:
-        _write_decoded_source_cache(cache_path, loaded)
+        try:
+            _write_decoded_source_cache(cache_path, loaded)
+        except OSError:
+            # The decoded intermediate is only a speed optimization. A full
+            # disk, a transient rename failure, or restrictive permissions
+            # must not turn an otherwise valid source image into a failed
+            # preview request.
+            pass
     loaded.info["_organizer_image_id"] = image_id
     loaded.info["_organizer_modified_ns"] = modified_ns
     return loaded
@@ -9190,7 +9197,7 @@ def render_slot_preview(
     platform: str = "vip",
     target_folder: str = "800",
     preview_generation: int | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     is_superseded = _register_slot_preview_generation(
         session_id,
         platform,
@@ -9201,7 +9208,7 @@ def render_slot_preview(
     if _fast_slot_preview_ready(slots, file_name, platform, target_folder):
         with _FAST_SLOT_PREVIEW_LOCK:
             if is_superseded is not None and is_superseded():
-                raise ValueError("预览已被更新的调整替代")
+                return {"superseded": True}
             try:
                 return _render_slot_preview(
                     session_id,
@@ -9218,20 +9225,26 @@ def render_slot_preview(
                 _cached_product_cutout.cache_clear()
                 _load_image_file.cache_clear()
                 _release_process_image_memory()
-    return run_heavy_task(
-        "backend.services.organizer_render_worker",
-        {
-            "operation": "preview_slot",
-            "session_id": session_id,
-            "slots": slots,
-            "product_info": product_info,
-            "file_name": file_name,
-            "platform": platform,
-            "target_folder": target_folder,
-        },
-        timeout=600,
-        is_superseded=is_superseded,
-    )
+    try:
+        return run_heavy_task(
+            "backend.services.organizer_render_worker",
+            {
+                "operation": "preview_slot",
+                "session_id": session_id,
+                "slots": slots,
+                "product_info": product_info,
+                "file_name": file_name,
+                "platform": platform,
+                "target_folder": target_folder,
+            },
+            timeout=600,
+            is_superseded=is_superseded,
+        )
+    except HeavyTaskSuperseded:
+        # Supersession is an expected scheduling outcome, not a render error.
+        # Returning a successful marker also avoids a misleading 400 in the
+        # browser when the editor is reopened while a saved preview finishes.
+        return {"superseded": True}
 
 
 def _fast_slot_preview_ready(

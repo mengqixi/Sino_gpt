@@ -833,6 +833,45 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
             {paths[-1].name, paths[-2].name},
         )
 
+    def test_decoded_source_cache_write_failure_does_not_fail_image_load(self):
+        source_path = self.organizer_root / "large-source-cache-failure.jpg"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGB", (2501, 8), "#315a7d")
+        image.save(source_path, quality=95)
+        modified_ns = source_path.stat().st_mtime_ns
+        service._load_image_file.cache_clear()
+
+        with patch.object(
+            service,
+            "_write_decoded_source_cache",
+            side_effect=OSError("cache unavailable"),
+        ):
+            loaded = service._load_image_file(1, str(source_path), modified_ns)
+
+        self.assertEqual(loaded.size, (2400, 8))
+        self.assertEqual(loaded.info["_organizer_image_id"], 1)
+        service._load_image_file.cache_clear()
+
+    def test_superseded_heavy_slot_preview_returns_success_marker(self):
+        session_id = service.start_session()["session_id"]
+        with (
+            patch.object(service, "_fast_slot_preview_ready", return_value=False),
+            patch.object(
+                service,
+                "run_heavy_task",
+                side_effect=service.HeavyTaskSuperseded("superseded"),
+            ),
+        ):
+            result = service.render_slot_preview(
+                session_id,
+                [],
+                {},
+                "2.jpg",
+                preview_generation=301,
+            )
+
+        self.assertEqual(result, {"superseded": True})
+
 
 if __name__ == "__main__":
     unittest.main()

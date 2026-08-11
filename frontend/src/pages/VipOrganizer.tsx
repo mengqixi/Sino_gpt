@@ -3054,7 +3054,8 @@ function SlotAdjustmentEditor({
 
   async function refreshPreview(
     nextDraft: ImageAdjustment = draftRef.current,
-    version = draftVersionRef.current
+    version = draftVersionRef.current,
+    retrySuperseded = true
   ): Promise<string | undefined> {
     if (previewTimerRef.current !== null) {
       window.clearTimeout(previewTimerRef.current);
@@ -3078,6 +3079,16 @@ function SlotAdjustmentEditor({
         target_folder: targetFolder,
         preview_generation: previewGeneration
       }, controller.signal);
+      if (result?.superseded) {
+        if (
+          retrySuperseded
+          && requestId === previewRequestRef.current
+          && version === draftVersionRef.current
+        ) {
+          return refreshPreview(nextDraft, version, false);
+        }
+        return undefined;
+      }
       await preloadExactPreview(result.preview_url, controller.signal);
       if (requestId === previewRequestRef.current) {
         renderedPreviewRef.current = result.preview_url;
@@ -4359,11 +4370,15 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
               target_folder: target.targetFolder,
               preview_generation: nextOrganizerPreviewGeneration()
             }, controller.signal);
-            return [target.key, result.preview_url] as const;
+            return result?.superseded ? null : [target.key, result.preview_url] as const;
           }));
           if (requestId === previewRequestRef.current) {
             const successfulResults = results
-              .filter((result): result is PromiseFulfilledResult<readonly [string, string]> => result.status === "fulfilled" && typeof result.value[1] === "string")
+              .filter((result): result is PromiseFulfilledResult<readonly [string, string]> => (
+                result.status === "fulfilled"
+                && result.value !== null
+                && typeof result.value[1] === "string"
+              ))
               .map((result) => result.value);
             const successfulKeys = new Set(successfulResults.map(([key]) => key));
             const previewEntries = Object.fromEntries(successfulResults);
@@ -4382,7 +4397,7 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
                   .map((key) => [key, signatures[key]])
               )
             };
-            const failedCount = results.length - successfulResults.length;
+            const failedCount = results.filter((result) => result.status === "rejected").length;
             if (failedCount) {
               partialPreviewFailure = true;
               setMessage(`${failedCount} 个预览暂未生成，其他预览已更新`);
