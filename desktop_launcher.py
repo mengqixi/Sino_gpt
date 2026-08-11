@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import logging
 import multiprocessing
@@ -47,6 +48,84 @@ def _configure_runtime_environment(data_dir: Path) -> None:
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def _bundled_api_seed_path() -> Path | None:
+    relative = Path("desktop") / "private" / "api-configs.json"
+    candidates = [
+        Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / relative,
+        Path(sys.executable).resolve().parent / "_internal" / relative,
+        Path(sys.executable).resolve().parent.parent / "Resources" / relative,
+    ]
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _install_bundled_api_seed(data_dir: Path) -> int:
+    seed_path = _bundled_api_seed_path()
+    if seed_path is None:
+        return 0
+    seed_bytes = seed_path.read_bytes()
+    seed_digest = hashlib.sha256(seed_bytes).hexdigest()
+    marker = data_dir / ".api-seed-sha256"
+    if marker.is_file() and marker.read_text(encoding="ascii").strip() == seed_digest:
+        return 0
+    payload = json.loads(seed_bytes.decode("utf-8"))
+    configs = payload.get("api_configs") if isinstance(payload, dict) else None
+    if not isinstance(configs, list) or not configs:
+        raise RuntimeError("内置 API 配置为空或格式错误")
+
+    from backend.database import db_session, init_db, now_iso
+    from backend.services.api_config_service import API_CONFIG_FIELDS, VALID_API_TYPES
+
+    init_db()
+    applied = 0
+    with db_session() as conn:
+        for item in configs:
+            if not isinstance(item, dict):
+                continue
+            api_type = str(item.get("api_type") or "").strip()
+            config_name = str(item.get("config_name") or "").strip()
+            api_base_url = str(item.get("api_base_url") or "").strip()
+            api_key = str(item.get("api_key") or "").strip()
+            if api_type not in VALID_API_TYPES or not config_name or not api_base_url or not api_key:
+                continue
+            data = {field: item.get(field) for field in API_CONFIG_FIELDS if field in item}
+            data.update({
+                "config_name": config_name,
+                "api_type": api_type,
+                "api_base_url": api_base_url,
+                "api_key": api_key,
+                "enabled": 1 if item.get("enabled", True) else 0,
+                "is_default": 1 if item.get("is_default") else 0,
+            })
+            if data["is_default"]:
+                conn.execute("UPDATE api_configs SET is_default = 0 WHERE api_type = ?", (api_type,))
+            existing = conn.execute(
+                "SELECT id FROM api_configs WHERE config_name = ? AND api_type = ?",
+                (config_name, api_type),
+            ).fetchone()
+            fields = list(data)
+            timestamp = now_iso()
+            if existing:
+                assignments = ", ".join(f"{field} = ?" for field in fields)
+                conn.execute(
+                    f"UPDATE api_configs SET {assignments}, updated_at = ? WHERE id = ?",
+                    [*(data[field] for field in fields), timestamp, existing["id"]],
+                )
+            else:
+                placeholders = ", ".join("?" for _ in fields)
+                conn.execute(
+                    f"INSERT INTO api_configs ({', '.join(fields)}, created_at, updated_at) "
+                    f"VALUES ({placeholders}, ?, ?)",
+                    [*(data[field] for field in fields), timestamp, timestamp],
+                )
+            applied += 1
+    if applied == 0:
+        raise RuntimeError("内置 API 配置没有可用项目")
+    marker_tmp = marker.with_suffix(".tmp")
+    marker_tmp.write_text(seed_digest, encoding="ascii")
+    os.replace(marker_tmp, marker)
+    return applied
 
 
 def _dispatch_worker(arguments: Sequence[str]) -> int | None:
@@ -179,7 +258,9 @@ def _show_error(message: str) -> None:
 
 def _run_self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="sino-desktop-test-") as directory:
-        _configure_runtime_environment(Path(directory))
+        data_dir = Path(directory)
+        _configure_runtime_environment(data_dir)
+        _install_bundled_api_seed(data_dir)
         from backend.app import FRONTEND_DIST
         from backend.database import init_db
 
@@ -191,7 +272,9 @@ def _run_self_test() -> int:
 
 def _run_server_self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="sino-desktop-server-test-") as directory:
-        _configure_runtime_environment(Path(directory))
+        data_dir = Path(directory)
+        _configure_runtime_environment(data_dir)
+        _install_bundled_api_seed(data_dir)
         import uvicorn
         from backend.app import app
 
@@ -224,6 +307,7 @@ def _run_server_self_test() -> int:
 def run_desktop() -> int:
     data_dir = user_data_dir()
     _configure_runtime_environment(data_dir)
+    _install_bundled_api_seed(data_dir)
     logging.basicConfig(
         filename=data_dir / "desktop.log",
         level=logging.INFO,

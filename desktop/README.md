@@ -38,3 +38,14 @@ python3 desktop/build.py
 数据库、上传图片、生成结果、自动整理会话和日志均写入上述目录，不会写入安装目录。
 
 程序优先查找 Google Chrome。Windows 如果没有 Chrome，会尝试 Microsoft Edge；其他情况会使用系统默认浏览器，并显示一个用于退出本地服务的小窗口。
+
+## 仅在本机注入 API 配置
+
+GitHub 构建产物默认不包含任何 API 密钥。需要生成内部私有包时，可在持有 API 数据库的本机执行：
+
+```powershell
+python desktop/inject_api.py --platform windows --database data/app.db --source clean-windows.zip --output SinoImageTool-Windows-x64-with-api.zip
+python desktop/inject_api.py --platform macos --database data/app.db --source clean-macos.zip --output SinoImageTool-macOS-arm64-with-api.zip
+```
+
+私有包首次启动时会把内置配置合并到本机数据目录；相同版本只导入一次。私有包内含可提取的 API 密钥，只能在内部传递，不能上传 GitHub。
