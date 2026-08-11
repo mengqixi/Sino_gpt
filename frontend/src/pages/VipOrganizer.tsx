@@ -136,6 +136,15 @@ const ORGANIZER_RENDER_STATE_VERSION = "34:1";
 const ORGANIZER_SESSION_SNAPSHOT_VERSION = 2;
 
 let organizerCanvasFontsReady: Promise<unknown> | null = null;
+let organizerPreviewGeneration = Date.now() * 1000;
+
+function nextOrganizerPreviewGeneration() {
+  organizerPreviewGeneration = Math.max(
+    organizerPreviewGeneration + 1,
+    Date.now() * 1000
+  );
+  return organizerPreviewGeneration;
+}
 
 function ensureOrganizerCanvasFonts() {
   if (!organizerCanvasFontsReady) {
@@ -2646,6 +2655,7 @@ function SlotAdjustmentEditor({
   const syncedVersionRef = useRef(usableInitialPreview ? 0 : -1);
   const previewRequestRef = useRef(0);
   const previewAbortRef = useRef<AbortController | null>(null);
+  const activePreviewGenerationRef = useRef<number | null>(null);
   const previewTimerRef = useRef<number | null>(null);
   const moveTargetRef = useRef<AdjustmentTarget>("product");
   const linkedProductRulersRef = useRef(false);
@@ -2949,12 +2959,25 @@ function SlotAdjustmentEditor({
     return { ...slot, adjustments, logo_color: logoColorRef.current };
   }
 
+  function supersedeActiveServerPreview() {
+    if (activePreviewGenerationRef.current === null) return;
+    activePreviewGenerationRef.current = null;
+    void api.cancelVipOrganizerSlotPreview({
+      session_id: sessionId,
+      file_name: slot.file_name,
+      platform,
+      target_folder: targetFolder,
+      preview_generation: nextOrganizerPreviewGeneration()
+    }).catch(() => undefined);
+  }
+
   function cancelStalePreview() {
     if (previewTimerRef.current !== null) {
       window.clearTimeout(previewTimerRef.current);
       previewTimerRef.current = null;
     }
     if (!previewAbortRef.current) return;
+    supersedeActiveServerPreview();
     previewAbortRef.current.abort();
     previewAbortRef.current = null;
     previewRequestRef.current += 1;
@@ -3041,6 +3064,8 @@ function SlotAdjustmentEditor({
     previewAbortRef.current?.abort();
     const controller = new AbortController();
     previewAbortRef.current = controller;
+    const previewGeneration = nextOrganizerPreviewGeneration();
+    activePreviewGenerationRef.current = previewGeneration;
     setBusy(true);
     setError("");
     try {
@@ -3050,7 +3075,8 @@ function SlotAdjustmentEditor({
         product_info: productInfo,
         file_name: slot.file_name,
         platform,
-        target_folder: targetFolder
+        target_folder: targetFolder,
+        preview_generation: previewGeneration
       }, controller.signal);
       await preloadExactPreview(result.preview_url, controller.signal);
       if (requestId === previewRequestRef.current) {
@@ -3069,6 +3095,9 @@ function SlotAdjustmentEditor({
     } finally {
       if (requestId === previewRequestRef.current) {
         previewAbortRef.current = null;
+        if (activePreviewGenerationRef.current === previewGeneration) {
+          activePreviewGenerationRef.current = null;
+        }
         setBusy(false);
       }
     }
@@ -3081,6 +3110,7 @@ function SlotAdjustmentEditor({
     return () => {
       document.body.style.overflow = previousOverflow;
       if (previewTimerRef.current !== null) window.clearTimeout(previewTimerRef.current);
+      supersedeActiveServerPreview();
       previewAbortRef.current?.abort();
       if (moveFrameRef.current !== null) window.cancelAnimationFrame(moveFrameRef.current);
     };
@@ -3351,22 +3381,21 @@ function SlotAdjustmentEditor({
     scheduleExactPreview(draftRef.current, draftVersionRef.current);
   }
 
-  async function saveAdjustment() {
+  function saveAdjustment() {
     if (!editorGeometryReady) {
       setError("正在读取商品精确几何，请稍后再保存");
       return;
     }
-    flushPendingMove();
+    // Saving the adjustment must not wait behind an obsolete exact render.
+    // The parent preview effect regenerates the latest slot after the editor
+    // closes; a fully synced URL can still be reused without another request.
+    flushPendingMove(false);
     const currentDraft = draftRef.current;
-    let previewUrl = renderedPreviewRef.current;
-    if (previewTimerRef.current !== null) {
-      window.clearTimeout(previewTimerRef.current);
-      previewTimerRef.current = null;
-    }
-    if (syncedVersionRef.current !== draftVersionRef.current) {
-      previewUrl = await refreshPreview(currentDraft, draftVersionRef.current) || "";
-    }
-    if (previewUrl) onSave(currentDraft, logoColorRef.current, previewUrl, syncJdFolders);
+    const previewUrl = syncedVersionRef.current === draftVersionRef.current
+      ? renderedPreviewRef.current
+      : undefined;
+    cancelStalePreview();
+    onSave(currentDraft, logoColorRef.current, previewUrl, syncJdFolders);
   }
 
   function requestClose() {
@@ -3404,7 +3433,7 @@ function SlotAdjustmentEditor({
               />
               <span>同步 800/750</span>
             </label>}
-            <button type="button" className="primary" disabled={busy || !editorGeometryReady} onClick={() => void saveAdjustment()}><Save size={17} />保存并退出</button>
+            <button type="button" className="primary" disabled={!editorGeometryReady} onClick={saveAdjustment}><Save size={17} />保存并退出</button>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="不保存并退出" title="不保存并退出"><X size={20} /></button>
         </div>}
@@ -3666,7 +3695,7 @@ function SlotAdjustmentEditor({
           } / {
             Math.round(targetOffset(draft, activeMoveTarget).y * 100)
           }</span>
-          {!previewSynced && <span className="slot-preview-pending">保存时会自动生成精确预览</span>}
+          {!previewSynced && <span className="slot-preview-pending">保存后会在后台更新精确预览</span>}
           <div className="slot-save-actions">
             {supportsJdFolderSync && <label
               className="slot-sync-toggle"
@@ -3679,7 +3708,7 @@ function SlotAdjustmentEditor({
               />
               <span>同步 800/750</span>
             </label>}
-            <button type="button" className="primary" disabled={busy || !editorGeometryReady} onClick={() => void saveAdjustment()}><Save size={18} />{busy ? "正在保存" : !editorGeometryReady ? "正在读取精确几何" : "保存并退出"}</button>
+            <button type="button" className="primary" disabled={!editorGeometryReady} onClick={saveAdjustment}><Save size={18} />{!editorGeometryReady ? "正在读取精确几何" : "保存并退出"}</button>
           </div>
         </div>
         {error && <div className="alert warning">{error}</div>}
@@ -4327,7 +4356,8 @@ export default function VipOrganizer({ active, initialProductFile, onInitialProd
               product_info: productInfo,
               file_name: target.slot.file_name,
               platform,
-              target_folder: target.targetFolder
+              target_folder: target.targetFolder,
+              preview_generation: nextOrganizerPreviewGeneration()
             }, controller.signal);
             return [target.key, result.preview_url] as const;
           }));

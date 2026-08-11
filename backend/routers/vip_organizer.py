@@ -14,6 +14,7 @@ from ..services.vip_organizer_service import (
     asset_thumbnail,
     analyze_assets,
     analyze_assets_with_api,
+    cancel_slot_preview,
     delete_asset,
     delete_session,
     export_package,
@@ -57,6 +58,15 @@ class PreviewPayload(ExportPayload):
 
 class SlotPreviewPayload(ExportPayload):
     file_name: str
+    preview_generation: int | None = Field(default=None, ge=0)
+
+
+class SlotPreviewCancelPayload(BaseModel):
+    session_id: str
+    file_name: str
+    platform: str = "vip"
+    target_folder: str = "800"
+    preview_generation: int = Field(ge=0)
 
 
 class ApiAnalyzePayload(BaseModel):
@@ -315,6 +325,21 @@ def preview_slot(payload: SlotPreviewPayload):
             payload.file_name,
             payload.platform,
             payload.target_folder,
+            payload.preview_generation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/preview-slot/cancel")
+def cancel_preview_slot(payload: SlotPreviewCancelPayload):
+    try:
+        return cancel_slot_preview(
+            payload.session_id,
+            payload.file_name,
+            payload.platform,
+            payload.target_folder,
+            payload.preview_generation,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

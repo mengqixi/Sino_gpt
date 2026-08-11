@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import mimetypes
 import base64
+import ctypes
+import gc
 import hashlib
 import io
 import json
@@ -20,7 +22,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -51,9 +53,13 @@ CUTOUT_WORKER_PATH = Path(__file__).resolve().with_name("cutout_model_worker.py"
 _PREVIEW_LOCKS_GUARD = Lock()
 _PREVIEW_LOCKS: dict[str, Lock] = {}
 _FAST_SLOT_PREVIEW_LOCK = Lock()
+_SLOT_PREVIEW_GENERATIONS_GUARD = Lock()
+_SLOT_PREVIEW_GENERATIONS: dict[tuple[str, str, str, str], int] = {}
 PREVIEW_RENDER_VERSION = 34
 ORGANIZER_LAYER_RENDER_VERSION = 1
+DECODED_SOURCE_CACHE_VERSION = 1
 MAX_PREVIEW_CACHE_ENTRIES = 48
+MAX_DECODED_SOURCE_CACHE_ENTRIES = 10
 JD_PHONE_HEIGHT_MM = 163.0
 JD_PHONE_LABEL = "iPhone 17 Pro Max"
 JD_MEASURE_COLOR = "#707070"
@@ -1109,6 +1115,13 @@ def delete_session(session_id: str) -> None:
     shutil.rmtree(_session_result_dir(session_id), ignore_errors=True)
     with _PREVIEW_LOCKS_GUARD:
         _PREVIEW_LOCKS.pop(session_id, None)
+    with _SLOT_PREVIEW_GENERATIONS_GUARD:
+        stale_keys = [
+            key for key in _SLOT_PREVIEW_GENERATIONS
+            if key[0] == session_id
+        ]
+        for key in stale_keys:
+            _SLOT_PREVIEW_GENERATIONS.pop(key, None)
 
 
 def _cleanup_expired_sessions() -> None:
@@ -1435,23 +1448,27 @@ def asset_organizer_layer_info(
     path = asset_organizer_layer(image_id, adjustment)
     with Image.open(path) as cached:
         layer = cached.convert("RGBA")
-    measurement = _info_measurement_bbox(layer)
-    product_body = _jd_product_body_bbox(layer)
-    return {
-        "url": (
-            f"/api/vip-organizer/assets/{image_id}/organizer-layer"
-            f"?crop_x={normalized['crop_x']:.6f}"
-            f"&crop_y={normalized['crop_y']:.6f}"
-            f"&crop_width={normalized['crop_width']:.6f}"
-            f"&crop_height={normalized['crop_height']:.6f}"
-            f"&v={ORGANIZER_LAYER_RENDER_VERSION}"
-        ),
-        "width": layer.width,
-        "height": layer.height,
-        "measurement_bbox": list(measurement),
-        "product_body_bbox": list(product_body),
-        "handle_lift": _handle_visual_lift(layer),
-    }
+    try:
+        measurement = _info_measurement_bbox(layer)
+        product_body = _jd_product_body_bbox(layer)
+        return {
+            "url": (
+                f"/api/vip-organizer/assets/{image_id}/organizer-layer"
+                f"?crop_x={normalized['crop_x']:.6f}"
+                f"&crop_y={normalized['crop_y']:.6f}"
+                f"&crop_width={normalized['crop_width']:.6f}"
+                f"&crop_height={normalized['crop_height']:.6f}"
+                f"&v={ORGANIZER_LAYER_RENDER_VERSION}"
+            ),
+            "width": layer.width,
+            "height": layer.height,
+            "measurement_bbox": list(measurement),
+            "product_body_bbox": list(product_body),
+            "handle_lift": _handle_visual_lift(layer),
+        }
+    finally:
+        layer.close()
+        _release_process_image_memory()
 
 
 def _render_organizer_layer_cache(
@@ -1703,13 +1720,95 @@ def analyze_assets(
     return {"assets": {"product": products, "model": models, "tag": tags}, "slots": slots}
 
 
+def _decoded_source_cache_path(file_path: str, modified_ns: int) -> Path:
+    source_path = Path(file_path)
+    return (
+        source_path.parent
+        / "render-cache"
+        / (
+            f"decoded-source-v{DECODED_SOURCE_CACHE_VERSION}-"
+            f"{source_path.stem}-{modified_ns}.png"
+        )
+    )
+
+
+def _prune_decoded_source_cache(cache_dir: Path) -> None:
+    try:
+        candidates = list(cache_dir.glob("decoded-source-v*.png"))
+    except OSError:
+        return
+    entries: list[tuple[int, Path]] = []
+    for path in candidates:
+        try:
+            entries.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in entries[MAX_DECODED_SOURCE_CACHE_ENTRIES:]:
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError:
+            # Another image request may touch or prune the same session cache.
+            # A failed best-effort eviction must never fail the render itself.
+            continue
+
+
+def _write_decoded_source_cache(cache_path: Path, image: Image.Image) -> None:
+    temporary = cache_path.with_name(
+        f".{cache_path.stem}-{uuid.uuid4().hex[:8]}.png"
+    )
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Compression level 0 keeps the exact resized pixels while making
+        # later worker processes load the intermediate with minimal CPU.
+        image.save(temporary, format="PNG", compress_level=0)
+        os.replace(temporary, cache_path)
+        _prune_decoded_source_cache(cache_path.parent)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _release_process_image_memory() -> None:
+    """Return large temporary Pillow allocations to Linux after API renders."""
+    gc.collect()
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is not None:
+            trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
 @lru_cache(maxsize=12)
 def _load_image_file(image_id: int, file_path: str, modified_ns: int) -> Image.Image:
+    cache_path = _decoded_source_cache_path(file_path, modified_ns)
+    if cache_path.is_file():
+        try:
+            with Image.open(cache_path) as cached:
+                loaded = cached.copy()
+            os.utime(cache_path, None)
+            loaded.info["_organizer_image_id"] = image_id
+            loaded.info["_organizer_modified_ns"] = modified_ns
+            return loaded
+        except OSError:
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     with Image.open(file_path) as source:
+        original_size = source.size
         source.draft("RGB", (2400, 2400))
         image = ImageOps.exif_transpose(source)
         image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
         loaded = image.copy()
+    if max(original_size) > 2400:
+        _write_decoded_source_cache(cache_path, loaded)
     loaded.info["_organizer_image_id"] = image_id
     loaded.info["_organizer_modified_ns"] = modified_ns
     return loaded
@@ -8819,6 +8918,48 @@ def _preview_lock(session_id: str) -> Lock:
         return _PREVIEW_LOCKS.setdefault(session_id, Lock())
 
 
+def _register_slot_preview_generation(
+    session_id: str,
+    platform: str,
+    target_folder: str,
+    file_name: str,
+    generation: int | None,
+) -> Callable[[], bool] | None:
+    """Return a cheap cancellation check for one independently edited slot."""
+    if generation is None:
+        return None
+    generation = max(0, int(generation))
+    key = (session_id, platform, target_folder, file_name)
+    with _SLOT_PREVIEW_GENERATIONS_GUARD:
+        current = _SLOT_PREVIEW_GENERATIONS.get(key, -1)
+        if generation > current:
+            _SLOT_PREVIEW_GENERATIONS[key] = generation
+
+    def is_superseded() -> bool:
+        with _SLOT_PREVIEW_GENERATIONS_GUARD:
+            return _SLOT_PREVIEW_GENERATIONS.get(key, generation) > generation
+
+    return is_superseded
+
+
+def cancel_slot_preview(
+    session_id: str,
+    file_name: str,
+    platform: str = "vip",
+    target_folder: str = "800",
+    preview_generation: int = 0,
+) -> dict[str, bool]:
+    _assert_session_active(session_id)
+    _register_slot_preview_generation(
+        session_id,
+        platform,
+        target_folder,
+        file_name,
+        preview_generation,
+    )
+    return {"cancelled": True}
+
+
 def _preview_product_info(
     file_name: str,
     product_info: dict[str, str],
@@ -9048,9 +9189,19 @@ def render_slot_preview(
     file_name: str,
     platform: str = "vip",
     target_folder: str = "800",
+    preview_generation: int | None = None,
 ) -> dict[str, str]:
+    is_superseded = _register_slot_preview_generation(
+        session_id,
+        platform,
+        target_folder,
+        file_name,
+        preview_generation,
+    )
     if _fast_slot_preview_ready(slots, file_name, platform, target_folder):
         with _FAST_SLOT_PREVIEW_LOCK:
+            if is_superseded is not None and is_superseded():
+                raise ValueError("预览已被更新的调整替代")
             try:
                 return _render_slot_preview(
                     session_id,
@@ -9066,6 +9217,7 @@ def render_slot_preview(
                 # source/layer images immediately after composing the slot.
                 _cached_product_cutout.cache_clear()
                 _load_image_file.cache_clear()
+                _release_process_image_memory()
     return run_heavy_task(
         "backend.services.organizer_render_worker",
         {
@@ -9078,6 +9230,7 @@ def render_slot_preview(
             "target_folder": target_folder,
         },
         timeout=600,
+        is_superseded=is_superseded,
     )
 
 

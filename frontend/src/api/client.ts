@@ -110,6 +110,10 @@ export const api = {
     body: JSON.stringify(payload),
     signal
   }),
+  cancelVipOrganizerSlotPreview: (payload: any) => request<any>("/api/vip-organizer/preview-slot/cancel", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  }),
   getVipOrganizerLayerInfo: (imageId: number, crop: Record<string, number>, signal?: AbortSignal) => {
     const params = new URLSearchParams(Object.fromEntries(
       Object.entries(crop).map(([key, value]) => [key, value.toFixed(6)])

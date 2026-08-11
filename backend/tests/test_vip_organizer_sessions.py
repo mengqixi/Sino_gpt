@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -720,6 +721,117 @@ class VipOrganizerSessionIsolationTests(unittest.TestCase):
         renderer.assert_called_once()
         self.assertEqual(renderer.call_args.args[1], requested)
         self.assertEqual(result, {"previews": {}, "missing": [requested]})
+
+    def test_new_slot_preview_generation_supersedes_only_the_same_target(self):
+        session_id = service.start_session()["session_id"]
+        old_check = service._register_slot_preview_generation(
+            session_id, "vip", "800", "2.jpg", 100
+        )
+        other_file_check = service._register_slot_preview_generation(
+            session_id, "vip", "800", "3.jpg", 100
+        )
+        other_folder_check = service._register_slot_preview_generation(
+            session_id, "jd", "750", "2.jpg", 100
+        )
+
+        self.assertFalse(old_check())
+        service.cancel_slot_preview(session_id, "2.jpg", "vip", "800", 101)
+
+        self.assertTrue(old_check())
+        self.assertFalse(other_file_check())
+        self.assertFalse(other_folder_check())
+
+    def test_heavy_slot_preview_receives_live_superseded_check(self):
+        session_id = service.start_session()["session_id"]
+        captured_check = None
+
+        def capture_worker(_module, _payload, **kwargs):
+            nonlocal captured_check
+            captured_check = kwargs["is_superseded"]
+            return {"preview_url": "/preview/15.jpg"}
+
+        with patch.object(service, "run_heavy_task", side_effect=capture_worker):
+            result = service.render_slot_preview(
+                session_id, [], {}, "15.jpg", "vip", "800", 200
+            )
+
+        self.assertEqual(result["preview_url"], "/preview/15.jpg")
+        self.assertIsNotNone(captured_check)
+        self.assertFalse(captured_check())
+        service.cancel_slot_preview(session_id, "15.jpg", "vip", "800", 201)
+        self.assertTrue(captured_check())
+
+    def test_preview_cancel_router_forwards_generation(self):
+        payload = organizer_router.SlotPreviewCancelPayload(
+            session_id="a" * 32,
+            file_name="2.jpg",
+            platform="vip",
+            target_folder="800",
+            preview_generation=202,
+        )
+
+        with patch.object(
+            organizer_router,
+            "cancel_slot_preview",
+            return_value={"cancelled": True},
+        ) as cancel:
+            result = organizer_router.cancel_preview_slot(payload)
+
+        cancel.assert_called_once_with("a" * 32, "2.jpg", "vip", "800", 202)
+        self.assertEqual(result, {"cancelled": True})
+
+    def test_delete_session_removes_slot_preview_generations(self):
+        session_id = service.start_session()["session_id"]
+        service._register_slot_preview_generation(
+            session_id, "vip", "800", "2.jpg", 100
+        )
+
+        service.delete_session(session_id)
+
+        with service._SLOT_PREVIEW_GENERATIONS_GUARD:
+            self.assertFalse(any(key[0] == session_id for key in service._SLOT_PREVIEW_GENERATIONS))
+
+    def test_large_source_reuses_lossless_decoded_intermediate(self):
+        session_id = service.start_session()["session_id"]
+        source_dir = service._session_upload_dir(session_id)
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_path = source_dir / "large-source.jpg"
+        image = Image.new("RGB", (2501, 8), "#315a7d")
+        ImageDraw.Draw(image).rectangle((1200, 0, 2500, 7), fill="#d2a34f")
+        image.save(source_path, quality=95)
+        modified_ns = source_path.stat().st_mtime_ns
+        service._load_image_file.cache_clear()
+
+        first = service._load_image_file(1, str(source_path), modified_ns).copy()
+        cache_path = service._decoded_source_cache_path(str(source_path), modified_ns)
+        self.assertTrue(cache_path.is_file())
+        service._load_image_file.cache_clear()
+        source_path.unlink()
+
+        second = service._load_image_file(1, str(source_path), modified_ns).copy()
+
+        self.assertEqual(first.size, second.size)
+        self.assertEqual(first.tobytes(), second.tobytes())
+        service._load_image_file.cache_clear()
+
+    def test_decoded_source_cache_keeps_only_the_newest_entries(self):
+        cache_dir = self.organizer_root / "uploads" / "cache-test" / "render-cache"
+        cache_dir.mkdir(parents=True)
+        paths = []
+        for index in range(5):
+            path = cache_dir / f"decoded-source-v1-{index}.png"
+            path.write_bytes(b"cache")
+            timestamp = 1_700_000_000 + index
+            os.utime(path, (timestamp, timestamp))
+            paths.append(path)
+
+        with patch.object(service, "MAX_DECODED_SOURCE_CACHE_ENTRIES", 2):
+            service._prune_decoded_source_cache(cache_dir)
+
+        self.assertEqual(
+            {path.name for path in cache_dir.glob("decoded-source-v*.png")},
+            {paths[-1].name, paths[-2].name},
+        )
 
 
 if __name__ == "__main__":
