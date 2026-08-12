@@ -31,6 +31,7 @@ from fastapi import UploadFile
 from PIL import Image, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 
 from ..config import ALLOWED_IMAGE_EXTENSIONS, DATA_DIR
+from ..runtime import cutout_worker_command, is_frozen
 from ..database import db_session, now_iso
 from .api_config_service import TEXT_API_TYPE, get_config, get_default_config, mask_api_key, require_config_type
 from .heavy_task_service import HeavyTaskSuperseded, run_heavy_task
@@ -1945,7 +1946,7 @@ def _product_cutout(source: Image.Image) -> Image.Image:
 
 
 def _predict_product_matte(source: Image.Image) -> np.ndarray | None:
-    if not U2NETP_MODEL_PATH.exists() or not CUTOUT_WORKER_PATH.exists():
+    if not U2NETP_MODEL_PATH.exists() or (not is_frozen() and not CUTOUT_WORKER_PATH.exists()):
         return None
     configured_python = os.environ.get("SINO_CUTOUT_PYTHON", "").strip()
     worker_python = Path(configured_python) if configured_python else Path(sys.executable)
@@ -1962,14 +1963,23 @@ def _predict_product_matte(source: Image.Image) -> np.ndarray | None:
             "MKL_NUM_THREADS": "1",
         })
         try:
+            configured_executable = (
+                worker_python
+                if (
+                    not is_frozen()
+                    and configured_python
+                    and Path(configured_python).is_file()
+                )
+                else None
+            )
             subprocess.run(
-                [
-                    str(worker_python),
-                    str(CUTOUT_WORKER_PATH),
-                    str(U2NETP_MODEL_PATH),
-                    str(input_path),
-                    str(output_path),
-                ],
+                cutout_worker_command(
+                    CUTOUT_WORKER_PATH,
+                    U2NETP_MODEL_PATH,
+                    input_path,
+                    output_path,
+                    python_executable=configured_executable,
+                ),
                 check=True,
                 timeout=45,
                 stdout=subprocess.DEVNULL,

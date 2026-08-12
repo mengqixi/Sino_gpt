@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -12,6 +11,7 @@ from threading import BoundedSemaphore, Lock, Thread
 from typing import Any, Callable
 
 from ..config import PROJECT_DIR
+from ..runtime import module_worker_command, prewarm_worker_command
 
 
 _MAX_PENDING_HEAVY_TASKS = 3
@@ -171,13 +171,7 @@ def prewarm_heavy_task(feature: str) -> dict[str, Any]:
             _stop_prewarmer_locked()
             directory = Path(tempfile.mkdtemp(prefix="sino-prewarm-"))
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "backend.services.prewarm_worker",
-                    feature,
-                    str(directory),
-                ],
+                prewarm_worker_command(feature, directory),
                 cwd=str(PROJECT_DIR),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -270,13 +264,7 @@ def _run_direct_worker(
         _write_json_atomically(input_path, payload)
         try:
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    worker_module,
-                    str(input_path),
-                    str(output_path),
-                ],
+                module_worker_command(worker_module, input_path, output_path),
                 cwd=str(PROJECT_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
