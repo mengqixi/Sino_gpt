@@ -21,8 +21,15 @@ jobs:
         include:
           - os: windows-latest
             artifact: SinoImageTool-Windows-x64
+            platform: windows
           - os: macos-14
             artifact: SinoImageTool-macOS-arm64
+            platform: macos
+            architecture: arm64
+          - os: macos-15-intel
+            artifact: SinoImageTool-macOS-x64
+            platform: macos
+            architecture: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +54,15 @@ jobs:
       - name: Build desktop package
         run: python desktop/build.py
 
+      - name: Verify macOS architecture
+        if: runner.os == 'macOS'
+        run: |
+          actual="$(uname -m)"
+          test "$actual" = "${{ matrix.architecture }}" || {
+            echo "Expected ${{ matrix.architecture }}, got $actual"
+            exit 1
+          }
+
       - name: Test Windows package
         if: runner.os == 'Windows'
         shell: pwsh
@@ -64,7 +80,7 @@ jobs:
           dist/SinoImageTool.app/Contents/MacOS/SinoImageTool --server-self-test
           ditto -c -k --sequesterRsrc --keepParent \
             dist/SinoImageTool.app \
-            dist/SinoImageTool-macOS-arm64.zip
+            dist/${{ matrix.artifact }}.zip
 
       - name: Upload Windows package
         if: runner.os == 'Windows'
@@ -79,5 +95,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/SinoImageTool-macOS-arm64.zip
+          path: dist/${{ matrix.artifact }}.zip
           if-no-files-found: error
